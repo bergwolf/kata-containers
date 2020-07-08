@@ -67,6 +67,7 @@ service AgentService {
 	rpc SetGuestDateTime(SetGuestDateTimeRequest) returns (google.protobuf.Empty);
 	rpc CopyFile(CopyFileRequest) returns (google.protobuf.Empty);
 	rpc GetOOMEvent(GetOOMEventRequest) returns (OOMEvent);
+	rpc PullImage(PullImageRequest) returns (PullImageResponse);
 }
 
 message CreateContainerRequest {
@@ -520,4 +521,14 @@ message GetMetricsRequest {}
 
 message Metrics {
 	string metrics = 1;
+}
+
+message PullImageRequest {
+	string image = 1;
+	string path = 2;
+	types.AuthConfig auth = 3;
+}
+
+message PullImageResponse {
+	string image_ref = 1;
 }

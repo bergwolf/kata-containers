@@ -57,3 +57,12 @@ message ARPNeighbor {
 	int32 state = 4;
 	int32 flags = 5;
 }
+
+message AuthConfig {
+       string username = 1;
+       string password = 2;
+       string auth = 3;
+       string server_address = 4;
+       string identity_token = 5;
+       string registry_token = 6;
+}
