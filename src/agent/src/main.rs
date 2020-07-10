@@ -10,6 +10,7 @@
 #![allow(non_snake_case)]
 #[macro_use]
 extern crate lazy_static;
+extern crate base64;
 extern crate oci;
 extern crate prctl;
 extern crate prometheus;
@@ -51,6 +52,7 @@ use unistd::Pid;
 
 mod config;
 mod device;
+mod image;
 mod linux_abi;
 mod metrics;
 mod mount;

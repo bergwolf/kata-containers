@@ -31,6 +31,7 @@ use nix::unistd::{self, Pid};
 use rustjail::process::ProcessOperations;
 
 use crate::device::{add_devices, rescan_pci_bus, update_device_cgroup};
+use crate::image::*;
 use crate::linux_abi::*;
 use crate::metrics::get_metrics;
 use crate::mount::{add_storages, remove_mounts, STORAGEHANDLERLIST};
@@ -71,6 +72,7 @@ macro_rules! sl {
 #[derive(Clone)]
 pub struct agentService {
     sandbox: Arc<Mutex<Sandbox>>,
+    image: ImageManager,
     test: u32,
 }
 
@@ -1285,6 +1287,27 @@ impl protocols::agent_ttrpc::AgentService for agentService {
             }
         }
     }
+
+    fn pull_image(
+        &self,
+        _ctx: &::ttrpc::TtrpcContext,
+        req: protocols::agent::PullImageRequest,
+    ) -> ::ttrpc::Result<protocols::agent::PullImageResponse> {
+        match self
+            .image
+            .pull_image(req.get_image(), req.get_path(), req.get_auth())
+        {
+            Ok(i) => {
+                let mut resp = protocols::agent::PullImageResponse::new();
+                resp.set_image_ref(i);
+                Ok(resp)
+            }
+            Err(e) => Err(ttrpc::Error::RpcStatus(ttrpc::get_status(
+                ttrpc::Code::INTERNAL,
+                e.to_string(),
+            ))),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1439,6 +1462,7 @@ fn find_process<'a>(
 pub fn start<S: Into<String>>(s: Arc<Mutex<Sandbox>>, host: S, port: u16) -> ttrpc::Server {
     let agent_service = Box::new(agentService {
         sandbox: s,
+        image: ImageManager::new(),
         test: 1,
     }) as Box<dyn protocols::agent_ttrpc::AgentService + Send + Sync>;
 
