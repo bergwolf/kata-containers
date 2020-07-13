@@ -6,6 +6,7 @@
 package vcmock
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"syscall"
@@ -246,4 +247,11 @@ func (s *Sandbox) Stats() (vc.SandboxStats, error) {
 		return s.StatsFunc()
 	}
 	return vc.SandboxStats{}, nil
+}
+
+func (s *Sandbox) PullImage(ctx context.Context, image string, auth *vcTypes.AuthConfig) (string, error) {
+	if s.PullImageFunc != nil {
+		return s.PullImageFunc(ctx, image, auth)
+	}
+	return "", nil
 }

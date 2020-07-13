@@ -2146,3 +2146,7 @@ func (s *Sandbox) GetPatchedOCISpec() *specs.Spec {
 func (s *Sandbox) GetOOMEvent() (string, error) {
 	return s.agent.getOOMEvent()
 }
+
+func (s *Sandbox) PullImage(ctx context.Context, image string, auth *vcTypes.AuthConfig) (string, error) {
+	return s.agent.pullImage(ctx, image, auth)
+}

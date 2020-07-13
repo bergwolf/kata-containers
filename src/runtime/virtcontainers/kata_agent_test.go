@@ -258,6 +258,10 @@ func (p *gRPCProxy) GetMetrics(ctx context.Context, req *pb.GetMetricsRequest) (
 	return &pb.Metrics{}, nil
 }
 
+func (p *gRPCProxy) PullImage(ctx context.Context, req *pb.PullImageRequest) (*pb.PullImageResponse, error) {
+	return &pb.PullImageResponse{}, nil
+}
+
 func gRPCRegister(s *ttrpc.Server, srv interface{}) {
 	switch g := srv.(type) {
 	case *gRPCProxy:

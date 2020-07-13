@@ -33,6 +33,7 @@ import (
 	vc "github.com/kata-containers/kata-containers/src/runtime/virtcontainers"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/compatoci"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/oci"
+	vcTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/types"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 )
 
@@ -112,6 +113,7 @@ type service struct {
 	ctx        context.Context
 	sandbox    vc.VCSandbox
 	containers map[string]*container
+	images     map[string]string
 	config     *oci.RuntimeConfig
 	events     chan interface{}
 	monitor    chan error
@@ -815,6 +817,48 @@ func (s *service) Shutdown(ctx context.Context, r *taskAPI.ShutdownRequest) (_ *
 	// This will never be called, but this is only there to make sure the
 	// program can compile.
 	return empty, nil
+}
+
+func (s *service) PullImage(ctx context.Context, req *taskAPI.PullImageRequest) (_ *taskAPI.PullImageResponse, err error) {
+	start := time.Now()
+	defer func() {
+		err = toGRPC(err)
+		rpcDurationsHistogram.WithLabelValues("stats").Observe(float64(time.Since(start).Nanoseconds() / int64(time.Millisecond)))
+	}()
+
+	s.mu.Lock()
+	if s.sandbox == nil {
+		s.mu.Unlock()
+		return nil, errdefs.ToGRPCf(errdefs.ErrInvalidArgument, "cannot pull image before creating sandbox")
+	}
+	if s.images[req.Image] != "" {
+		ref := s.images[req.Image]
+		s.mu.Unlock()
+		return &taskAPI.PullImageResponse{ImageRef: ref}, nil
+	}
+	s.mu.Unlock()
+
+	// Once sandbox is set, it is never unset
+	ref, err := s.sandbox.PullImage(s.ctx, req.Image, &vcTypes.AuthConfig{
+		Username:      req.Auth.Username,
+		Password:      req.Auth.Password,
+		ServerAddress: req.Auth.ServerAddress,
+		IdentityToken: req.Auth.IdentityToken,
+		RegistryToken: req.Auth.RegistryToken,
+	})
+	if err != nil {
+		return nil, errdefs.ToGRPCf(errdefs.ErrUnavailable, "pull image inside sandbox failed: %s", err)
+	}
+
+	s.mu.Lock()
+	if s.images[req.Image] != "" {
+		ref = s.images[req.Image]
+	} else {
+		s.images[req.Image] = ref
+	}
+	s.mu.Unlock()
+
+	return &taskAPI.PullImageResponse{ImageRef: ref}, nil
 }
 
 func (s *service) Stats(ctx context.Context, r *taskAPI.StatsRequest) (_ *taskAPI.StatsResponse, err error) {

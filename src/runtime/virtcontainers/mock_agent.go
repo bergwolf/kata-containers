@@ -245,6 +245,10 @@ func (n *mockAgent) getOOMEvent() (string, error) {
 	return "", nil
 }
 
-func (k *mockAgent) getAgentMetrics(req *grpc.GetMetricsRequest) (*grpc.Metrics, error) {
+func (n *mockAgent) getAgentMetrics(req *grpc.GetMetricsRequest) (*grpc.Metrics, error) {
 	return nil, nil
+}
+
+func (n *mockAgent) pullImage(ctx context.Context, image string, auth *vcTypes.AuthConfig) (string, error) {
+	return "", nil
 }

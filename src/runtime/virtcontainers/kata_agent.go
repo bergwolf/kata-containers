@@ -64,6 +64,7 @@ var (
 	defaultKataGuestSharedDir   = "/run/kata-containers/shared/containers/"
 	mountGuestTag               = "kataShared"
 	defaultKataGuestSandboxDir  = "/run/kata-containers/sandbox/"
+	defaultKataGuestImageDir    = "/run/kata-containers/sandbox/images/"
 	type9pFs                    = "9p"
 	typeVirtioFS                = "virtiofs"
 	typeVirtioFSNoCache         = "none"
@@ -129,6 +130,7 @@ const (
 	grpcStopTracingRequest       = "grpc.StopTracingRequest"
 	grpcGetOOMEventRequest       = "grpc.GetOOMEventRequest"
 	grpcGetMetricsRequest        = "grpc.GetMetricsRequest"
+	grpcPullImageRequest         = "grpc.PullImageRequest"
 )
 
 // newKataAgent returns an agent from an agent type.
@@ -2061,12 +2063,16 @@ func (k *kataAgent) installReqFunc(c *kataclient.AgentClient) {
 	k.reqHandlers[grpcGetMetricsRequest] = func(ctx context.Context, req interface{}) (interface{}, error) {
 		return k.client.AgentServiceClient.GetMetrics(ctx, req.(*grpc.GetMetricsRequest))
 	}
+	k.reqHandlers[grpcPullImageRequest] = func(ctx context.Context, req interface{}) (interface{}, error) {
+		return k.client.AgentServiceClient.PullImage(ctx, req.(*grpc.PullImageRequest))
+	}
 }
 
+// FIXME: should use containerd shim context for most APIs
 func (k *kataAgent) getReqContext(reqName string) (ctx context.Context, cancel context.CancelFunc) {
 	ctx = context.Background()
 	switch reqName {
-	case grpcWaitProcessRequest, grpcGetOOMEventRequest:
+	case grpcWaitProcessRequest, grpcGetOOMEventRequest, grpcPullImageRequest:
 		// Wait and GetOOMEvent have no timeout
 	case grpcCheckRequest:
 		ctx, cancel = context.WithTimeout(ctx, checkRequestTimeout)
@@ -2442,4 +2448,18 @@ func (k *kataAgent) getAgentMetrics(req *grpc.GetMetricsRequest) (*grpc.Metrics,
 	}
 
 	return resp.(*grpc.Metrics), nil
+}
+
+func (k *kataAgent) pullImage(ctx context.Context, image string, auth *vcTypes.AuthConfig) (string, error) {
+	req := &grpc.PullImageRequest{
+		Image: image,
+		Path:  defaultKataGuestImageDir + strings.NewReplacer("/", "-", ":", "-").Replace(image),
+		Auth:  &aTypes.AuthConfig{},
+	}
+	resp, err := k.sendReq(req)
+	if err != nil {
+		return "", err
+	}
+
+	return resp.(*grpc.PullImageResponse).ImageRef, nil
 }

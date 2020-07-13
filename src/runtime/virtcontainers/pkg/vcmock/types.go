@@ -67,6 +67,7 @@ type Sandbox struct {
 	UpdateRuntimeMetricsFunc func() error
 	GetAgentMetricsFunc      func() (string, error)
 	StatsFunc                func() (vc.SandboxStats, error)
+	PullImageFunc            func(ctx context.Context, image string, auth *vcTypes.AuthConfig) (string, error)
 }
 
 // Container is a fake Container type used for testing

@@ -47,3 +47,12 @@ type ARPNeighbor struct {
 	State       int
 	Flags       int
 }
+
+type AuthConfig struct {
+	Username      string
+	Password      string
+	Auth          string
+	ServerAddress string
+	IdentityToken string
+	RegistryToken string
+}

@@ -75,6 +75,8 @@ type VCSandbox interface {
 
 	UpdateRuntimeMetrics() error
 	GetAgentMetrics() (string, error)
+
+	PullImage(ctx context.Context, image string, auth *vcTypes.AuthConfig) (string, error)
 }
 
 // VCContainer is the Container interface

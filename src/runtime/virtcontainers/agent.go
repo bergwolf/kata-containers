@@ -220,4 +220,7 @@ type agent interface {
 
 	// getAgentMetrics get metrics of agent and guest through agent
 	getAgentMetrics(*grpc.GetMetricsRequest) (*grpc.Metrics, error)
+
+	// pullImage pulls the requested container image inside through the agent
+	pullImage(ctx context.Context, image string, auth *vcTypes.AuthConfig) (string, error)
 }
