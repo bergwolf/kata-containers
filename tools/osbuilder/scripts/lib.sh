@@ -14,7 +14,7 @@ MUSL_VERSION=${MUSL_VERSION:-"null"}
 # Give preference to variable set by CI
 KATA_BRANCH=${branch:-}
 KATA_BRANCH=${KATA_BRANCH:-master}
-yq_file="${script_dir}/../scripts/install-yq.sh"
+yq_file="${script_dir}/../../../ci/install_yq.sh"
 kata_versions_file="${KATA_REPO_DIR}/versions.yaml"
 
 error()
