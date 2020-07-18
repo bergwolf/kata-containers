@@ -29,9 +29,7 @@ arch_target="$(uname -m)"
 
 source "${script_dir}/../versions.txt"
 # osbuilder info
-[ -n "${osbuider_version}" ] || osbuider_version="${kata_version}"
-# Agent version
-[ -n "${agent_version}" ] || agent_version="${kata_version}"
+osbuider_version="${kata_version}"
 
 readonly destdir="${PWD}"
 
