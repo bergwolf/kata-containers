@@ -107,7 +107,7 @@ main() {
 	#initrd information
 	initrd_distro=$(get_from_kata_deps "assets.initrd.architecture.${arch_target}.name" "${kata_version}")
 	#In old branches this is not defined, use a default
-	initrd_distro=${initrd_distro:-ubuntu}
+	initrd_distro=${initrd_distro:-alpine}
 	initrd_os_version=$(get_from_kata_deps "assets.image.architecture.${arch_target}.version" "${kata_version}")
 
 	shift "$((OPTIND - 1))"
