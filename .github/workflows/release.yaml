@@ -258,6 +258,7 @@ jobs:
     needs: gather-artifacts
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v2
       - name: get-artifacts
         uses: actions/download-artifact@v2
         with:
@@ -280,7 +281,6 @@ jobs:
           mkdir -p packaging/kata-deploy
           ln -s $GITHUB_WORKSPACE/tools/packaging/kata-deploy/action packaging/kata-deploy/action
       - name: test-kata-deploy-ci-in-aks
-        #uses: $GITHUB_WORKSPACE/tools/packaging/kata-deploy/action
         uses: ./packaging/kata-deploy/action
         with:
           packaging-sha: ${{steps.build-and-push-kata-deploy-ci.outputs.PKG_SHA}}
