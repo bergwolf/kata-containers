@@ -205,7 +205,9 @@ pub fn init_rootfs(
     unistd::chdir(rootfs)?;
 
     default_symlinks()?;
+    println!("rootfs is {}", rootfs);
     create_devices(&linux.devices, bind_device)?;
+    println!("2");
     ensure_ptmx()?;
 
     unistd::chdir(&olddir)?;
@@ -761,7 +763,11 @@ fn bind_dev(dev: &LinuxDevice) -> Result<()> {
         &dev.path[1..],
         OFlag::O_RDWR | OFlag::O_CREAT,
         Mode::from_bits_truncate(0o644),
-    )?;
+    )
+    .map_err(|e| {
+        println!("failed to open {}: {}", &dev.path[1..], e);
+        e
+    })?;
 
     unistd::close(fd)?;
 

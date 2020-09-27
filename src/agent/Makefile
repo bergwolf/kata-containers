@@ -123,7 +123,7 @@ clean:
 	@rm -f $(GENERATED_FILES)
 
 test:
-	@cargo test --all --target $(TRIPLE)
+	@cargo test --all --target $(TRIPLE) -- --nocapture
 
 check: test
 
