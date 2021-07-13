@@ -15,7 +15,6 @@ import (
 	"testing"
 
 	ktu "github.com/kata-containers/kata-containers/src/runtime/pkg/katatestutils"
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/persist"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/annotations"
 	vccgroups "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/cgroups"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/mock"
@@ -72,16 +71,6 @@ func newBasicTestCmd() types.Cmd {
 	}
 
 	return cmd
-}
-
-func rmSandboxDir(sid string) error {
-	store, err := persist.GetDriver()
-	if err != nil {
-		return fmt.Errorf("failed to get fs persist driver: %v", err)
-	}
-
-	store.Destroy(sid)
-	return nil
 }
 
 func newTestSandboxConfigNoop() SandboxConfig {
@@ -155,7 +144,7 @@ func TestCreateSandboxNoopAgentSuccessful(t *testing.T) {
 	assert.True(ok)
 	assert.NotNil(s)
 
-	sandboxDir := filepath.Join(s.newStore.RunStoragePath(), p.ID())
+	sandboxDir := filepath.Join(s.store.RunStoragePath(), p.ID())
 	_, err = os.Stat(sandboxDir)
 	assert.NoError(err)
 }
@@ -170,8 +159,12 @@ func TestCreateSandboxKataAgentSuccessful(t *testing.T) {
 
 	config := newTestSandboxConfigKataAgent()
 
+	url, err := mock.GenerateKataMockHybridVSock()
+	assert.NoError(err)
+	MockHybridVSockPath = url
+
 	hybridVSockTTRPCMock := mock.HybridVSockTTRPCMock{}
-	err := hybridVSockTTRPCMock.Start(fmt.Sprintf("mock://%s", MockHybridVSockPath))
+	err = hybridVSockTTRPCMock.Start(fmt.Sprintf("mock://%s", url))
 	assert.NoError(err)
 	defer hybridVSockTTRPCMock.Stop()
 
@@ -182,7 +175,7 @@ func TestCreateSandboxKataAgentSuccessful(t *testing.T) {
 
 	s, ok := p.(*Sandbox)
 	assert.True(ok)
-	sandboxDir := filepath.Join(s.newStore.RunStoragePath(), p.ID())
+	sandboxDir := filepath.Join(s.store.RunStoragePath(), p.ID())
 	_, err = os.Stat(sandboxDir)
 	assert.NoError(err)
 }
@@ -202,26 +195,6 @@ func TestCreateSandboxFailing(t *testing.T) {
 /*
  * Benchmarks
  */
-
-func createNewSandboxConfig(hType HypervisorType) SandboxConfig {
-	hypervisorConfig := HypervisorConfig{
-		KernelPath:     "/usr/share/kata-containers/vmlinux.container",
-		ImagePath:      "/usr/share/kata-containers/kata-containers.img",
-		HypervisorPath: "/usr/bin/qemu-system-x86_64",
-	}
-
-	netConfig := NetworkConfig{}
-
-	return SandboxConfig{
-		ID:               testSandboxID,
-		HypervisorType:   hType,
-		HypervisorConfig: hypervisorConfig,
-
-		AgentConfig: KataAgentConfig{},
-
-		NetworkConfig: netConfig,
-	}
-}
 
 func newTestContainerConfigNoop(contID string) ContainerConfig {
 	// Define the container command and bundle.
@@ -251,7 +224,7 @@ func createAndStartSandbox(ctx context.Context, config SandboxConfig) (sandbox V
 	if !ok {
 		return nil, "", fmt.Errorf("Could not get Sandbox")
 	}
-	sandboxDir = filepath.Join(s.newStore.RunStoragePath(), sandbox.ID())
+	sandboxDir = filepath.Join(s.store.RunStoragePath(), sandbox.ID())
 	_, err = os.Stat(sandboxDir)
 	if err != nil {
 		return nil, "", err
@@ -312,7 +285,7 @@ func TestCleanupContainer(t *testing.T) {
 
 	s, ok := p.(*Sandbox)
 	assert.True(ok)
-	sandboxDir := filepath.Join(s.newStore.RunStoragePath(), p.ID())
+	sandboxDir := filepath.Join(s.store.RunStoragePath(), p.ID())
 
 	_, err = os.Stat(sandboxDir)
 	if err == nil {

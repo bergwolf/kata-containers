@@ -314,6 +314,8 @@ build_rootfs_distro()
 	[ -n "${distro}" ] || usage 1
 	distro_config_dir="${script_dir}/${distro}"
 
+	[ -d "${distro_config_dir}" ] || die "Not found configuration directory ${distro_config_dir}"
+
 	# Source config.sh from distro
 	rootfs_config="${distro_config_dir}/${CONFIG_SH}"
 	source "${rootfs_config}"
@@ -323,8 +325,6 @@ build_rootfs_distro()
 	if [ -f "${rootfs_arch_config}" ]; then
 		source "${rootfs_arch_config}"
 	fi
-
-	[ -d "${distro_config_dir}" ] || die "Not found configuration directory ${distro_config_dir}"
 
 	if [ -z "$ROOTFS_DIR" ]; then
 		 ROOTFS_DIR="${script_dir}/rootfs-${OS_NAME}"
@@ -562,15 +562,14 @@ EOT
 		       -e '/^\[Unit\]/a ConditionPathExists=\/dev\/ptp0' ${chrony_systemd_service}
 	fi
 
-	# The CC on s390x for fedora needs to be manually set to gcc when the golang is downloaded from the main page.
-	# See issue: https://github.com/kata-containers/osbuilder/issues/217
-	[ "$distro" == "fedora" ] && [ "$ARCH" == "s390x" ] && export CC=gcc
-
 	AGENT_DIR="${ROOTFS_DIR}/usr/bin"
 	AGENT_DEST="${AGENT_DIR}/${AGENT_BIN}"
 
 	if [ -z "${AGENT_SOURCE_BIN}" ] ; then
-		[ "$ARCH" == "ppc64le" ] && { LIBC=gnu; echo "WARNING: Forcing LIBC=gnu for ppc64le because musl toolchain is not supported on ppc64le"; }
+		if [ "$ARCH" == "ppc64le" ] || [ "$ARCH" == "s390x" ]; then
+			LIBC=gnu
+			echo "WARNING: Forcing LIBC=gnu because $ARCH has no musl Rust target"
+		fi
 		[ "$LIBC" == "musl" ] && bash ${script_dir}/../../../ci/install_musl.sh
 		# rust agent needs ${arch}-unknown-linux-${LIBC}
 		rustup show | grep linux-${LIBC} > /dev/null || bash ${script_dir}/../../../ci/install_rust.sh
@@ -584,7 +583,9 @@ EOT
 
 		info "Build agent"
 		pushd "${agent_dir}"
-		[ -n "${AGENT_VERSION}" ] && git checkout "${AGENT_VERSION}" && OK "git checkout successful" || info "checkout failed!"
+		if [ -n "${AGENT_VERSION}" ]; then
+			git checkout "${AGENT_VERSION}" && OK "git checkout successful" || die "checkout agent ${AGENT_VERSION} failed!"
+		fi
 		make clean
 		make LIBC=${LIBC} INIT=${AGENT_INIT}
 		make install DESTDIR="${ROOTFS_DIR}" LIBC=${LIBC} INIT=${AGENT_INIT} SECCOMP=${SECCOMP}

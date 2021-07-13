@@ -6,12 +6,15 @@
 package virtcontainers
 
 import (
+	"context"
 	"fmt"
 	"time"
 
 	govmmQemu "github.com/kata-containers/govmm/qemu"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/device/config"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
+	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/utils"
+	"github.com/sirupsen/logrus"
 )
 
 type qemuS390x struct {
@@ -19,15 +22,18 @@ type qemuS390x struct {
 	qemuArchBase
 }
 
-const defaultQemuPath = "/usr/bin/qemu-system-s390x"
+const (
+	defaultQemuPath           = "/usr/bin/qemu-system-s390x"
+	defaultQemuMachineType    = QemuCCWVirtio
+	defaultQemuMachineOptions = "accel=kvm"
+	virtioSerialCCW           = "virtio-serial-ccw"
+	qmpMigrationWaitTimeout   = 5 * time.Second
+	logSubsystem              = "qemuS390x"
 
-const defaultQemuMachineType = QemuCCWVirtio
-
-const defaultQemuMachineOptions = "accel=kvm"
-
-const virtioSerialCCW = "virtio-serial-ccw"
-
-const qmpMigrationWaitTimeout = 5 * time.Second
+	// Secure Execution, also known as Protected Virtualization
+	// https://qemu.readthedocs.io/en/latest/system/s390x/protvirt.html
+	secExecID = "pv0"
+)
 
 // Verify needed parameters
 var kernelParams = []Param{
@@ -72,6 +78,12 @@ func newQemuArch(config HypervisorConfig) (qemuArch, error) {
 	// Set first bridge type to CCW
 	q.Bridges = append(q.Bridges, ccwbridge)
 
+	if config.ConfidentialGuest {
+		if err := q.enableProtection(); err != nil {
+			return nil, err
+		}
+	}
+
 	if config.ImagePath != "" {
 		q.kernelParams = append(q.kernelParams, commonVirtioblkKernelRootParams...)
 		q.kernelParamsNonDebug = append(q.kernelParamsNonDebug, kernelParamsSystemdNonDebug...)
@@ -87,9 +99,9 @@ func (q *qemuS390x) bridges(number uint32) {
 
 // appendConsole appends a console to devices.
 // The function has been overwriten to correctly set the driver to the CCW device
-func (q *qemuS390x) appendConsole(devices []govmmQemu.Device, path string) ([]govmmQemu.Device, error) {
+func (q *qemuS390x) appendConsole(ctx context.Context, devices []govmmQemu.Device, path string) ([]govmmQemu.Device, error) {
 	id := "serial0"
-	addr, b, err := q.addDeviceToBridge(id, types.CCW)
+	addr, b, err := q.addDeviceToBridge(ctx, id, types.CCW)
 	if err != nil {
 		return devices, fmt.Errorf("Failed to append console %v", err)
 	}
@@ -122,24 +134,24 @@ func (q *qemuS390x) appendConsole(devices []govmmQemu.Device, path string) ([]go
 	return devices, nil
 }
 
-func (q *qemuS390x) appendImage(devices []govmmQemu.Device, path string) ([]govmmQemu.Device, error) {
+func (q *qemuS390x) appendImage(ctx context.Context, devices []govmmQemu.Device, path string) ([]govmmQemu.Device, error) {
 	drive, err := genericImage(path)
 	if err != nil {
 		return nil, err
 	}
-	return q.appendCCWBlockDevice(devices, drive)
+	return q.appendCCWBlockDevice(ctx, devices, drive)
 }
 
-func (q *qemuS390x) appendBlockDevice(devices []govmmQemu.Device, drive config.BlockDrive) ([]govmmQemu.Device, error) {
-	return q.appendCCWBlockDevice(devices, drive)
+func (q *qemuS390x) appendBlockDevice(ctx context.Context, devices []govmmQemu.Device, drive config.BlockDrive) ([]govmmQemu.Device, error) {
+	return q.appendCCWBlockDevice(ctx, devices, drive)
 }
 
-func (q *qemuS390x) appendCCWBlockDevice(devices []govmmQemu.Device, drive config.BlockDrive) ([]govmmQemu.Device, error) {
+func (q *qemuS390x) appendCCWBlockDevice(ctx context.Context, devices []govmmQemu.Device, drive config.BlockDrive) ([]govmmQemu.Device, error) {
 	d, err := genericBlockDevice(drive, false)
 	if err != nil {
 		return devices, fmt.Errorf("Failed to append blk-dev %v", err)
 	}
-	addr, b, err := q.addDeviceToBridge(drive.ID, types.CCW)
+	addr, b, err := q.addDeviceToBridge(ctx, drive.ID, types.CCW)
 	if err != nil {
 		return devices, fmt.Errorf("Failed to append blk-dev %v", err)
 	}
@@ -151,10 +163,33 @@ func (q *qemuS390x) appendCCWBlockDevice(devices []govmmQemu.Device, drive confi
 	return devices, nil
 }
 
-// appendVhostUserDevice throws an error if vhost devices are tried to be used.
-// See issue https://github.com/kata-containers/runtime/issues/659
-func (q *qemuS390x) appendVhostUserDevice(devices []govmmQemu.Device, attr config.VhostUserDeviceAttrs) ([]govmmQemu.Device, error) {
-	return nil, fmt.Errorf("No vhost-user devices supported on s390x")
+func (q *qemuS390x) appendVhostUserDevice(ctx context.Context, devices []govmmQemu.Device, attr config.VhostUserDeviceAttrs) ([]govmmQemu.Device, error) {
+	if attr.Type != config.VhostUserFS {
+		return devices, fmt.Errorf("vhost-user device of type %s not supported on s390x, only vhost-user-fs-ccw is supported", attr.Type)
+	}
+
+	addr, b, err := q.addDeviceToBridge(ctx, attr.DevID, types.CCW)
+	if err != nil {
+		return devices, fmt.Errorf("Failed to append vhost user device: %s", err)
+	}
+	var devno string
+	devno, err = b.AddressFormatCCW(addr)
+	if err != nil {
+		return devices, fmt.Errorf("Failed to append vhost user device: %s", err)
+	}
+
+	qemuVhostUserDevice := govmmQemu.VhostUserDevice{
+		SocketPath:    attr.SocketPath,
+		CharDevID:     utils.MakeNameID("char", attr.DevID, maxDevIDSize),
+		TypeDevID:     utils.MakeNameID("fs", attr.DevID, maxDevIDSize),
+		Tag:           attr.Tag,
+		CacheSize:     attr.CacheSize,
+		VhostUserType: govmmQemu.VhostUserFS,
+		DevNo:         devno,
+	}
+
+	devices = append(devices, qemuVhostUserDevice)
+	return devices, nil
 }
 
 // supportGuestMemoryHotplug return false for s390x architecture. The pc-dimm backend device for s390x
@@ -163,13 +198,13 @@ func (q *qemuS390x) supportGuestMemoryHotplug() bool {
 	return false
 }
 
-func (q *qemuS390x) appendNetwork(devices []govmmQemu.Device, endpoint Endpoint) ([]govmmQemu.Device, error) {
+func (q *qemuS390x) appendNetwork(ctx context.Context, devices []govmmQemu.Device, endpoint Endpoint) ([]govmmQemu.Device, error) {
 	d, err := genericNetwork(endpoint, false, false, q.networkIndex)
 	if err != nil {
 		return devices, fmt.Errorf("Failed to append network %v", err)
 	}
 	q.networkIndex++
-	addr, b, err := q.addDeviceToBridge(d.ID, types.CCW)
+	addr, b, err := q.addDeviceToBridge(ctx, d.ID, types.CCW)
 	if err != nil {
 		return devices, fmt.Errorf("Failed to append network %v", err)
 	}
@@ -182,8 +217,8 @@ func (q *qemuS390x) appendNetwork(devices []govmmQemu.Device, endpoint Endpoint)
 	return devices, nil
 }
 
-func (q *qemuS390x) appendRNGDevice(devices []govmmQemu.Device, rngDev config.RNGDev) ([]govmmQemu.Device, error) {
-	addr, b, err := q.addDeviceToBridge(rngDev.ID, types.CCW)
+func (q *qemuS390x) appendRNGDevice(ctx context.Context, devices []govmmQemu.Device, rngDev config.RNGDev) ([]govmmQemu.Device, error) {
+	addr, b, err := q.addDeviceToBridge(ctx, rngDev.ID, types.CCW)
 	if err != nil {
 		return devices, fmt.Errorf("Failed to append RNG-Device %v", err)
 	}
@@ -204,12 +239,12 @@ func (q *qemuS390x) appendRNGDevice(devices []govmmQemu.Device, rngDev config.RN
 	return devices, nil
 }
 
-func (q *qemuS390x) append9PVolume(devices []govmmQemu.Device, volume types.Volume) ([]govmmQemu.Device, error) {
+func (q *qemuS390x) append9PVolume(ctx context.Context, devices []govmmQemu.Device, volume types.Volume) ([]govmmQemu.Device, error) {
 	if volume.MountTag == "" || volume.HostPath == "" {
 		return devices, nil
 	}
 	d := generic9PVolume(volume, false)
-	addr, b, err := q.addDeviceToBridge(d.ID, types.CCW)
+	addr, b, err := q.addDeviceToBridge(ctx, d.ID, types.CCW)
 	if err != nil {
 		return devices, fmt.Errorf("Failed to append 9p-Volume %v", err)
 	}
@@ -226,9 +261,9 @@ func (q *qemuS390x) appendBridges(devices []govmmQemu.Device) []govmmQemu.Device
 	return genericAppendBridges(devices, q.Bridges, q.qemuMachine.Type)
 }
 
-func (q *qemuS390x) appendSCSIController(devices []govmmQemu.Device, enableIOThreads bool) ([]govmmQemu.Device, *govmmQemu.IOThread, error) {
+func (q *qemuS390x) appendSCSIController(ctx context.Context, devices []govmmQemu.Device, enableIOThreads bool) ([]govmmQemu.Device, *govmmQemu.IOThread, error) {
 	d, t := genericSCSIController(enableIOThreads, q.nestedRun)
-	addr, b, err := q.addDeviceToBridge(d.ID, types.CCW)
+	addr, b, err := q.addDeviceToBridge(ctx, d.ID, types.CCW)
 	if err != nil {
 		return devices, nil, fmt.Errorf("Failed to append scsi-controller %v", err)
 	}
@@ -241,10 +276,10 @@ func (q *qemuS390x) appendSCSIController(devices []govmmQemu.Device, enableIOThr
 	return devices, t, nil
 }
 
-func (q *qemuS390x) appendVSock(devices []govmmQemu.Device, vsock types.VSock) ([]govmmQemu.Device, error) {
+func (q *qemuS390x) appendVSock(ctx context.Context, devices []govmmQemu.Device, vsock types.VSock) ([]govmmQemu.Device, error) {
 	var devno string
 	id := fmt.Sprintf("vsock-%d", vsock.ContextID)
-	addr, b, err := q.addDeviceToBridge(id, types.CCW)
+	addr, b, err := q.addDeviceToBridge(ctx, id, types.CCW)
 	if err != nil {
 		return devices, fmt.Errorf("Failed to append VSock: %v", err)
 	}
@@ -270,11 +305,50 @@ func (q *qemuS390x) appendIOMMU(devices []govmmQemu.Device) ([]govmmQemu.Device,
 	return devices, fmt.Errorf("S390x does not support appending a vIOMMU")
 }
 
-func (q *qemuS390x) addDeviceToBridge(ID string, t types.Type) (string, types.Bridge, error) {
-	addr, b, err := genericAddDeviceToBridge(q.Bridges, ID, types.CCW)
+func (q *qemuS390x) addDeviceToBridge(ctx context.Context, ID string, t types.Type) (string, types.Bridge, error) {
+	addr, b, err := genericAddDeviceToBridge(ctx, q.Bridges, ID, types.CCW)
 	if err != nil {
 		return "", b, err
 	}
 
 	return fmt.Sprintf("%04x", addr), b, nil
+}
+
+// enableProtection enables guest protection for QEMU's machine option.
+func (q *qemuS390x) enableProtection() error {
+	protection, err := availableGuestProtection()
+	if err != nil {
+		return err
+	}
+	if protection != seProtection {
+		return fmt.Errorf("Got unexpected protection %v, only seProtection (Secure Execution) is supported", protection)
+	}
+
+	q.protection = protection
+	if q.qemuMachine.Options != "" {
+		q.qemuMachine.Options += ","
+	}
+	q.qemuMachine.Options += fmt.Sprintf("confidential-guest-support=%s", secExecID)
+	virtLog.WithFields(logrus.Fields{
+		"subsystem": logSubsystem,
+		"machine":   q.qemuMachine}).
+		Info("Enabling guest protection with Secure Execution")
+	return nil
+}
+
+// appendProtectionDevice appends a QEMU object for Secure Execution.
+// Takes devices and returns updated version. Takes BIOS and returns it (no modification on s390x).
+func (q *qemuS390x) appendProtectionDevice(devices []govmmQemu.Device, firmware string) ([]govmmQemu.Device, string, error) {
+	switch q.protection {
+	case seProtection:
+		return append(devices,
+			govmmQemu.Object{
+				Type: govmmQemu.SecExecGuest,
+				ID:   secExecID,
+			}), firmware, nil
+	case noneProtection:
+		return devices, firmware, nil
+	default:
+		return devices, firmware, fmt.Errorf("Unsupported guest protection technology: %v", q.protection)
+	}
 }

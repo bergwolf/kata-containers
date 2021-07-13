@@ -26,6 +26,7 @@ There are several kinds of Kata configurations and they are listed below.
 | `io.katacontainers.config.runtime.disable_new_netns` | `boolean` | determines if a new netns is created for the hypervisor process |
 | `io.katacontainers.config.runtime.internetworking_model` | string| determines how the VM should be connected to the container network interface. Valid values are `macvtap`, `tcfilter` and `none` |
 | `io.katacontainers.config.runtime.sandbox_cgroup_only`| `boolean` | determines if Kata processes are managed only in sandbox cgroup |
+| `io.katacontainers.config.runtime.enable_pprof` | `boolean` | enables Golang `pprof` for `containerd-shim-kata-v2` process |
 
 ## Agent Options
 | Key | Value Type | Comments |
@@ -60,7 +61,7 @@ There are several kinds of Kata configurations and they are listed below.
 | `io.katacontainers.config.hypervisor.enable_swap` | `boolean` | enable swap of VM memory |
 | `io.katacontainers.config.hypervisor.enable_vhost_user_store` | `boolean` | enable vhost-user storage device (QEMU) |
 | `io.katacontainers.config.hypervisor.enable_virtio_mem` | `boolean` | enable virtio-mem (QEMU) |
-| `io.katacontainers.config.hypervisor.entropy_source` | string| the path to a host source of entropy (`/dev/random`, `/dev/urandom` or real hardware RNG device) |
+| `io.katacontainers.config.hypervisor.entropy_source` (R) | string| the path to a host source of entropy (`/dev/random`, `/dev/urandom` or real hardware RNG device) |
 | `io.katacontainers.config.hypervisor.file_mem_backend` (R) | string | file based memory backend root directory |
 | `io.katacontainers.config.hypervisor.firmware_hash` | string | container firmware SHA-512 hash value |
 | `io.katacontainers.config.hypervisor.firmware` | string | the guest firmware that will run the container VM |
@@ -78,7 +79,7 @@ There are several kinds of Kata configurations and they are listed below.
 | `io.katacontainers.config.hypervisor.kernel` | string | the kernel used to boot the container VM |
 | `io.katacontainers.config.hypervisor.machine_accelerators` | string | machine specific accelerators for the hypervisor |
 | `io.katacontainers.config.hypervisor.machine_type` | string | the type of machine being emulated by the hypervisor |
-| `io.katacontainers.config.hypervisor.memory_offset` | uint32| the memory space used for `nvdimm` device by the hypervisor |
+| `io.katacontainers.config.hypervisor.memory_offset` | uint64| the memory space used for `nvdimm` device by the hypervisor |
 | `io.katacontainers.config.hypervisor.memory_slots` | uint32| the memory slots assigned to the VM by the hypervisor |
 | `io.katacontainers.config.hypervisor.msize_9p` | uint32 | the `msize` for 9p shares |
 | `io.katacontainers.config.hypervisor.path` | string | the hypervisor that will run the container VM |
@@ -95,6 +96,8 @@ There are several kinds of Kata configurations and they are listed below.
 
 In case of CRI-O, all annotations specified in the pod spec are passed down to Kata.
 
+# containerd Configuration
+
 For containerd, annotations specified in the pod spec are passed down to Kata
 starting with version `1.3.0` of containerd. Additionally, extra configuration is
 needed for containerd, by providing a `pod_annotations` field in the containerd config
@@ -107,11 +110,9 @@ for passing annotations to Kata from containerd:
 $ cat /etc/containerd/config
 ....
 
-[plugins.cri.containerd.runtimes.kata]
-           runtime_type = "io.containerd.runc.v1"
+         [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.kata]
+           runtime_type = "io.containerd.kata.v2"
            pod_annotations = ["io.katacontainers.*"]
-           [plugins.cri.containerd.runtimes.kata.options]
-             BinaryName = "/usr/bin/kata-runtime"
 ....
 
 ```
@@ -197,6 +198,7 @@ the configuration entry:
 | Key | Config file entry | Comments |
 |-------| ----- | ----- |
 | `ctlpath`  | `valid_ctlpaths` | Valid paths for `acrnctl` binary |
+| `entropy_source` | `valid_entropy_sources` | Valid entropy sources, e.g. `/dev/random` |
 | `file_mem_backend`  | `valid_file_mem_backends` | Valid locations for the file-based memory backend root directory |
 | `jailer_path`  | `valid_jailer_paths`| Valid paths for the jailer constraining the container VM (Firecracker) |
 | `path`  | `valid_hypervisor_paths` | Valid hypervisors to run the container VM |

@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 
@@ -63,46 +64,46 @@ type qemuArch interface {
 	memoryTopology(memoryMb, hostMemoryMb uint64, slots uint8) govmmQemu.Memory
 
 	// appendConsole appends a console to devices
-	appendConsole(devices []govmmQemu.Device, path string) ([]govmmQemu.Device, error)
+	appendConsole(ctx context.Context, devices []govmmQemu.Device, path string) ([]govmmQemu.Device, error)
 
 	// appendImage appends an image to devices
-	appendImage(devices []govmmQemu.Device, path string) ([]govmmQemu.Device, error)
+	appendImage(ctx context.Context, devices []govmmQemu.Device, path string) ([]govmmQemu.Device, error)
 
 	// appendBlockImage appends an image as block device
-	appendBlockImage(devices []govmmQemu.Device, path string) ([]govmmQemu.Device, error)
+	appendBlockImage(ctx context.Context, devices []govmmQemu.Device, path string) ([]govmmQemu.Device, error)
 
 	// appendNvdimmImage appends an image as nvdimm device
 	appendNvdimmImage(devices []govmmQemu.Device, path string) ([]govmmQemu.Device, error)
 
 	// appendSCSIController appens a SCSI controller to devices
-	appendSCSIController(devices []govmmQemu.Device, enableIOThreads bool) ([]govmmQemu.Device, *govmmQemu.IOThread, error)
+	appendSCSIController(context context.Context, devices []govmmQemu.Device, enableIOThreads bool) ([]govmmQemu.Device, *govmmQemu.IOThread, error)
 
 	// appendBridges appends bridges to devices
 	appendBridges(devices []govmmQemu.Device) []govmmQemu.Device
 
 	// append9PVolume appends a 9P volume to devices
-	append9PVolume(devices []govmmQemu.Device, volume types.Volume) ([]govmmQemu.Device, error)
+	append9PVolume(ctx context.Context, devices []govmmQemu.Device, volume types.Volume) ([]govmmQemu.Device, error)
 
 	// appendSocket appends a socket to devices
 	appendSocket(devices []govmmQemu.Device, socket types.Socket) []govmmQemu.Device
 
 	// appendVSock appends a vsock PCI to devices
-	appendVSock(devices []govmmQemu.Device, vsock types.VSock) ([]govmmQemu.Device, error)
+	appendVSock(ctx context.Context, devices []govmmQemu.Device, vsock types.VSock) ([]govmmQemu.Device, error)
 
 	// appendNetwork appends a endpoint device to devices
-	appendNetwork(devices []govmmQemu.Device, endpoint Endpoint) ([]govmmQemu.Device, error)
+	appendNetwork(ctx context.Context, devices []govmmQemu.Device, endpoint Endpoint) ([]govmmQemu.Device, error)
 
 	// appendBlockDevice appends a block drive to devices
-	appendBlockDevice(devices []govmmQemu.Device, drive config.BlockDrive) ([]govmmQemu.Device, error)
+	appendBlockDevice(ctx context.Context, devices []govmmQemu.Device, drive config.BlockDrive) ([]govmmQemu.Device, error)
 
 	// appendVhostUserDevice appends a vhost user device to devices
-	appendVhostUserDevice(devices []govmmQemu.Device, drive config.VhostUserDeviceAttrs) ([]govmmQemu.Device, error)
+	appendVhostUserDevice(ctx context.Context, devices []govmmQemu.Device, drive config.VhostUserDeviceAttrs) ([]govmmQemu.Device, error)
 
 	// appendVFIODevice appends a VFIO device to devices
 	appendVFIODevice(devices []govmmQemu.Device, vfioDevice config.VFIODev) []govmmQemu.Device
 
 	// appendRNGDevice appends a RNG device to devices
-	appendRNGDevice(devices []govmmQemu.Device, rngDevice config.RNGDev) ([]govmmQemu.Device, error)
+	appendRNGDevice(ctx context.Context, devices []govmmQemu.Device, rngDevice config.RNGDev) ([]govmmQemu.Device, error)
 
 	// addDeviceToBridge adds devices to the bus
 	addDeviceToBridge(ctx context.Context, ID string, t types.Type) (string, types.Bridge, error)
@@ -142,22 +143,52 @@ type qemuArch interface {
 
 	// append pvpanic device
 	appendPVPanicDevice(devices []govmmQemu.Device) ([]govmmQemu.Device, error)
+
+	// append protection device.
+	// This implementation is architecture specific, some archs may need
+	// a firmware, returns a string containing the path to the firmware that should
+	// be used with the -bios option, ommit -bios option if the path is empty.
+	appendProtectionDevice(devices []govmmQemu.Device, firmware string) ([]govmmQemu.Device, string, error)
 }
 
+// Kind of guest protection
+type guestProtection uint8
+
+const (
+	noneProtection guestProtection = iota
+
+	//Intel Trust Domain Extensions
+	//https://software.intel.com/content/www/us/en/develop/articles/intel-trust-domain-extensions.html
+	tdxProtection
+
+	// AMD Secure Encrypted Virtualization
+	// https://developer.amd.com/sev/
+	sevProtection
+
+	// IBM POWER 9 Protected Execution Facility
+	// https://www.kernel.org/doc/html/latest/powerpc/ultravisor.html
+	pefProtection
+
+	// IBM Secure Execution (IBM Z & LinuxONE)
+	// https://www.kernel.org/doc/html/latest/virt/kvm/s390-pv.html
+	seProtection
+)
+
 type qemuArchBase struct {
-	qemuMachine          govmmQemu.Machine
-	qemuExePath          string
-	memoryOffset         uint32
+	memoryOffset         uint64
+	networkIndex         int
 	nestedRun            bool
 	vhost                bool
 	disableNvdimm        bool
 	dax                  bool
-	networkIndex         int
+	protection           guestProtection
+	qemuMachine          govmmQemu.Machine
+	qemuExePath          string
+	PFlash               []string
 	kernelParamsNonDebug []Param
 	kernelParamsDebug    []Param
 	kernelParams         []Param
 	Bridges              []types.Bridge
-	PFlash		     []string
 }
 
 const (
@@ -181,9 +212,6 @@ const (
 	// QemuPCLite is the QEMU pc-lite machine type for amd64
 	QemuPCLite = "pc-lite"
 
-	// QemuPC is the QEMU pc machine type for amd64
-	QemuPC = "pc"
-
 	// QemuQ35 is the QEMU Q35 machine type for amd64
 	QemuQ35 = "q35"
 
@@ -201,7 +229,7 @@ const (
 
 	qmpCapMigrationIgnoreShared = "x-ignore-shared"
 
-	qemuNvdimmOption = "nvdimm"
+	qemuNvdimmOption = "nvdimm=on"
 )
 
 // kernelParamsNonDebug is a list of the default kernel
@@ -313,7 +341,7 @@ func (q *qemuArchBase) memoryTopology(memoryMb, hostMemoryMb uint64, slots uint8
 	return memory
 }
 
-func (q *qemuArchBase) appendConsole(devices []govmmQemu.Device, path string) ([]govmmQemu.Device, error) {
+func (q *qemuArchBase) appendConsole(_ context.Context, devices []govmmQemu.Device, path string) ([]govmmQemu.Device, error) {
 	serial := govmmQemu.SerialDevice{
 		Driver:        govmmQemu.VirtioSerial,
 		ID:            "serial0",
@@ -385,16 +413,16 @@ func (q *qemuArchBase) appendNvdimmImage(devices []govmmQemu.Device, path string
 	return devices, nil
 }
 
-func (q *qemuArchBase) appendImage(devices []govmmQemu.Device, path string) ([]govmmQemu.Device, error) {
-	return q.appendBlockImage(devices, path)
+func (q *qemuArchBase) appendImage(ctx context.Context, devices []govmmQemu.Device, path string) ([]govmmQemu.Device, error) {
+	return q.appendBlockImage(ctx, devices, path)
 }
 
-func (q *qemuArchBase) appendBlockImage(devices []govmmQemu.Device, path string) ([]govmmQemu.Device, error) {
+func (q *qemuArchBase) appendBlockImage(ctx context.Context, devices []govmmQemu.Device, path string) ([]govmmQemu.Device, error) {
 	drive, err := genericImage(path)
 	if err != nil {
 		return nil, err
 	}
-	devices, err = q.appendBlockDevice(devices, drive)
+	devices, err = q.appendBlockDevice(ctx, devices, drive)
 	if err != nil {
 		return nil, err
 	}
@@ -422,7 +450,7 @@ func genericSCSIController(enableIOThreads, nestedRun bool) (govmmQemu.SCSIContr
 	return scsiController, t
 }
 
-func (q *qemuArchBase) appendSCSIController(devices []govmmQemu.Device, enableIOThreads bool) ([]govmmQemu.Device, *govmmQemu.IOThread, error) {
+func (q *qemuArchBase) appendSCSIController(_ context.Context, devices []govmmQemu.Device, enableIOThreads bool) ([]govmmQemu.Device, *govmmQemu.IOThread, error) {
 	d, t := genericSCSIController(enableIOThreads, q.nestedRun)
 	devices = append(devices, d)
 	return devices, t, nil
@@ -480,7 +508,7 @@ func genericAppend9PVolume(devices []govmmQemu.Device, volume types.Volume, nest
 	return d, nil
 }
 
-func (q *qemuArchBase) append9PVolume(devices []govmmQemu.Device, volume types.Volume) ([]govmmQemu.Device, error) {
+func (q *qemuArchBase) append9PVolume(_ context.Context, devices []govmmQemu.Device, volume types.Volume) ([]govmmQemu.Device, error) {
 	if volume.MountTag == "" || volume.HostPath == "" {
 		return devices, nil
 	}
@@ -514,7 +542,7 @@ func (q *qemuArchBase) appendSocket(devices []govmmQemu.Device, socket types.Soc
 	return devices
 }
 
-func (q *qemuArchBase) appendVSock(devices []govmmQemu.Device, vsock types.VSock) ([]govmmQemu.Device, error) {
+func (q *qemuArchBase) appendVSock(_ context.Context, devices []govmmQemu.Device, vsock types.VSock) ([]govmmQemu.Device, error) {
 	devices = append(devices,
 		govmmQemu.VSOCKDevice{
 			ID:            fmt.Sprintf("vsock-%d", vsock.ContextID),
@@ -592,7 +620,7 @@ func genericNetwork(endpoint Endpoint, vhost, nestedRun bool, index int) (govmmQ
 	return d, nil
 }
 
-func (q *qemuArchBase) appendNetwork(devices []govmmQemu.Device, endpoint Endpoint) ([]govmmQemu.Device, error) {
+func (q *qemuArchBase) appendNetwork(_ context.Context, devices []govmmQemu.Device, endpoint Endpoint) ([]govmmQemu.Device, error) {
 	d, err := genericNetwork(endpoint, q.vhost, q.nestedRun, q.networkIndex)
 	if err != nil {
 		return devices, fmt.Errorf("Failed to append network %v", err)
@@ -624,7 +652,7 @@ func genericBlockDevice(drive config.BlockDrive, nestedRun bool) (govmmQemu.Bloc
 	}, nil
 }
 
-func (q *qemuArchBase) appendBlockDevice(devices []govmmQemu.Device, drive config.BlockDrive) ([]govmmQemu.Device, error) {
+func (q *qemuArchBase) appendBlockDevice(_ context.Context, devices []govmmQemu.Device, drive config.BlockDrive) ([]govmmQemu.Device, error) {
 	d, err := genericBlockDevice(drive, q.nestedRun)
 	if err != nil {
 		return devices, fmt.Errorf("Failed to append block device %v", err)
@@ -633,7 +661,7 @@ func (q *qemuArchBase) appendBlockDevice(devices []govmmQemu.Device, drive confi
 	return devices, nil
 }
 
-func (q *qemuArchBase) appendVhostUserDevice(devices []govmmQemu.Device, attr config.VhostUserDeviceAttrs) ([]govmmQemu.Device, error) {
+func (q *qemuArchBase) appendVhostUserDevice(ctx context.Context, devices []govmmQemu.Device, attr config.VhostUserDeviceAttrs) ([]govmmQemu.Device, error) {
 	qemuVhostUserDevice := govmmQemu.VhostUserDevice{}
 
 	switch attr.Type {
@@ -678,7 +706,7 @@ func (q *qemuArchBase) appendVFIODevice(devices []govmmQemu.Device, vfioDev conf
 	return devices
 }
 
-func (q *qemuArchBase) appendRNGDevice(devices []govmmQemu.Device, rngDev config.RNGDev) ([]govmmQemu.Device, error) {
+func (q *qemuArchBase) appendRNGDevice(_ context.Context, devices []govmmQemu.Device, rngDev config.RNGDev) ([]govmmQemu.Device, error) {
 	devices = append(devices,
 		govmmQemu.RngDevice{
 			ID:       rngDev.ID,
@@ -812,4 +840,10 @@ func (q *qemuArchBase) getPFlash() ([]string, error) {
 
 func (q *qemuArchBase) setPFlash(p []string) {
 	q.PFlash = p
+}
+
+// append protection device
+func (q *qemuArchBase) appendProtectionDevice(devices []govmmQemu.Device, firmware string) ([]govmmQemu.Device, string, error) {
+	virtLog.WithField("arch", runtime.GOARCH).Warnf("Confidential Computing has not been implemented for this architecture")
+	return devices, firmware, nil
 }

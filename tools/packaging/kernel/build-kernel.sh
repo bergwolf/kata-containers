@@ -31,7 +31,7 @@ readonly kernel_config_repo="github.com/${project_name}/kata-containers/tools/pa
 readonly patches_repo="github.com/${project_name}/kata-containers/tools/packaging"
 readonly patches_repo_dir="${GOPATH}/src/${patches_repo}"
 # Default path to search patches to apply to kernel
-readonly default_patches_dir="${script_dir}/patches/"
+readonly default_patches_dir="${script_dir}/patches"
 # Default path to search config for kata
 readonly default_kernel_config_dir="${script_dir}/configs"
 # Default path to search for kernel config fragments
@@ -49,6 +49,8 @@ experimental_kernel="false"
 force_setup_generate_config="false"
 #GPU kernel support
 gpu_vendor=""
+#Confidential guest type 
+conf_guest=""
 #
 patches_path=""
 #
@@ -98,6 +100,7 @@ Options:
 	-p <path>   	: Path to a directory with patches to apply to kernel.
 	-t <hypervisor>	: Hypervisor_target.
 	-v <version>	: Kernel version to use if kernel path not provided.
+	-x <type>	: Confidential guest protection type, such as sev
 EOT
 	exit "$exit_code"
 }
@@ -123,12 +126,6 @@ get_kernel() {
 	[ ! -d "${kernel_path}" ] || die "kernel_path already exist"
 
 
-	if [[ ${experimental_kernel} == "true" ]]; then
-		kernel_tarball="linux-${version}.tar.gz"
-		curl --fail -OL "https://gitlab.com/virtio-fs/linux/-/archive/${version}/${kernel_tarball}"
-		tar xf "${kernel_tarball}"
-		mv "linux-${version}" "${kernel_path}"
-	else
 
 		#Remove extra 'v'
 		version=${version#v}
@@ -159,7 +156,6 @@ get_kernel() {
 		tar xf "${kernel_tarball}"
 
 		mv "linux-${version}" "${kernel_path}"
-	fi
 }
 
 get_major_kernel_version() {
@@ -214,6 +210,12 @@ get_kernel_frag_path() {
 		info "Add kernel config for GPU due to '-g ${gpu_vendor}'"
 		local gpu_configs="$(ls ${gpu_path}/${gpu_vendor}.conf)"
 		all_configs="${all_configs} ${gpu_configs}"
+	fi
+
+	if [[ "${conf_guest}" != "" ]];then
+		info "Enabling config for '${conf_guest}' confidential guest protection"
+		local conf_configs="$(ls ${arch_path}/${conf_guest}/*.conf)"
+		all_configs="${all_configs} ${conf_configs}"
 	fi
 
 	info "Constructing config from fragments: ${config_path}"
@@ -329,15 +331,16 @@ setup_kernel() {
 		fi
 
 		[ -n "$kernel_path" ] || die "failed to find kernel source path"
-
-		get_config_and_patches
-
-		[ -d "${patches_path}" ] || die " patches path '${patches_path}' does not exist"
 	fi
+
+	get_config_and_patches
+
+	[ -d "${patches_path}" ] || die " patches path '${patches_path}' does not exist"
 
 	local major_kernel
 	major_kernel=$(get_major_kernel_version "${kernel_version}")
 	local patches_dir_for_version="${patches_path}/${major_kernel}.x"
+	local experimental_patches_dir="${patches_path}/${major_kernel}.x/experimental"
 
 	[ -n "${arch_target}" ] || arch_target="$(uname -m)"
 	arch_target=$(arch_to_kernel "${arch_target}")
@@ -346,6 +349,12 @@ setup_kernel() {
 
 	# Apply version specific patches
 	${packaging_scripts_dir}/apply_patches.sh "${patches_dir_for_version}"
+
+	# Apply version specific patches for experimental build
+	if [ "${experimental_kernel}" == "true" ] ;then
+		info "Apply experimental patches"
+		${packaging_scripts_dir}/apply_patches.sh "${experimental_patches_dir}"
+	fi
 
 	[ -n "${hypervisor_target}" ] || hypervisor_target="kvm"
 	[ -n "${kernel_config_path}" ] || kernel_config_path=$(get_default_kernel_config "${kernel_version}" "${hypervisor_target}" "${arch_target}" "${kernel_path}")
@@ -381,10 +390,14 @@ install_kata() {
 
 	suffix=""
 	if [[ ${experimental_kernel} == "true" ]]; then
-		suffix="-virtiofs"
+		suffix="-experimental"
 	fi
 	if [[ ${gpu_vendor} != "" ]];then
 		suffix="-${gpu_vendor}-gpu${suffix}"
+	fi
+
+	if [[ ${conf_guest} != "" ]];then
+		suffix="-${conf_guest}${suffix}"
 	fi
 
 	vmlinuz="vmlinuz-${kernel_version}-${config_version}${suffix}"
@@ -424,7 +437,7 @@ install_kata() {
 }
 
 main() {
-	while getopts "a:c:defg:hk:p:t:v:" opt; do
+	while getopts "a:c:defg:hk:p:t:v:x:" opt; do
 		case "$opt" in
 			a)
 				arch_target="${OPTARG}"
@@ -461,6 +474,13 @@ main() {
 			v)
 				kernel_version="${OPTARG}"
 				;;
+			x)
+				conf_guest="${OPTARG}"
+				case "$conf_guest" in
+					sev) ;;
+					*) die "Confidential guest type '$conf_guest' not supported" ;;
+				esac
+				;;
 		esac
 	done
 
@@ -474,6 +494,8 @@ main() {
 	if [ -z "$kernel_version" ]; then
 		if [[ ${experimental_kernel} == "true" ]]; then
 			kernel_version=$(get_from_kata_deps "assets.kernel-experimental.tag" "${kata_version}")
+			#Remove extra 'v'
+			kernel_version="${kernel_version#v}"
 		else
 			kernel_version=$(get_from_kata_deps "assets.kernel.version" "${kata_version}")
 			#Remove extra 'v'

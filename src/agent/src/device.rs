@@ -5,6 +5,7 @@
 
 use libc::{c_uint, major, minor};
 use nix::sys::stat;
+use regex::Regex;
 use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
@@ -13,14 +14,20 @@ use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+#[cfg(target_arch = "s390x")]
+use crate::ccw;
 use crate::linux_abi::*;
-use crate::mount::{DRIVER_BLK_TYPE, DRIVER_MMIO_BLK_TYPE, DRIVER_NVDIMM_TYPE, DRIVER_SCSI_TYPE};
+use crate::mount::{
+    DRIVER_BLK_CCW_TYPE, DRIVER_BLK_TYPE, DRIVER_MMIO_BLK_TYPE, DRIVER_NVDIMM_TYPE,
+    DRIVER_SCSI_TYPE,
+};
 use crate::pci;
 use crate::sandbox::Sandbox;
-use crate::{AGENT_CONFIG, GLOBAL_DEVICE_WATCHER};
+use crate::uevent::{wait_for_uevent, Uevent, UeventMatcher};
 use anyhow::{anyhow, Result};
 use oci::{LinuxDeviceCgroup, LinuxResources, Spec};
 use protocols::agent::Device;
+use tracing::instrument;
 
 // Convenience macro to obtain the scope logger
 macro_rules! sl {
@@ -31,25 +38,30 @@ macro_rules! sl {
 
 const VM_ROOTFS: &str = "/";
 
+#[derive(Debug)]
 struct DevIndexEntry {
     idx: usize,
     residx: Vec<usize>,
 }
 
+#[derive(Debug)]
 struct DevIndex(HashMap<String, DevIndexEntry>);
 
+#[instrument]
 pub fn rescan_pci_bus() -> Result<()> {
     online_device(SYSFS_PCI_BUS_RESCAN_FILE)
 }
 
+#[instrument]
 pub fn online_device(path: &str) -> Result<()> {
     fs::write(path, "1")?;
     Ok(())
 }
 
-// pciPathToSysfs fetches the sysfs path for a PCI path, relative to
-// the syfs path for the PCI host bridge, based on the PCI path
+// pcipath_to_sysfs fetches the sysfs path for a PCI path, relative to
+// the sysfs path for the PCI host bridge, based on the PCI path
 // provided.
+#[instrument]
 fn pcipath_to_sysfs(root_bus_sysfs: &str, pcipath: &pci::Path) -> Result<String> {
     let mut bus = "0000:00".to_string();
     let mut relpath = String::new();
@@ -87,78 +99,164 @@ fn pcipath_to_sysfs(root_bus_sysfs: &str, pcipath: &pci::Path) -> Result<String>
     Ok(relpath)
 }
 
-async fn get_device_name(sandbox: &Arc<Mutex<Sandbox>>, dev_addr: &str) -> Result<String> {
-    // Keep the same lock order as uevent::handle_block_add_event(), otherwise it may cause deadlock.
-    let mut w = GLOBAL_DEVICE_WATCHER.lock().await;
-    let sb = sandbox.lock().await;
-    for (key, value) in sb.pci_device_map.iter() {
-        if key.contains(dev_addr) {
-            info!(sl!(), "Device {} found in pci device map", dev_addr);
-            return Ok(format!("{}/{}", SYSTEM_DEV_PATH, value));
-        }
-    }
-    drop(sb);
-
-    // If device is not found in the device map, hotplug event has not
-    // been received yet, create and add channel to the watchers map.
-    // The key of the watchers map is the device we are interested in.
-    // Note this is done inside the lock, not to miss any events from the
-    // global udev listener.
-    let (tx, rx) = tokio::sync::oneshot::channel::<String>();
-    w.insert(dev_addr.to_string(), Some(tx));
-    drop(w);
-
-    info!(sl!(), "Waiting on channel for device notification\n");
-    let hotplug_timeout = AGENT_CONFIG.read().await.hotplug_timeout;
-
-    let dev_name = match tokio::time::timeout(hotplug_timeout, rx).await {
-        Ok(v) => v?,
-        Err(_) => {
-            let watcher = GLOBAL_DEVICE_WATCHER.clone();
-            let mut w = watcher.lock().await;
-            w.remove_entry(dev_addr);
-
-            return Err(anyhow!(
-                "Timeout reached after {:?} waiting for device {}",
-                hotplug_timeout,
-                dev_addr
-            ));
-        }
-    };
-
-    Ok(format!("{}/{}", SYSTEM_DEV_PATH, &dev_name))
+// FIXME: This matcher is only correct if the guest has at most one
+// SCSI host.
+#[derive(Debug)]
+struct ScsiBlockMatcher {
+    search: String,
 }
 
+impl ScsiBlockMatcher {
+    fn new(scsi_addr: &str) -> ScsiBlockMatcher {
+        let search = format!(r"/0:0:{}/block/", scsi_addr);
+
+        ScsiBlockMatcher { search }
+    }
+}
+
+impl UeventMatcher for ScsiBlockMatcher {
+    fn is_match(&self, uev: &Uevent) -> bool {
+        uev.subsystem == "block" && uev.devpath.contains(&self.search) && !uev.devname.is_empty()
+    }
+}
+
+#[instrument]
 pub async fn get_scsi_device_name(
     sandbox: &Arc<Mutex<Sandbox>>,
     scsi_addr: &str,
 ) -> Result<String> {
-    let dev_sub_path = format!("{}{}/{}", SCSI_HOST_CHANNEL, scsi_addr, SCSI_BLOCK_SUFFIX);
+    let matcher = ScsiBlockMatcher::new(scsi_addr);
 
     scan_scsi_bus(scsi_addr)?;
-    get_device_name(sandbox, &dev_sub_path).await
+    let uev = wait_for_uevent(sandbox, matcher).await?;
+    Ok(format!("{}/{}", SYSTEM_DEV_PATH, &uev.devname))
 }
 
-pub async fn get_pci_device_name(
+#[derive(Debug)]
+struct VirtioBlkPciMatcher {
+    rex: Regex,
+}
+
+impl VirtioBlkPciMatcher {
+    fn new(relpath: &str) -> VirtioBlkPciMatcher {
+        let root_bus = create_pci_root_bus_path();
+        let re = format!(r"^{}{}/virtio[0-9]+/block/", root_bus, relpath);
+        VirtioBlkPciMatcher {
+            rex: Regex::new(&re).unwrap(),
+        }
+    }
+}
+
+impl UeventMatcher for VirtioBlkPciMatcher {
+    fn is_match(&self, uev: &Uevent) -> bool {
+        uev.subsystem == "block" && self.rex.is_match(&uev.devpath) && !uev.devname.is_empty()
+    }
+}
+
+#[instrument]
+pub async fn get_virtio_blk_pci_device_name(
     sandbox: &Arc<Mutex<Sandbox>>,
     pcipath: &pci::Path,
 ) -> Result<String> {
     let root_bus_sysfs = format!("{}{}", SYSFS_DIR, create_pci_root_bus_path());
     let sysfs_rel_path = pcipath_to_sysfs(&root_bus_sysfs, pcipath)?;
+    let matcher = VirtioBlkPciMatcher::new(&sysfs_rel_path);
 
     rescan_pci_bus()?;
-    get_device_name(sandbox, &sysfs_rel_path).await
+
+    let uev = wait_for_uevent(sandbox, matcher).await?;
+    Ok(format!("{}/{}", SYSTEM_DEV_PATH, &uev.devname))
 }
 
-pub async fn get_pmem_device_name(
+#[cfg(target_arch = "s390x")]
+#[derive(Debug)]
+struct VirtioBlkCCWMatcher {
+    rex: Regex,
+}
+
+#[cfg(target_arch = "s390x")]
+impl VirtioBlkCCWMatcher {
+    fn new(root_bus_path: &str, device: &ccw::Device) -> Self {
+        let re = format!(
+            r"^{}/0\.[0-3]\.[0-9a-f]{{1,4}}/{}/virtio[0-9]+/block/",
+            root_bus_path, device
+        );
+        VirtioBlkCCWMatcher {
+            rex: Regex::new(&re).unwrap(),
+        }
+    }
+}
+
+#[cfg(target_arch = "s390x")]
+impl UeventMatcher for VirtioBlkCCWMatcher {
+    fn is_match(&self, uev: &Uevent) -> bool {
+        uev.action == "add" && self.rex.is_match(&uev.devpath) && !uev.devname.is_empty()
+    }
+}
+
+#[cfg(target_arch = "s390x")]
+#[instrument]
+pub async fn get_virtio_blk_ccw_device_name(
     sandbox: &Arc<Mutex<Sandbox>>,
-    pmem_devname: &str,
+    device: &ccw::Device,
 ) -> Result<String> {
-    let dev_sub_path = format!("/{}/{}", SCSI_BLOCK_SUFFIX, pmem_devname);
-    get_device_name(sandbox, &dev_sub_path).await
+    let matcher = VirtioBlkCCWMatcher::new(&create_ccw_root_bus_path(), device);
+    let uev = wait_for_uevent(sandbox, matcher).await?;
+    let devname = uev.devname;
+    return match Path::new(SYSTEM_DEV_PATH).join(&devname).to_str() {
+        Some(path) => Ok(String::from(path)),
+        None => Err(anyhow!("CCW device name {} is not valid UTF-8", &devname)),
+    };
+}
+
+#[derive(Debug)]
+struct PmemBlockMatcher {
+    suffix: String,
+}
+
+impl PmemBlockMatcher {
+    fn new(devname: &str) -> PmemBlockMatcher {
+        let suffix = format!(r"/block/{}", devname);
+
+        PmemBlockMatcher { suffix }
+    }
+}
+
+impl UeventMatcher for PmemBlockMatcher {
+    fn is_match(&self, uev: &Uevent) -> bool {
+        uev.subsystem == "block"
+            && uev.devpath.starts_with(ACPI_DEV_PATH)
+            && uev.devpath.ends_with(&self.suffix)
+            && !uev.devname.is_empty()
+    }
+}
+
+#[instrument]
+pub async fn wait_for_pmem_device(sandbox: &Arc<Mutex<Sandbox>>, devpath: &str) -> Result<()> {
+    let devname = match devpath.strip_prefix("/dev/") {
+        Some(dev) => dev,
+        None => {
+            return Err(anyhow!(
+                "Storage source '{}' must start with /dev/",
+                devpath
+            ))
+        }
+    };
+
+    let matcher = PmemBlockMatcher::new(devname);
+    let uev = wait_for_uevent(sandbox, matcher).await?;
+    if uev.devname != devname {
+        return Err(anyhow!(
+            "Unexpected device name {} for pmem device (expected {})",
+            uev.devname,
+            devname
+        ));
+    }
+    Ok(())
 }
 
 /// Scan SCSI bus for the given SCSI address(SCSI-Id and LUN)
+#[instrument]
 fn scan_scsi_bus(scsi_addr: &str) -> Result<()> {
     let tokens: Vec<&str> = scsi_addr.split(':').collect();
     if tokens.len() != 2 {
@@ -193,6 +291,7 @@ fn scan_scsi_bus(scsi_addr: &str) -> Result<()> {
 // the same device in the list of devices provided through the OCI spec.
 // This is needed to update information about minor/major numbers that cannot
 // be predicted from the caller.
+#[instrument]
 fn update_spec_device_list(device: &Device, spec: &mut Spec, devidx: &DevIndex) -> Result<()> {
     let major_id: c_uint;
     let minor_id: c_uint;
@@ -269,6 +368,7 @@ fn update_spec_device_list(device: &Device, spec: &mut Spec, devidx: &DevIndex) 
 
 // device.Id should be the predicted device name (vda, vdb, ...)
 // device.VmPath already provides a way to send it in
+#[instrument]
 async fn virtiommio_blk_device_handler(
     device: &Device,
     spec: &mut Spec,
@@ -283,6 +383,7 @@ async fn virtiommio_blk_device_handler(
 }
 
 // device.Id should be a PCI path string
+#[instrument]
 async fn virtio_blk_device_handler(
     device: &Device,
     spec: &mut Spec,
@@ -290,19 +391,41 @@ async fn virtio_blk_device_handler(
     devidx: &DevIndex,
 ) -> Result<()> {
     let mut dev = device.clone();
+    let pcipath = pci::Path::from_str(&device.id)?;
 
-    // When "Id (PCI path)" is not set, we allow to use the predicted
-    // "VmPath" passed from kata-runtime Note this is a special code
-    // path for cloud-hypervisor when BDF information is not available
-    if !device.id.is_empty() {
-        let pcipath = pci::Path::from_str(&device.id)?;
-        dev.vm_path = get_pci_device_name(sandbox, &pcipath).await?;
-    }
+    dev.vm_path = get_virtio_blk_pci_device_name(sandbox, &pcipath).await?;
 
     update_spec_device_list(&dev, spec, devidx)
 }
 
+// device.id should be a CCW path string
+#[cfg(target_arch = "s390x")]
+#[instrument]
+async fn virtio_blk_ccw_device_handler(
+    device: &Device,
+    spec: &mut Spec,
+    sandbox: &Arc<Mutex<Sandbox>>,
+    devidx: &DevIndex,
+) -> Result<()> {
+    let mut dev = device.clone();
+    let ccw_device = ccw::Device::from_str(&device.id)?;
+    dev.vm_path = get_virtio_blk_ccw_device_name(sandbox, &ccw_device).await?;
+    update_spec_device_list(&dev, spec, devidx)
+}
+
+#[cfg(not(target_arch = "s390x"))]
+#[instrument]
+async fn virtio_blk_ccw_device_handler(
+    _: &Device,
+    _: &mut Spec,
+    _: &Arc<Mutex<Sandbox>>,
+    _: &DevIndex,
+) -> Result<()> {
+    Err(anyhow!("CCW is only supported on s390x"))
+}
+
 // device.Id should be the SCSI address of the disk in the format "scsiID:lunID"
+#[instrument]
 async fn virtio_scsi_device_handler(
     device: &Device,
     spec: &mut Spec,
@@ -314,6 +437,7 @@ async fn virtio_scsi_device_handler(
     update_spec_device_list(&dev, spec, devidx)
 }
 
+#[instrument]
 async fn virtio_nvdimm_device_handler(
     device: &Device,
     spec: &mut Spec,
@@ -352,6 +476,7 @@ impl DevIndex {
     }
 }
 
+#[instrument]
 pub async fn add_devices(
     devices: &[Device],
     spec: &mut Spec,
@@ -366,6 +491,7 @@ pub async fn add_devices(
     Ok(())
 }
 
+#[instrument]
 async fn add_device(
     device: &Device,
     spec: &mut Spec,
@@ -390,6 +516,7 @@ async fn add_device(
 
     match device.field_type.as_str() {
         DRIVER_BLK_TYPE => virtio_blk_device_handler(device, spec, sandbox, devidx).await,
+        DRIVER_BLK_CCW_TYPE => virtio_blk_ccw_device_handler(device, spec, sandbox, devidx).await,
         DRIVER_MMIO_BLK_TYPE => virtiommio_blk_device_handler(device, spec, sandbox, devidx).await,
         DRIVER_NVDIMM_TYPE => virtio_nvdimm_device_handler(device, spec, sandbox, devidx).await,
         DRIVER_SCSI_TYPE => virtio_scsi_device_handler(device, spec, sandbox, devidx).await,
@@ -400,6 +527,7 @@ async fn add_device(
 // update_device_cgroup update the device cgroup for container
 // to not allow access to the guest root partition. This prevents
 // the container from being able to access the VM rootfs.
+#[instrument]
 pub fn update_device_cgroup(spec: &mut Spec) -> Result<()> {
     let meta = fs::metadata(VM_ROOTFS)?;
     let rdev = meta.dev();
@@ -430,6 +558,7 @@ pub fn update_device_cgroup(spec: &mut Spec) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::uevent::spawn_test_watcher;
     use oci::Linux;
     use tempfile::tempdir;
 
@@ -775,5 +904,168 @@ mod tests {
 
         let relpath = pcipath_to_sysfs(rootbuspath, &path234);
         assert_eq!(relpath.unwrap(), "/0000:00:02.0/0000:01:03.0/0000:02:04.0");
+    }
+
+    // We use device specific variants of this for real cases, but
+    // they have some complications that make them troublesome to unit
+    // test
+    async fn example_get_device_name(
+        sandbox: &Arc<Mutex<Sandbox>>,
+        relpath: &str,
+    ) -> Result<String> {
+        let matcher = VirtioBlkPciMatcher::new(relpath);
+
+        let uev = wait_for_uevent(sandbox, matcher).await?;
+
+        Ok(uev.devname)
+    }
+
+    #[tokio::test]
+    async fn test_get_device_name() {
+        let devname = "vda";
+        let root_bus = create_pci_root_bus_path();
+        let relpath = "/0000:00:0a.0/0000:03:0b.0";
+        let devpath = format!("{}{}/virtio4/block/{}", root_bus, relpath, devname);
+
+        let mut uev = crate::uevent::Uevent::default();
+        uev.action = crate::linux_abi::U_EVENT_ACTION_ADD.to_string();
+        uev.subsystem = "block".to_string();
+        uev.devpath = devpath.clone();
+        uev.devname = devname.to_string();
+
+        let logger = slog::Logger::root(slog::Discard, o!());
+        let sandbox = Arc::new(Mutex::new(Sandbox::new(&logger).unwrap()));
+
+        let mut sb = sandbox.lock().await;
+        sb.uevent_map.insert(devpath.clone(), uev);
+        drop(sb); // unlock
+
+        let name = example_get_device_name(&sandbox, relpath).await;
+        assert!(name.is_ok(), "{}", name.unwrap_err());
+        assert_eq!(name.unwrap(), devname);
+
+        let mut sb = sandbox.lock().await;
+        let uev = sb.uevent_map.remove(&devpath).unwrap();
+        drop(sb); // unlock
+
+        spawn_test_watcher(sandbox.clone(), uev);
+
+        let name = example_get_device_name(&sandbox, relpath).await;
+        assert!(name.is_ok(), "{}", name.unwrap_err());
+        assert_eq!(name.unwrap(), devname);
+    }
+
+    #[tokio::test]
+    async fn test_virtio_blk_matcher() {
+        let root_bus = create_pci_root_bus_path();
+        let devname = "vda";
+
+        let mut uev_a = crate::uevent::Uevent::default();
+        let relpath_a = "/0000:00:0a.0";
+        uev_a.action = crate::linux_abi::U_EVENT_ACTION_ADD.to_string();
+        uev_a.subsystem = "block".to_string();
+        uev_a.devname = devname.to_string();
+        uev_a.devpath = format!("{}{}/virtio4/block/{}", root_bus, relpath_a, devname);
+        let matcher_a = VirtioBlkPciMatcher::new(&relpath_a);
+
+        let mut uev_b = uev_a.clone();
+        let relpath_b = "/0000:00:0a.0/0000:00:0b.0";
+        uev_b.devpath = format!("{}{}/virtio0/block/{}", root_bus, relpath_b, devname);
+        let matcher_b = VirtioBlkPciMatcher::new(&relpath_b);
+
+        assert!(matcher_a.is_match(&uev_a));
+        assert!(matcher_b.is_match(&uev_b));
+        assert!(!matcher_b.is_match(&uev_a));
+        assert!(!matcher_a.is_match(&uev_b));
+    }
+
+    #[cfg(target_arch = "s390x")]
+    #[tokio::test]
+    async fn test_virtio_blk_ccw_matcher() {
+        let root_bus = create_ccw_root_bus_path();
+        let subsystem = "block";
+        let devname = "vda";
+        let relpath = "0.0.0002";
+
+        let mut uev = crate::uevent::Uevent::default();
+        uev.action = crate::linux_abi::U_EVENT_ACTION_ADD.to_string();
+        uev.subsystem = subsystem.to_string();
+        uev.devname = devname.to_string();
+        uev.devpath = format!(
+            "{}/0.0.0001/{}/virtio1/{}/{}",
+            root_bus, relpath, subsystem, devname
+        );
+
+        // Valid path
+        let device = ccw::Device::from_str(relpath).unwrap();
+        let matcher = VirtioBlkCCWMatcher::new(&root_bus, &device);
+        assert!(matcher.is_match(&uev));
+
+        // Invalid paths
+        uev.devpath = format!(
+            "{}/0.0.0001/0.0.0003/virtio1/{}/{}",
+            root_bus, subsystem, devname
+        );
+        assert!(!matcher.is_match(&uev));
+
+        uev.devpath = format!("0.0.0001/{}/virtio1/{}/{}", relpath, subsystem, devname);
+        assert!(!matcher.is_match(&uev));
+
+        uev.devpath = format!(
+            "{}/0.0.0001/{}/virtio/{}/{}",
+            root_bus, relpath, subsystem, devname
+        );
+        assert!(!matcher.is_match(&uev));
+
+        uev.devpath = format!("{}/0.0.0001/{}/virtio1", root_bus, relpath);
+        assert!(!matcher.is_match(&uev));
+
+        uev.devpath = format!(
+            "{}/1.0.0001/{}/virtio1/{}/{}",
+            root_bus, relpath, subsystem, devname
+        );
+        assert!(!matcher.is_match(&uev));
+
+        uev.devpath = format!(
+            "{}/0.4.0001/{}/virtio1/{}/{}",
+            root_bus, relpath, subsystem, devname
+        );
+        assert!(!matcher.is_match(&uev));
+
+        uev.devpath = format!(
+            "{}/0.0.10000/{}/virtio1/{}/{}",
+            root_bus, relpath, subsystem, devname
+        );
+        assert!(!matcher.is_match(&uev));
+    }
+
+    #[tokio::test]
+    async fn test_scsi_block_matcher() {
+        let root_bus = create_pci_root_bus_path();
+        let devname = "sda";
+
+        let mut uev_a = crate::uevent::Uevent::default();
+        let addr_a = "0:0";
+        uev_a.action = crate::linux_abi::U_EVENT_ACTION_ADD.to_string();
+        uev_a.subsystem = "block".to_string();
+        uev_a.devname = devname.to_string();
+        uev_a.devpath = format!(
+            "{}/0000:00:00.0/virtio0/host0/target0:0:0/0:0:{}/block/sda",
+            root_bus, addr_a
+        );
+        let matcher_a = ScsiBlockMatcher::new(&addr_a);
+
+        let mut uev_b = uev_a.clone();
+        let addr_b = "2:0";
+        uev_b.devpath = format!(
+            "{}/0000:00:00.0/virtio0/host0/target0:0:2/0:0:{}/block/sdb",
+            root_bus, addr_b
+        );
+        let matcher_b = ScsiBlockMatcher::new(&addr_b);
+
+        assert!(matcher_a.is_match(&uev_a));
+        assert!(matcher_b.is_match(&uev_b));
+        assert!(!matcher_b.is_match(&uev_a));
+        assert!(!matcher_a.is_match(&uev_b));
     }
 }

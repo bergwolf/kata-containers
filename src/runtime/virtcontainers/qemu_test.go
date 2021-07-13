@@ -11,7 +11,6 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	govmmQemu "github.com/kata-containers/govmm/qemu"
@@ -194,7 +193,7 @@ func TestQemuKnobs(t *testing.T) {
 	assert.NoError(err)
 
 	q := &qemu{
-		store: sandbox.newStore,
+		store: sandbox.store,
 	}
 	err = q.createSandbox(context.Background(), sandbox.id, NetworkNamespace{}, &sandbox.config.HypervisorConfig)
 	assert.NoError(err)
@@ -363,7 +362,7 @@ func TestQemuQemuPath(t *testing.T) {
 	qemuConfig.HypervisorPath = expectedPath
 	qkvm := &qemuArchBase{
 		qemuMachine: govmmQemu.Machine{
-			Type:    "pc",
+			Type:    "q35",
 			Options: "",
 		},
 		qemuExePath: expectedPath,
@@ -462,7 +461,7 @@ func TestQemuFileBackedMem(t *testing.T) {
 	assert.NoError(err)
 
 	q := &qemu{
-		store: sandbox.newStore,
+		store: sandbox.store,
 	}
 	sandbox.config.HypervisorConfig.SharedFS = config.VirtioFS
 	err = q.createSandbox(context.Background(), sandbox.id, NetworkNamespace{}, &sandbox.config.HypervisorConfig)
@@ -477,7 +476,7 @@ func TestQemuFileBackedMem(t *testing.T) {
 	assert.NoError(err)
 
 	q = &qemu{
-		store: sandbox.newStore,
+		store: sandbox.store,
 	}
 	sandbox.config.HypervisorConfig.BootToBeTemplate = true
 	sandbox.config.HypervisorConfig.SharedFS = config.VirtioFS
@@ -493,7 +492,7 @@ func TestQemuFileBackedMem(t *testing.T) {
 	assert.NoError(err)
 
 	q = &qemu{
-		store: sandbox.newStore,
+		store: sandbox.store,
 	}
 	sandbox.config.HypervisorConfig.FileBackedMemRootDir = "/tmp/xyzabc"
 	err = q.createSandbox(context.Background(), sandbox.id, NetworkNamespace{}, &sandbox.config.HypervisorConfig)
@@ -507,7 +506,7 @@ func TestQemuFileBackedMem(t *testing.T) {
 	assert.NoError(err)
 
 	q = &qemu{
-		store: sandbox.newStore,
+		store: sandbox.store,
 	}
 	sandbox.config.HypervisorConfig.EnableVhostUserStore = true
 	sandbox.config.HypervisorConfig.HugePages = true
@@ -520,7 +519,7 @@ func TestQemuFileBackedMem(t *testing.T) {
 	assert.NoError(err)
 
 	q = &qemu{
-		store: sandbox.newStore,
+		store: sandbox.store,
 	}
 	sandbox.config.HypervisorConfig.EnableVhostUserStore = true
 	sandbox.config.HypervisorConfig.HugePages = false
@@ -541,42 +540,13 @@ func createQemuSandboxConfig() (*Sandbox, error) {
 		},
 	}
 
-	newStore, err := persist.GetDriver()
+	store, err := persist.GetDriver()
 	if err != nil {
 		return &Sandbox{}, err
 	}
-	sandbox.newStore = newStore
+	sandbox.store = store
 
 	return &sandbox, nil
-}
-
-func TestQemuVirtiofsdArgs(t *testing.T) {
-	assert := assert.New(t)
-
-	q := &qemu{
-		id: "foo",
-		config: HypervisorConfig{
-			VirtioFSCache: "none",
-			Debug:         true,
-		},
-	}
-
-	savedKataHostSharedDir := kataHostSharedDir
-	kataHostSharedDir = func() string {
-		return "test-share-dir"
-	}
-	defer func() {
-		kataHostSharedDir = savedKataHostSharedDir
-	}()
-
-	result := "--fd=123 -o source=test-share-dir/foo/shared -o cache=none --syslog -o no_posix_lock -d"
-	args := q.virtiofsdArgs(123)
-	assert.Equal(strings.Join(args, " "), result)
-
-	q.config.Debug = false
-	result = "--fd=123 -o source=test-share-dir/foo/shared -o cache=none --syslog -o no_posix_lock -f"
-	args = q.virtiofsdArgs(123)
-	assert.Equal(strings.Join(args, " "), result)
 }
 
 func TestQemuGetpids(t *testing.T) {

@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/katautils/katatrace"
 	pb "github.com/kata-containers/kata-containers/src/runtime/protocols/cache"
 	vc "github.com/kata-containers/kata-containers/src/runtime/virtcontainers"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/factory/base"
@@ -18,10 +19,14 @@ import (
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/factory/template"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/utils"
 	"github.com/sirupsen/logrus"
-	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/label"
-	otelTrace "go.opentelemetry.io/otel/trace"
 )
+
+// factoryTracingTags defines tags for the trace span
+var factoryTracingTags = map[string]string{
+	"source":    "runtime",
+	"package":   "factory",
+	"subsystem": "factory",
+}
 
 var factoryLogger = logrus.FieldLogger(logrus.New())
 
@@ -40,17 +45,9 @@ type factory struct {
 	base base.FactoryBase
 }
 
-func trace(parent context.Context, name string) (otelTrace.Span, context.Context) {
-	tracer := otel.Tracer("kata")
-	ctx, span := tracer.Start(parent, name)
-	span.SetAttributes(label.Key("subsystem").String("factory"))
-
-	return span, ctx
-}
-
 // NewFactory returns a working factory.
 func NewFactory(ctx context.Context, config Config, fetchOnly bool) (vc.Factory, error) {
-	span, _ := trace(ctx, "NewFactory")
+	span, _ := katatrace.Trace(ctx, nil, "NewFactory", factoryTracingTags)
 	defer span.End()
 
 	err := config.VMConfig.Valid()
@@ -141,7 +138,7 @@ func (f *factory) checkConfig(config vc.VMConfig) error {
 
 // GetVM returns a working blank VM created by the factory.
 func (f *factory) GetVM(ctx context.Context, config vc.VMConfig) (*vc.VM, error) {
-	span, ctx := trace(ctx, "GetVM")
+	span, ctx := katatrace.Trace(ctx, f.log(), "GetVM", factoryTracingTags)
 	defer span.End()
 
 	hypervisorConfig := config.HypervisorConfig
@@ -191,7 +188,7 @@ func (f *factory) GetVM(ctx context.Context, config vc.VMConfig) (*vc.VM, error)
 	online := false
 	baseConfig := f.base.Config().HypervisorConfig
 	if baseConfig.NumVCPUs < hypervisorConfig.NumVCPUs {
-		err = vm.AddCPUs(ctx, hypervisorConfig.NumVCPUs - baseConfig.NumVCPUs)
+		err = vm.AddCPUs(ctx, hypervisorConfig.NumVCPUs-baseConfig.NumVCPUs)
 		if err != nil {
 			return nil, err
 		}
@@ -199,7 +196,7 @@ func (f *factory) GetVM(ctx context.Context, config vc.VMConfig) (*vc.VM, error)
 	}
 
 	if baseConfig.MemorySize < hypervisorConfig.MemorySize {
-		err = vm.AddMemory(ctx, hypervisorConfig.MemorySize - baseConfig.MemorySize)
+		err = vm.AddMemory(ctx, hypervisorConfig.MemorySize-baseConfig.MemorySize)
 		if err != nil {
 			return nil, err
 		}

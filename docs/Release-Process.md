@@ -18,8 +18,7 @@
 ## Requirements
 
 - [hub](https://github.com/github/hub)
-
-- OBS account with permissions on [`/home:katacontainers`](https://build.opensuse.org/project/subprojects/home:katacontainers)
+  * Using an [application token](https://github.com/settings/tokens) is required for hub.
 
 - GitHub permissions to push tags and create releases in Kata repositories.
 
@@ -30,22 +29,35 @@
 
 ## Release Process
 
+
 ### Bump all Kata repositories
 
-  - We have set up a Jenkins job to bump the version in the `VERSION` file in all Kata repositories. Go to the [Jenkins bump-job page](http://jenkins.katacontainers.io/job/release/build) to trigger a new job.
-  - Start a new job with variables for the job passed as:
-     - `BRANCH=<the-branch-you-want-to-bump>`
-     - `NEW_VERSION=<the-new-kata-version>`
-
-     For example, in the case where you want to make a patch release `1.10.2`, the variable `NEW_VERSION` should be `1.10.2` and `BRANCH` should point to  `stable-1.10`. In case of an alpha or release candidate release, `BRANCH` should point to `master` branch.
-
-  Alternatively, you can also bump the repositories using a script in the Kata packaging repo
+  Bump the repositories using a script in the Kata packaging repo, where:
+  - `BRANCH=<the-branch-you-want-to-bump>`
+  - `NEW_VERSION=<the-new-kata-version>`
   ```
   $ cd ${GOPATH}/src/github.com/kata-containers/kata-containers/tools/packaging/release
   $ export NEW_VERSION=<the-new-kata-version>
   $ export BRANCH=<the-branch-you-want-to-bump>
   $ ./update-repository-version.sh -p "$NEW_VERSION" "$BRANCH"
   ```
+
+### Point tests repository to stable branch
+
+  If you create a new stable branch, i.e. if your release changes a major or minor version number (not a patch release), then
+  you should modify the `tests` repository to point to that newly created stable branch and not the `main` branch.
+  The objective is that changes in the CI on the main branch will not impact the stable branch.
+
+  In the test directory, change references the main branch in:
+  * `README.md`
+  * `versions.yaml`
+  * `cmd/github-labels/labels.yaml.in`
+  * `cmd/pmemctl/pmemctl.sh`
+  * `.ci/lib.sh`
+  * `.ci/static-checks.sh`
+
+  See the commits in [the corresponding PR for stable-2.1](https://github.com/kata-containers/tests/pull/3504) for an example of the changes.
+
 
 ### Merge all bump version Pull requests
 
@@ -56,7 +68,7 @@
 ### Tag all Kata repositories
 
   Once all the pull requests to bump versions in all Kata repositories are merged,
-  tag all the repositories as shown below.  
+  tag all the repositories as shown below.
   ```
   $ cd ${GOPATH}/src/github.com/kata-containers/kata-containers/tools/packaging/release
   $ git checkout  <kata-branch-to-release>
@@ -66,7 +78,7 @@
 
 ### Check Git-hub Actions
 
-  We make use of [GitHub actions](https://github.com/features/actions) in this [file](https://github.com/kata-containers/kata-containers/blob/master/.github/workflows/main.yaml) in the `kata-containers/kata-containers` repository to build and upload release artifacts. This action is auto triggered with the above step when a new tag is pushed to the `kata-containers/kata-conatiners` repository.
+  We make use of [GitHub actions](https://github.com/features/actions) in this [file](https://github.com/kata-containers/kata-containers/blob/main/.github/workflows/main.yaml) in the `kata-containers/kata-containers` repository to build and upload release artifacts. This action is auto triggered with the above step when a new tag is pushed to the `kata-containers/kata-containers` repository.
 
   Check the [actions status page](https://github.com/kata-containers/kata-containers/actions) to verify all steps in the actions workflow have completed successfully. On success, a static tarball containing Kata release artifacts will be uploaded to the [Release page](https://github.com/kata-containers/kata-containers/releases).
 

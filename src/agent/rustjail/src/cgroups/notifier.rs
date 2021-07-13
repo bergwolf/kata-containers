@@ -8,7 +8,7 @@ use eventfd::{eventfd, EfdFlags};
 use nix::sys::eventfd;
 use std::fs::{self, File};
 use std::os::unix::io::{AsRawFd, FromRawFd};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::pipestream::PipeStream;
 use futures::StreamExt as _;
@@ -35,7 +35,7 @@ pub async fn notify_oom(cid: &str, cg_dir: String) -> Result<Receiver<String>> {
 // Flat keyed file format:
 //   KEY0 VAL0\n
 //   KEY1 VAL1\n
-fn get_value_from_cgroup(path: &PathBuf, key: &str) -> Result<i64> {
+fn get_value_from_cgroup(path: &Path, key: &str) -> Result<i64> {
     let content = fs::read_to_string(path)?;
     info!(
         sl!(),
@@ -117,12 +117,12 @@ async fn register_memory_event_v2(
                     return;
                 }
             }
-        }
 
-        // When a cgroup is destroyed, an event is sent to eventfd.
-        // So if the control path is gone, return instead of notifying.
-        if !Path::new(&event_control_path).exists() {
-            return;
+            // When a cgroup is destroyed, an event is sent to eventfd.
+            // So if the control path is gone, return instead of notifying.
+            if !Path::new(&event_control_path).exists() {
+                return;
+            }
         }
     });
 
@@ -137,19 +137,6 @@ async fn notify_on_oom(cid: &str, dir: String) -> Result<Receiver<String>> {
     }
 
     register_memory_event(cid, dir, "memory.oom_control", "").await
-}
-
-// level is one of "low", "medium", or "critical"
-async fn notify_memory_pressure(cid: &str, dir: String, level: &str) -> Result<Receiver<String>> {
-    if dir.is_empty() {
-        return Err(anyhow!("memory controller missing"));
-    }
-
-    if level != "low" && level != "medium" && level != "critical" {
-        return Err(anyhow!("invalid pressure level {}", level));
-    }
-
-    register_memory_event(cid, dir, "memory.pressure_level", level).await
 }
 
 async fn register_memory_event(

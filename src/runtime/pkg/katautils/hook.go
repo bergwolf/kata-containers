@@ -15,10 +15,17 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/katautils/katatrace"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
-	"go.opentelemetry.io/otel/label"
 )
+
+// hookTracingTags defines tags for the trace span
+var hookTracingTags = map[string]string{
+	"source":    "runtime",
+	"package":   "katautils",
+	"subsystem": "hook",
+}
 
 // Logger returns a logrus logger appropriate for logging hook messages
 func hookLogger() *logrus.Entry {
@@ -26,10 +33,8 @@ func hookLogger() *logrus.Entry {
 }
 
 func runHook(ctx context.Context, hook specs.Hook, cid, bundlePath string) error {
-	span, _ := Trace(ctx, "hook")
+	span, _ := katatrace.Trace(ctx, hookLogger(), "runHook", hookTracingTags)
 	defer span.End()
-
-	span.SetAttributes(label.Key("subsystem").String("runHook"))
 
 	// FIXME
 	// span.LogFields(
@@ -90,10 +95,9 @@ func runHook(ctx context.Context, hook specs.Hook, cid, bundlePath string) error
 }
 
 func runHooks(ctx context.Context, hooks []specs.Hook, cid, bundlePath, hookType string) error {
-	span, _ := Trace(ctx, "hooks")
+	span, _ := katatrace.Trace(ctx, hookLogger(), "runHooks", hookTracingTags)
+	katatrace.AddTag(span, "type", hookType)
 	defer span.End()
-
-	span.SetAttributes(label.Key("subsystem").String(hookType))
 
 	for _, hook := range hooks {
 		if err := runHook(ctx, hook, cid, bundlePath); err != nil {

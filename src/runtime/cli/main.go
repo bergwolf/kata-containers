@@ -22,14 +22,12 @@ import (
 	vc "github.com/kata-containers/kata-containers/src/runtime/virtcontainers"
 	exp "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/experimental"
 	vf "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/factory"
+	tl "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/factory/template"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/oci"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/rootless"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
-	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/label"
-	otelTrace "go.opentelemetry.io/otel/trace"
 )
 
 // specConfig is the name of the file holding the containers configuration
@@ -64,9 +62,6 @@ var originalLoggerLevel = logrus.WarnLevel
 
 var debug = false
 
-// if true, coredump when an internal error occurs or a fatal signal is received
-var crashOnError = false
-
 // concrete virtcontainer implementation
 var virtcontainersImpl = &vc.VCImpl{}
 
@@ -86,8 +81,8 @@ var defaultErrorFile = os.Stderr
 // runtimeFlags is the list of supported global command-line flags
 var runtimeFlags = []cli.Flag{
 	cli.StringFlag{
-		Name:    "config, kata-config",
-		Usage:   project + " config file path",
+		Name:  "config, kata-config",
+		Usage: project + " config file path",
 	},
 	cli.StringFlag{
 		Name:  "log",
@@ -110,8 +105,8 @@ var runtimeFlags = []cli.Flag{
 		Usage: "ignore cgroup permission errors ('true', 'false', or 'auto')",
 	},
 	cli.BoolFlag{
-		Name:    "show-default-config-paths, kata-show-default-config-paths",
-		Usage:   "show config file paths that will be checked for (in order)",
+		Name:  "show-default-config-paths, kata-show-default-config-paths",
+		Usage: "show config file paths that will be checked for (in order)",
 	},
 	cli.BoolFlag{
 		Name:  "systemd-cgroup",
@@ -128,16 +123,13 @@ var runtimeCommands = []cli.Command{
 	kataCheckCLICommand,
 	kataEnvCLICommand,
 	kataExecCLICommand,
+	kataMetricsCLICommand,
 	factoryCLICommand,
 }
 
 // runtimeBeforeSubcommands is the function to run before command-line
 // parsing occurs.
 var runtimeBeforeSubcommands = beforeSubcommands
-
-// runtimeAfterSubcommands is the function to run after the command-line
-// has been parsed.
-var runtimeAfterSubcommands = afterSubcommands
 
 // runtimeCommandNotFound is the function to handle an invalid sub-command.
 var runtimeCommandNotFound = commandNotFound
@@ -171,10 +163,6 @@ func init() {
 
 // setupSignalHandler sets up signal handling, starting a go routine to deal
 // with signals as they arrive.
-//
-// Note that the specified context is NOT used to create a trace span (since the
-// first (root) span must be created in beforeSubcommands()): it is simply
-// used to pass to the crash handling functions to finalise tracing.
 func setupSignalHandler(ctx context.Context) {
 	signals.SetLogger(kataLog)
 
@@ -182,10 +170,6 @@ func setupSignalHandler(ctx context.Context) {
 
 	for _, sig := range signals.HandledSignals() {
 		signal.Notify(sigCh, sig)
-	}
-
-	dieCb := func() {
-		katautils.StopTracing(ctx)
 	}
 
 	go func() {
@@ -201,7 +185,6 @@ func setupSignalHandler(ctx context.Context) {
 
 			if signals.FatalSignal(nativeSignal) {
 				kataLog.WithField("signal", sig).Error("received fatal signal")
-				signals.Die(dieCb)
 			} else if debug && signals.NonFatalSignal(nativeSignal) {
 				kataLog.WithField("signal", sig).Debug("handling signal")
 				signals.Backtrace()
@@ -213,23 +196,14 @@ func setupSignalHandler(ctx context.Context) {
 // setExternalLoggers registers the specified logger with the external
 // packages which accept a logger to handle their own logging.
 func setExternalLoggers(ctx context.Context, logger *logrus.Entry) {
-	var span otelTrace.Span
-
-	// Only create a new span if a root span already exists. This is
-	// required to ensure that this function will not disrupt the root
-	// span logic by creating a span before the proper root span has been
-	// created.
-
-	if otelTrace.SpanFromContext(ctx) != nil {
-		span, ctx = katautils.Trace(ctx, "setExternalLoggers")
-		defer span.End()
-	}
-
 	// Set virtcontainers logger.
 	vci.SetLogger(ctx, logger)
 
 	// Set vm factory logger.
 	vf.SetLogger(ctx, logger)
+
+	// Set vm factory template logger.
+	tl.SetLogger(ctx, logger)
 
 	// Set the OCI package logger.
 	oci.SetLogger(ctx, logger)
@@ -247,7 +221,6 @@ func beforeSubcommands(c *cli.Context) error {
 	var configFile string
 	var runtimeConfig oci.RuntimeConfig
 	var err error
-	var traceFlushFunc func()
 
 	katautils.SetConfigOptions(name, defaultRuntimeConfiguration, defaultSysConfRuntimeConfiguration)
 
@@ -273,7 +246,6 @@ func beforeSubcommands(c *cli.Context) error {
 	// Issue: https://github.com/kata-containers/runtime/issues/2428
 
 	ignoreConfigLogs := false
-	var traceRootSpan string
 
 	subCmdIsCheckCmd := (c.NArg() >= 1 && ((c.Args()[0] == "kata-check") || (c.Args()[0] == "check")))
 	if subCmdIsCheckCmd {
@@ -305,16 +277,13 @@ func beforeSubcommands(c *cli.Context) error {
 		cmdName := c.Args().First()
 		if c.App.Command(cmdName) != nil {
 			kataLog = kataLog.WithField("command", cmdName)
-
-			// Name for the root span (used for tracing) now the
-			// sub-command name is known.
-			traceRootSpan = name + " " + cmdName
 		}
 
-		// Since a context is required, pass a new (throw-away) one - we
-		// cannot use the main context as tracing hasn't been enabled yet
-		// (meaning any spans created at this point will be silently ignored).
-		setExternalLoggers(context.Background(), kataLog)
+		ctx, err := cliContextToContext(c)
+		if err != nil {
+			return err
+		}
+		setExternalLoggers(ctx, kataLog)
 
 		if c.NArg() == 1 && (c.Args()[0] == "kata-env" || c.Args()[0] == "env") {
 			// simply report the logging setup
@@ -322,27 +291,12 @@ func beforeSubcommands(c *cli.Context) error {
 		}
 	}
 
-	configFile, runtimeConfig, err = katautils.LoadConfiguration(c.GlobalString("config"), ignoreConfigLogs, false)
+	configFile, runtimeConfig, err = katautils.LoadConfiguration(c.GlobalString("kata-config"), ignoreConfigLogs)
 	if err != nil {
 		fatal(err)
 	}
 	if !subCmdIsCheckCmd {
 		debug = runtimeConfig.Debug
-		crashOnError = runtimeConfig.Debug
-
-		if traceRootSpan != "" {
-			// Create the tracer.
-			//
-			// Note: no spans are created until the command-line has been parsed.
-			// This delays collection of trace data slightly but benefits the user by
-			// ensuring the first span is the name of the sub-command being
-			// invoked from the command-line.
-			traceFlushFunc, err = setupTracing(c, traceRootSpan, &runtimeConfig)
-			if err != nil {
-				return err
-			}
-			defer traceFlushFunc()
-		}
 	}
 
 	args := strings.Join(c.Args(), " ")
@@ -381,36 +335,6 @@ func handleShowConfig(context *cli.Context) {
 	}
 }
 
-func setupTracing(context *cli.Context, rootSpanName string, config *oci.RuntimeConfig) (func(), error) {
-	flush, err := katautils.CreateTracer(name, config)
-	if err != nil {
-		return nil, err
-	}
-
-	ctx, err := cliContextToContext(context)
-	if err != nil {
-		return nil, err
-	}
-
-	// Create the root span now that the sub-command name is
-	// known.
-	//
-	// Note that this "Before" function is called (and returns)
-	// before the subcommand handler is called. As such, we cannot
-	// "Finish()" the span here - that is handled in the .After
-	// function.
-	tracer := otel.Tracer("kata")
-	newCtx, span := tracer.Start(ctx, rootSpanName)
-
-	span.SetAttributes(label.Key("subsystem").String("runtime"))
-
-	// Add tracer to metadata and update the context
-	context.App.Metadata["tracer"] = tracer
-	context.App.Metadata["context"] = newCtx
-
-	return flush, nil
-}
-
 // add supported experimental features in context
 func addExpFeatures(clictx *cli.Context, runtimeConfig oci.RuntimeConfig) error {
 	ctx, err := cliContextToContext(clictx)
@@ -424,19 +348,8 @@ func addExpFeatures(clictx *cli.Context, runtimeConfig oci.RuntimeConfig) error 
 	}
 
 	ctx = exp.ContextWithExp(ctx, exps)
-	// Add tracer to metadata and update the context
+	// Add experimental features to metadata and update the context
 	clictx.App.Metadata["context"] = ctx
-	return nil
-}
-
-func afterSubcommands(c *cli.Context) error {
-	ctx, err := cliContextToContext(c)
-	if err != nil {
-		return err
-	}
-
-	katautils.StopTracing(ctx)
-
 	return nil
 }
 
@@ -506,7 +419,6 @@ func createRuntimeApp(ctx context.Context, args []string) error {
 	app.Flags = runtimeFlags
 	app.Commands = runtimeCommands
 	app.Before = runtimeBeforeSubcommands
-	app.After = runtimeAfterSubcommands
 	app.EnableBashCompletion = true
 
 	// allow sub-commands to access context
@@ -582,12 +494,5 @@ func cliContextToContext(c *cli.Context) (context.Context, error) {
 func main() {
 	// create a new empty context
 	ctx := context.Background()
-
-	dieCb := func() {
-		katautils.StopTracing(ctx)
-	}
-
-	defer signals.HandlePanic(dieCb)
-
 	createRuntime(ctx)
 }

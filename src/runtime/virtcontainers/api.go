@@ -9,35 +9,27 @@ import (
 	"context"
 	"runtime"
 
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/katautils/katatrace"
 	deviceApi "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/device/api"
 	deviceConfig "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/device/config"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/cgroups"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/compatoci"
 	vcTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/types"
 	"github.com/sirupsen/logrus"
-	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/label"
-	otelTrace "go.opentelemetry.io/otel/trace"
 )
+
+// apiTracingTags defines tags for the trace span
+var apiTracingTags = map[string]string{
+	"source":    "runtime",
+	"packages":  "virtcontainers",
+	"subsystem": "api",
+}
 
 func init() {
 	runtime.LockOSThread()
 }
 
 var virtLog = logrus.WithField("source", "virtcontainers")
-
-// trace creates a new tracing span based on the specified name and parent
-// context.
-func trace(parent context.Context, name string) (otelTrace.Span, context.Context) {
-	tracer := otel.Tracer("kata")
-	ctx, span := tracer.Start(parent, name)
-	span.SetAttributes([]label.KeyValue{
-		label.Key("source").String("virtcontainers"),
-		label.Key("component").String("virtcontainers"),
-		label.Key("subsystem").String("api")}...)
-
-	return span, ctx
-}
 
 // SetLogger sets the logger for virtcontainers package.
 func SetLogger(ctx context.Context, logger *logrus.Entry) {
@@ -53,7 +45,7 @@ func SetLogger(ctx context.Context, logger *logrus.Entry) {
 // CreateSandbox is the virtcontainers sandbox creation entry point.
 // CreateSandbox creates a sandbox and its containers. It does not start them.
 func CreateSandbox(ctx context.Context, sandboxConfig SandboxConfig, factory Factory) (VCSandbox, error) {
-	span, ctx := trace(ctx, "CreateSandbox")
+	span, ctx := katatrace.Trace(ctx, virtLog, "CreateSandbox", apiTracingTags)
 	defer span.End()
 
 	s, err := createSandboxFromConfig(ctx, sandboxConfig, factory)
@@ -62,7 +54,7 @@ func CreateSandbox(ctx context.Context, sandboxConfig SandboxConfig, factory Fac
 }
 
 func createSandboxFromConfig(ctx context.Context, sandboxConfig SandboxConfig, factory Factory) (_ *Sandbox, err error) {
-	span, ctx := trace(ctx, "createSandboxFromConfig")
+	span, ctx := katatrace.Trace(ctx, virtLog, "createSandboxFromConfig", apiTracingTags)
 	defer span.End()
 
 	// Create the sandbox.
@@ -124,11 +116,6 @@ func createSandboxFromConfig(ctx context.Context, sandboxConfig SandboxConfig, f
 		return nil, err
 	}
 
-	// The sandbox is completely created now, we can store it.
-	if err = s.storeSandbox(ctx); err != nil {
-		return nil, err
-	}
-
 	return s, nil
 }
 
@@ -136,7 +123,7 @@ func createSandboxFromConfig(ctx context.Context, sandboxConfig SandboxConfig, f
 // in the sandbox left, do stop the sandbox and delete it. Those serial operations will be done exclusively by
 // locking the sandbox.
 func CleanupContainer(ctx context.Context, sandboxID, containerID string, force bool) error {
-	span, ctx := trace(ctx, "CleanupContainer")
+	span, ctx := katatrace.Trace(ctx, virtLog, "CleanupContainer", apiTracingTags)
 	defer span.End()
 
 	if sandboxID == "" {

@@ -191,6 +191,8 @@ func (s *Sandbox) dumpConfig(ss *persistapi.SandboxState) {
 		Cgroups:             sconfig.Cgroups,
 	}
 
+	ss.Config.SandboxBindMounts = append(ss.Config.SandboxBindMounts, sconfig.SandboxBindMounts...)
+
 	for _, e := range sconfig.Experimental {
 		ss.Config.Experimental = append(ss.Config.Experimental, e.Name)
 	}
@@ -222,6 +224,7 @@ func (s *Sandbox) dumpConfig(ss *persistapi.SandboxState) {
 		MemoryPath:              sconfig.HypervisorConfig.MemoryPath,
 		DevicesStatePath:        sconfig.HypervisorConfig.DevicesStatePath,
 		EntropySource:           sconfig.HypervisorConfig.EntropySource,
+		EntropySourceList:       sconfig.HypervisorConfig.EntropySourceList,
 		SharedFS:                sconfig.HypervisorConfig.SharedFS,
 		VirtioFSDaemon:          sconfig.HypervisorConfig.VirtioFSDaemon,
 		VirtioFSDaemonList:      sconfig.HypervisorConfig.VirtioFSDaemonList,
@@ -287,7 +290,7 @@ func (s *Sandbox) Save() error {
 	s.dumpNetwork(&ss)
 	s.dumpConfig(&ss)
 
-	if err := s.newStore.ToDisk(ss, cs); err != nil {
+	if err := s.store.ToDisk(ss, cs); err != nil {
 		return err
 	}
 
@@ -397,7 +400,7 @@ func (s *Sandbox) loadNetwork(netInfo persistapi.NetworkInfo) {
 
 // Restore will restore sandbox data from persist file on disk
 func (s *Sandbox) Restore() error {
-	ss, _, err := s.newStore.FromDisk(s.id)
+	ss, _, err := s.store.FromDisk(s.id)
 	if err != nil {
 		return err
 	}
@@ -412,7 +415,7 @@ func (s *Sandbox) Restore() error {
 
 // Restore will restore container data from persist file on disk
 func (c *Container) Restore() error {
-	_, css, err := c.sandbox.newStore.FromDisk(c.sandbox.id)
+	_, css, err := c.sandbox.store.FromDisk(c.sandbox.id)
 	if err != nil {
 		return err
 	}
@@ -458,6 +461,7 @@ func loadSandboxConfig(id string) (*SandboxConfig, error) {
 		DisableGuestSeccomp: savedConf.DisableGuestSeccomp,
 		Cgroups:             savedConf.Cgroups,
 	}
+	sconfig.SandboxBindMounts = append(sconfig.SandboxBindMounts, savedConf.SandboxBindMounts...)
 
 	for _, name := range savedConf.Experimental {
 		sconfig.Experimental = append(sconfig.Experimental, *exp.Get(name))
@@ -491,6 +495,7 @@ func loadSandboxConfig(id string) (*SandboxConfig, error) {
 		MemoryPath:              hconf.MemoryPath,
 		DevicesStatePath:        hconf.DevicesStatePath,
 		EntropySource:           hconf.EntropySource,
+		EntropySourceList:       hconf.EntropySourceList,
 		SharedFS:                hconf.SharedFS,
 		VirtioFSDaemon:          hconf.VirtioFSDaemon,
 		VirtioFSDaemonList:      hconf.VirtioFSDaemonList,

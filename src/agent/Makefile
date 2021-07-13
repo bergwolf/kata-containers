@@ -21,47 +21,13 @@ SOURCES := \
 VERSION_FILE := ./VERSION
 VERSION := $(shell grep -v ^\# $(VERSION_FILE))
 COMMIT_NO := $(shell git rev-parse HEAD 2>/dev/null || true)
-COMMIT_NO_SHORT := $(shell git rev-parse --short HEAD 2>/dev/null || true)
 COMMIT := $(if $(shell git status --porcelain --untracked-files=no 2>/dev/null || true),${COMMIT_NO}-dirty,${COMMIT_NO})
 COMMIT_MSG = $(if $(COMMIT),$(COMMIT),unknown)
 
 # Exported to allow cargo to see it
 export VERSION_COMMIT := $(if $(COMMIT),$(VERSION)-$(COMMIT),$(VERSION))
 
-##VAR BUILD_TYPE=release|debug type of rust build
-BUILD_TYPE = release
-
-##VAR ARCH=arch target to build (format: uname -m)
-ARCH = $(shell uname -m)
-##VAR LIBC=musl|gnu
-LIBC ?= musl
-ifneq ($(LIBC),musl)
-    ifeq ($(LIBC),gnu)
-        override LIBC = gnu
-    else
-        $(error "ERROR: A non supported LIBC value was passed. Supported values are musl and gnu")
-    endif
-endif
-
-ifeq ($(ARCH), ppc64le)
-    override ARCH = powerpc64le
-    override LIBC = gnu
-    $(warning "WARNING: powerpc64le-unknown-linux-musl target is unavailable")
-endif
-
-ifeq ($(ARCH), s390x)
-    override LIBC = gnu
-    $(warning "WARNING: s390x-unknown-linux-musl target is unavailable")
-endif
-
-
-EXTRA_RUSTFLAGS :=
-ifeq ($(ARCH), aarch64)
-    override EXTRA_RUSTFLAGS = -C link-arg=-lgcc
-    $(warning "WARNING: aarch64-musl needs extra symbols from libgcc")
-endif
-
-TRIPLE = $(ARCH)-unknown-linux-$(LIBC)
+include ../../utils.mk
 
 TARGET_PATH = target/$(TRIPLE)/$(BUILD_TYPE)/$(TARGET)
 
@@ -141,6 +107,9 @@ clippy: $(GENERATED_CODE)
 		-Aclippy::redundant_allocation \
 		-D warnings
 
+format:
+	cargo fmt -- --check
+
 
 ##TARGET install: install agent
 install: install-services
@@ -157,7 +126,7 @@ test:
 	@cargo test --all --target $(TRIPLE)
 
 ##TARGET check: run test
-check: test
+check: clippy format
 
 ##TARGET run: build and run agent
 run:

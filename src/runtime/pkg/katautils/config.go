@@ -1,4 +1,4 @@
-// Copyright (c) 2018 Intel Corporation
+// Copyright (c) 2018-2021 Intel Corporation
 // Copyright (c) 2018 HyperHQ Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
@@ -16,6 +16,7 @@ import (
 
 	"github.com/BurntSushi/toml"
 	govmmQemu "github.com/kata-containers/govmm/qemu"
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/katautils/katatrace"
 	vc "github.com/kata-containers/kata-containers/src/runtime/virtcontainers"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/device/config"
 	exp "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/experimental"
@@ -26,11 +27,6 @@ import (
 
 const (
 	defaultHypervisor = vc.QemuHypervisor
-)
-
-var (
-	// if true, enable opentracing support.
-	tracing = false
 )
 
 // The TOML configuration file contains a number of sections (or
@@ -61,6 +57,12 @@ type tomlConfig struct {
 	Runtime    runtime
 	Factory    factory
 	Netmon     netmon
+	Image      image
+}
+
+type image struct {
+	ServiceOffload bool   `toml:"service_offload"`
+	Provision      string `toml:"provision"`
 }
 
 type factory struct {
@@ -72,12 +74,9 @@ type factory struct {
 
 type hypervisor struct {
 	Path                    string   `toml:"path"`
-	HypervisorPathList      []string `toml:"valid_hypervisor_paths"`
 	JailerPath              string   `toml:"jailer_path"`
-	JailerPathList          []string `toml:"valid_jailer_paths"`
 	Kernel                  string   `toml:"kernel"`
 	CtlPath                 string   `toml:"ctlpath"`
-	CtlPathList             []string `toml:"valid_ctlpaths"`
 	Initrd                  string   `toml:"initrd"`
 	Image                   string   `toml:"image"`
 	Firmware                string   `toml:"firmware"`
@@ -89,33 +88,42 @@ type hypervisor struct {
 	EntropySource           string   `toml:"entropy_source"`
 	SharedFS                string   `toml:"shared_fs"`
 	VirtioFSDaemon          string   `toml:"virtio_fs_daemon"`
-	VirtioFSDaemonList      []string `toml:"valid_virtio_fs_daemon_paths"`
 	VirtioFSCache           string   `toml:"virtio_fs_cache"`
+	VhostUserStorePath      string   `toml:"vhost_user_store_path"`
+	FileBackedMemRootDir    string   `toml:"file_mem_backend"`
+	GuestHookPath           string   `toml:"guest_hook_path"`
+	GuestMemoryDumpPath     string   `toml:"guest_memory_dump_path"`
+	HypervisorPathList      []string `toml:"valid_hypervisor_paths"`
+	JailerPathList          []string `toml:"valid_jailer_paths"`
+	CtlPathList             []string `toml:"valid_ctlpaths"`
+	VirtioFSDaemonList      []string `toml:"valid_virtio_fs_daemon_paths"`
 	VirtioFSExtraArgs       []string `toml:"virtio_fs_extra_args"`
 	PFlashList              []string `toml:"pflashes"`
-	VirtioFSCacheSize       uint32   `toml:"virtio_fs_cache_size"`
-	BlockDeviceCacheSet     bool     `toml:"block_device_cache_set"`
-	BlockDeviceCacheDirect  bool     `toml:"block_device_cache_direct"`
-	BlockDeviceCacheNoflush bool     `toml:"block_device_cache_noflush"`
-	EnableVhostUserStore    bool     `toml:"enable_vhost_user_store"`
-	VhostUserStorePath      string   `toml:"vhost_user_store_path"`
 	VhostUserStorePathList  []string `toml:"valid_vhost_user_store_paths"`
+	FileBackedMemRootList   []string `toml:"valid_file_mem_backends"`
+	EntropySourceList       []string `toml:"valid_entropy_sources"`
+	EnableAnnotations       []string `toml:"enable_annotations"`
+	RxRateLimiterMaxRate    uint64   `toml:"rx_rate_limiter_max_rate"`
+	TxRateLimiterMaxRate    uint64   `toml:"tx_rate_limiter_max_rate"`
+	VirtioFSCacheSize       uint32   `toml:"virtio_fs_cache_size"`
 	NumVCPUs                int32    `toml:"default_vcpus"`
 	DefaultMaxVCPUs         uint32   `toml:"default_maxvcpus"`
 	MemorySize              uint32   `toml:"default_memory"`
 	MemSlots                uint32   `toml:"memory_slots"`
-	MemOffset               uint32   `toml:"memory_offset"`
+	MemOffset               uint64   `toml:"memory_offset"`
 	DefaultBridges          uint32   `toml:"default_bridges"`
 	Msize9p                 uint32   `toml:"msize_9p"`
 	PCIeRootPort            uint32   `toml:"pcie_root_port"`
+	BlockDeviceCacheSet     bool     `toml:"block_device_cache_set"`
+	BlockDeviceCacheDirect  bool     `toml:"block_device_cache_direct"`
+	BlockDeviceCacheNoflush bool     `toml:"block_device_cache_noflush"`
+	EnableVhostUserStore    bool     `toml:"enable_vhost_user_store"`
 	DisableBlockDeviceUse   bool     `toml:"disable_block_device_use"`
 	MemPrealloc             bool     `toml:"enable_mem_prealloc"`
 	HugePages               bool     `toml:"enable_hugepages"`
 	VirtioMem               bool     `toml:"enable_virtio_mem"`
 	IOMMU                   bool     `toml:"enable_iommu"`
 	IOMMUPlatform           bool     `toml:"enable_iommu_platform"`
-	FileBackedMemRootDir    string   `toml:"file_mem_backend"`
-	FileBackedMemRootList   []string `toml:"valid_file_mem_backends"`
 	Swap                    bool     `toml:"enable_swap"`
 	Debug                   bool     `toml:"enable_debug"`
 	DisableNestingChecks    bool     `toml:"disable_nesting_checks"`
@@ -123,36 +131,33 @@ type hypervisor struct {
 	DisableImageNvdimm      bool     `toml:"disable_image_nvdimm"`
 	HotplugVFIOOnRootBus    bool     `toml:"hotplug_vfio_on_root_bus"`
 	DisableVhostNet         bool     `toml:"disable_vhost_net"`
-	GuestHookPath           string   `toml:"guest_hook_path"`
-	RxRateLimiterMaxRate    uint64   `toml:"rx_rate_limiter_max_rate"`
-	TxRateLimiterMaxRate    uint64   `toml:"tx_rate_limiter_max_rate"`
-	EnableAnnotations       []string `toml:"enable_annotations"`
-	GuestMemoryDumpPath     string   `toml:"guest_memory_dump_path"`
 	GuestMemoryDumpPaging   bool     `toml:"guest_memory_dump_paging"`
+	ConfidentialGuest       bool     `toml:"confidential_guest"`
 }
 
 type runtime struct {
+	InterNetworkModel   string   `toml:"internetworking_model"`
+	JaegerEndpoint      string   `toml:"jaeger_endpoint"`
+	JaegerUser          string   `toml:"jaeger_user"`
+	JaegerPassword      string   `toml:"jaeger_password"`
+	SandboxBindMounts   []string `toml:"sandbox_bind_mounts"`
+	Experimental        []string `toml:"experimental"`
 	Debug               bool     `toml:"enable_debug"`
 	Tracing             bool     `toml:"enable_tracing"`
 	DisableNewNetNs     bool     `toml:"disable_new_netns"`
 	DisableGuestSeccomp bool     `toml:"disable_guest_seccomp"`
 	SandboxCgroupOnly   bool     `toml:"sandbox_cgroup_only"`
-	SandboxBindMounts   []string `toml:"sandbox_bind_mounts"`
-	Experimental        []string `toml:"experimental"`
-	InterNetworkModel   string   `toml:"internetworking_model"`
 	EnablePprof         bool     `toml:"enable_pprof"`
-	JaegerEndpoint      string   `toml:"jaeger_endpoint"`
-	JaegerUser          string   `toml:"jaeger_user"`
-	JaegerPassword      string   `toml:"jaeger_password"`
 }
 
 type agent struct {
-	Debug               bool     `toml:"enable_debug"`
-	Tracing             bool     `toml:"enable_tracing"`
 	TraceMode           string   `toml:"trace_mode"`
 	TraceType           string   `toml:"trace_type"`
 	KernelModules       []string `toml:"kernel_modules"`
+	Debug               bool     `toml:"enable_debug"`
+	Tracing             bool     `toml:"enable_tracing"`
 	DebugConsoleEnabled bool     `toml:"debug_console_enabled"`
+	DialTimeout         uint32   `toml:"dial_timeout"`
 }
 
 type netmon struct {
@@ -350,7 +355,7 @@ func (h hypervisor) defaultMemSlots() uint32 {
 	return slots
 }
 
-func (h hypervisor) defaultMemOffset() uint32 {
+func (h hypervisor) defaultMemOffset() uint64 {
 	offset := h.MemOffset
 	if offset == 0 {
 		offset = defaultMemOffset
@@ -449,20 +454,12 @@ func (h hypervisor) getInitrdAndImage() (initrd string, image string, err error)
 	return
 }
 
-func (h hypervisor) getRxRateLimiterCfg() (uint64, error) {
-	if h.RxRateLimiterMaxRate < 0 {
-		return 0, fmt.Errorf("rx Rate Limiter configuration must be greater than or equal to 0, max_rate %v", h.RxRateLimiterMaxRate)
-	}
-
-	return h.RxRateLimiterMaxRate, nil
+func (h hypervisor) getRxRateLimiterCfg() uint64 {
+	return h.RxRateLimiterMaxRate
 }
 
-func (h hypervisor) getTxRateLimiterCfg() (uint64, error) {
-	if h.TxRateLimiterMaxRate < 0 {
-		return 0, fmt.Errorf("tx Rate Limiter configuration must be greater than or equal to 0, max_rate %v", h.TxRateLimiterMaxRate)
-	}
-
-	return h.TxRateLimiterMaxRate, nil
+func (h hypervisor) getTxRateLimiterCfg() uint64 {
+	return h.TxRateLimiterMaxRate
 }
 
 func (h hypervisor) getIOMMUPlatform() bool {
@@ -476,6 +473,10 @@ func (h hypervisor) getIOMMUPlatform() bool {
 
 func (a agent) debugConsoleEnabled() bool {
 	return a.DebugConsoleEnabled
+}
+
+func (a agent) dialTimout() uint32 {
+	return a.DialTimeout
 }
 
 func (a agent) debug() bool {
@@ -547,15 +548,8 @@ func newFirecrackerHypervisorConfig(h hypervisor) (vc.HypervisorConfig, error) {
 		return vc.HypervisorConfig{}, err
 	}
 
-	rxRateLimiterMaxRate, err := h.getRxRateLimiterCfg()
-	if err != nil {
-		return vc.HypervisorConfig{}, err
-	}
-
-	txRateLimiterMaxRate, err := h.getTxRateLimiterCfg()
-	if err != nil {
-		return vc.HypervisorConfig{}, err
-	}
+	rxRateLimiterMaxRate := h.getRxRateLimiterCfg()
+	txRateLimiterMaxRate := h.getTxRateLimiterCfg()
 
 	return vc.HypervisorConfig{
 		HypervisorPath:        hypervisor,
@@ -572,6 +566,7 @@ func newFirecrackerHypervisorConfig(h hypervisor) (vc.HypervisorConfig, error) {
 		MemorySize:            h.defaultMemSz(),
 		MemSlots:              h.defaultMemSlots(),
 		EntropySource:         h.GetEntropySource(),
+		EntropySourceList:     h.EntropySourceList,
 		DefaultBridges:        h.defaultBridges(),
 		DisableBlockDeviceUse: h.DisableBlockDeviceUse,
 		HugePages:             h.HugePages,
@@ -656,15 +651,8 @@ func newQemuHypervisorConfig(h hypervisor) (vc.HypervisorConfig, error) {
 		return vc.HypervisorConfig{}, err
 	}
 
-	rxRateLimiterMaxRate, err := h.getRxRateLimiterCfg()
-	if err != nil {
-		return vc.HypervisorConfig{}, err
-	}
-
-	txRateLimiterMaxRate, err := h.getTxRateLimiterCfg()
-	if err != nil {
-		return vc.HypervisorConfig{}, err
-	}
+	rxRateLimiterMaxRate := h.getRxRateLimiterCfg()
+	txRateLimiterMaxRate := h.getTxRateLimiterCfg()
 
 	return vc.HypervisorConfig{
 		HypervisorPath:          hypervisor,
@@ -685,6 +673,7 @@ func newQemuHypervisorConfig(h hypervisor) (vc.HypervisorConfig, error) {
 		MemOffset:               h.defaultMemOffset(),
 		VirtioMem:               h.VirtioMem,
 		EntropySource:           h.GetEntropySource(),
+		EntropySourceList:       h.EntropySourceList,
 		DefaultBridges:          h.defaultBridges(),
 		DisableBlockDeviceUse:   h.DisableBlockDeviceUse,
 		SharedFS:                sharedFS,
@@ -721,6 +710,7 @@ func newQemuHypervisorConfig(h hypervisor) (vc.HypervisorConfig, error) {
 		EnableAnnotations:       h.EnableAnnotations,
 		GuestMemoryDumpPath:     h.GuestMemoryDumpPath,
 		GuestMemoryDumpPaging:   h.GuestMemoryDumpPaging,
+		ConfidentialGuest:       h.ConfidentialGuest,
 	}, nil
 }
 
@@ -776,6 +766,7 @@ func newAcrnHypervisorConfig(h hypervisor) (vc.HypervisorConfig, error) {
 		MemorySize:            h.defaultMemSz(),
 		MemSlots:              h.defaultMemSlots(),
 		EntropySource:         h.GetEntropySource(),
+		EntropySourceList:     h.EntropySourceList,
 		DefaultBridges:        h.defaultBridges(),
 		HugePages:             h.HugePages,
 		Mlock:                 !h.Swap,
@@ -852,6 +843,7 @@ func newClhHypervisorConfig(h hypervisor) (vc.HypervisorConfig, error) {
 		MemOffset:               h.defaultMemOffset(),
 		VirtioMem:               h.VirtioMem,
 		EntropySource:           h.GetEntropySource(),
+		EntropySourceList:       h.EntropySourceList,
 		DefaultBridges:          h.defaultBridges(),
 		DisableBlockDeviceUse:   h.DisableBlockDeviceUse,
 		SharedFS:                sharedFS,
@@ -927,7 +919,7 @@ func updateRuntimeConfigHypervisor(configPath string, tomlConf tomlConfig, confi
 	return nil
 }
 
-func updateRuntimeConfigAgent(configPath string, tomlConf tomlConfig, config *oci.RuntimeConfig, builtIn bool) error {
+func updateRuntimeConfigAgent(configPath string, tomlConf tomlConfig, config *oci.RuntimeConfig) error {
 	for _, agent := range tomlConf.Agent {
 		config.AgentConfig = vc.KataAgentConfig{
 			LongLiveConn:       true,
@@ -937,6 +929,7 @@ func updateRuntimeConfigAgent(configPath string, tomlConf tomlConfig, config *oc
 			TraceType:          agent.traceType(),
 			KernelModules:      agent.kernelModules(),
 			EnableDebugConsole: agent.debugConsoleEnabled(),
+			DialTimeout:        agent.dialTimout(),
 		}
 	}
 
@@ -1002,12 +995,12 @@ func SetKernelParams(runtimeConfig *oci.RuntimeConfig) error {
 	return nil
 }
 
-func updateRuntimeConfig(configPath string, tomlConf tomlConfig, config *oci.RuntimeConfig, builtIn bool) error {
+func updateRuntimeConfig(configPath string, tomlConf tomlConfig, config *oci.RuntimeConfig) error {
 	if err := updateRuntimeConfigHypervisor(configPath, tomlConf, config); err != nil {
 		return err
 	}
 
-	if err := updateRuntimeConfigAgent(configPath, tomlConf, config, builtIn); err != nil {
+	if err := updateRuntimeConfigAgent(configPath, tomlConf, config); err != nil {
 		return err
 	}
 
@@ -1072,6 +1065,7 @@ func GetDefaultHypervisorConfig() vc.HypervisorConfig {
 		RxRateLimiterMaxRate:    defaultRxRateLimiterMaxRate,
 		TxRateLimiterMaxRate:    defaultTxRateLimiterMaxRate,
 		SGXEPCSize:              defaultSGXEPCSize,
+		ConfidentialGuest:       defaultConfidentialGuest,
 	}
 }
 
@@ -1098,7 +1092,7 @@ func initConfig() (config oci.RuntimeConfig, err error) {
 //
 // All paths are resolved fully meaning if this function does not return an
 // error, all paths are valid at the time of the call.
-func LoadConfiguration(configPath string, ignoreLogging, builtIn bool) (resolvedConfigPath string, config oci.RuntimeConfig, err error) {
+func LoadConfiguration(configPath string, ignoreLogging bool) (resolvedConfigPath string, config oci.RuntimeConfig, err error) {
 
 	config, err = initConfig()
 	if err != nil {
@@ -1118,7 +1112,7 @@ func LoadConfiguration(configPath string, ignoreLogging, builtIn bool) (resolved
 	}
 
 	config.Trace = tomlConf.Runtime.Tracing
-	tracing = config.Trace
+	katatrace.SetTracing(config.Trace)
 
 	if tomlConf.Runtime.InterNetworkModel != "" {
 		err = config.InterNetworkModel.SetModel(tomlConf.Runtime.InterNetworkModel)
@@ -1140,7 +1134,7 @@ func LoadConfiguration(configPath string, ignoreLogging, builtIn bool) (resolved
 			}).Info("loaded configuration")
 	}
 
-	if err := updateRuntimeConfig(resolved, tomlConf, &config, builtIn); err != nil {
+	if err := updateRuntimeConfig(resolved, tomlConf, &config); err != nil {
 		return "", config, err
 	}
 

@@ -24,7 +24,7 @@ use anyhow::{anyhow, Context, Result};
 use libc::{self, pid_t};
 use nix::errno::Errno;
 use oci::{
-    LinuxBlockIO, LinuxCPU, LinuxDevice, LinuxDeviceCgroup, LinuxHugepageLimit, LinuxMemory,
+    LinuxBlockIo, LinuxCpu, LinuxDevice, LinuxDeviceCgroup, LinuxHugepageLimit, LinuxMemory,
     LinuxNetwork, LinuxPids, LinuxResources,
 };
 
@@ -36,6 +36,8 @@ use protocols::agent::{
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+
+const GUEST_CPUS_PATH: &str = "/sys/devices/system/cpu/online";
 
 // Convenience macro to obtain the scope logger
 macro_rules! sl {
@@ -270,7 +272,7 @@ fn set_hugepages_resources(
 
 fn set_block_io_resources(
     _cg: &cgroups::Cgroup,
-    blkio: &LinuxBlockIO,
+    blkio: &LinuxBlockIo,
     res: &mut cgroups::Resources,
 ) {
     info!(sl!(), "cgroup manager set block io");
@@ -300,7 +302,7 @@ fn set_block_io_resources(
         build_blk_io_device_throttle_resource(&blkio.throttle_write_iops_device);
 }
 
-fn set_cpu_resources(cg: &cgroups::Cgroup, cpu: &LinuxCPU) -> Result<()> {
+fn set_cpu_resources(cg: &cgroups::Cgroup, cpu: &LinuxCpu) -> Result<()> {
     info!(sl!(), "cgroup manager set cpu");
 
     let cpuset_controller: &CpuSetController = cg.controller_of().unwrap();
@@ -347,14 +349,34 @@ fn set_memory_resources(cg: &cgroups::Cgroup, memory: &LinuxMemory, update: bool
         mem_controller.set_kmem_limit(-1)?;
     }
 
-    set_resource!(mem_controller, set_limit, memory, limit);
-    set_resource!(mem_controller, set_soft_limit, memory, reservation);
-    set_resource!(mem_controller, set_kmem_limit, memory, kernel);
-    set_resource!(mem_controller, set_tcp_limit, memory, kernel_tcp);
+    // If the memory update is set to -1 we should also
+    // set swap to -1, it means unlimited memory.
+    let mut swap = memory.swap.unwrap_or(0);
+    if memory.limit == Some(-1) {
+        swap = -1;
+    }
 
-    if let Some(swap) = memory.swap {
-        // set memory swap
-        let swap = if cg.v2() {
+    if memory.limit.is_some() && swap != 0 {
+        let memstat = get_memory_stats(cg)
+            .into_option()
+            .ok_or_else(|| anyhow!("failed to get the cgroup memory stats"))?;
+        let memusage = memstat.get_usage();
+
+        // When update memory limit, the kernel would check the current memory limit
+        // set against the new swap setting, if the current memory limit is large than
+        // the new swap, then set limit first, otherwise the kernel would complain and
+        // refused to set; on the other hand, if the current memory limit is smaller than
+        // the new swap, then we should set the swap first and then set the memor limit.
+        if swap == -1 || memusage.get_limit() < swap as u64 {
+            mem_controller.set_memswap_limit(swap)?;
+            set_resource!(mem_controller, set_limit, memory, limit);
+        } else {
+            set_resource!(mem_controller, set_limit, memory, limit);
+            mem_controller.set_memswap_limit(swap)?;
+        }
+    } else {
+        set_resource!(mem_controller, set_limit, memory, limit);
+        swap = if cg.v2() {
             convert_memory_swap_to_v2_value(swap, memory.limit.unwrap_or(0))?
         } else {
             swap
@@ -363,6 +385,10 @@ fn set_memory_resources(cg: &cgroups::Cgroup, memory: &LinuxMemory, update: bool
             mem_controller.set_memswap_limit(swap)?;
         }
     }
+
+    set_resource!(mem_controller, set_soft_limit, memory, reservation);
+    set_resource!(mem_controller, set_kmem_limit, memory, kernel);
+    set_resource!(mem_controller, set_tcp_limit, memory, kernel_tcp);
 
     if let Some(swappiness) = memory.swappiness {
         if (0..=100).contains(&swappiness) {
@@ -487,63 +513,61 @@ lazy_static! {
     };
 
     pub static ref DEFAULT_ALLOWED_DEVICES: Vec<LinuxDeviceCgroup> = {
-        let mut v = Vec::new();
+        vec![
+            // all mknod to all char devices
+            LinuxDeviceCgroup {
+                allow: true,
+                r#type: "c".to_string(),
+                major: Some(WILDCARD),
+                minor: Some(WILDCARD),
+                access: "m".to_string(),
+            },
 
-        // all mknod to all char devices
-        v.push(LinuxDeviceCgroup {
-            allow: true,
-            r#type: "c".to_string(),
-            major: Some(WILDCARD),
-            minor: Some(WILDCARD),
-            access: "m".to_string(),
-        });
+            // all mknod to all block devices
+            LinuxDeviceCgroup {
+                allow: true,
+                r#type: "b".to_string(),
+                major: Some(WILDCARD),
+                minor: Some(WILDCARD),
+                access: "m".to_string(),
+            },
 
-        // all mknod to all block devices
-        v.push(LinuxDeviceCgroup {
-            allow: true,
-            r#type: "b".to_string(),
-            major: Some(WILDCARD),
-            minor: Some(WILDCARD),
-            access: "m".to_string(),
-        });
+            // all read/write/mknod to char device /dev/console
+            LinuxDeviceCgroup {
+                allow: true,
+                r#type: "c".to_string(),
+                major: Some(5),
+                minor: Some(1),
+                access: "rwm".to_string(),
+            },
 
-        // all read/write/mknod to char device /dev/console
-        v.push(LinuxDeviceCgroup {
-            allow: true,
-            r#type: "c".to_string(),
-            major: Some(5),
-            minor: Some(1),
-            access: "rwm".to_string(),
-        });
+            // all read/write/mknod to char device /dev/pts/<N>
+            LinuxDeviceCgroup {
+                allow: true,
+                r#type: "c".to_string(),
+                major: Some(136),
+                minor: Some(WILDCARD),
+                access: "rwm".to_string(),
+            },
 
-        // all read/write/mknod to char device /dev/pts/<N>
-        v.push(LinuxDeviceCgroup {
-            allow: true,
-            r#type: "c".to_string(),
-            major: Some(136),
-            minor: Some(WILDCARD),
-            access: "rwm".to_string(),
-        });
+            // all read/write/mknod to char device /dev/ptmx
+            LinuxDeviceCgroup {
+                allow: true,
+                r#type: "c".to_string(),
+                major: Some(5),
+                minor: Some(2),
+                access: "rwm".to_string(),
+            },
 
-        // all read/write/mknod to char device /dev/ptmx
-        v.push(LinuxDeviceCgroup {
-            allow: true,
-            r#type: "c".to_string(),
-            major: Some(5),
-            minor: Some(2),
-            access: "rwm".to_string(),
-        });
-
-        // all read/write/mknod to char device /dev/net/tun
-        v.push(LinuxDeviceCgroup {
-            allow: true,
-            r#type: "c".to_string(),
-            major: Some(10),
-            minor: Some(200),
-            access: "rwm".to_string(),
-        });
-
-        v
+            // all read/write/mknod to char device /dev/net/tun
+            LinuxDeviceCgroup {
+                allow: true,
+                r#type: "c".to_string(),
+                major: Some(10),
+                minor: Some(200),
+                access: "rwm".to_string(),
+            },
+        ]
     };
 }
 
@@ -899,12 +923,12 @@ pub fn get_mounts() -> Result<HashMap<String, String>> {
     let paths = get_paths()?;
 
     for l in fs::read_to_string(MOUNTS)?.lines() {
-        let p: Vec<&str> = l.split(" - ").collect();
+        let p: Vec<&str> = l.splitn(2, " - ").collect();
         let pre: Vec<&str> = p[0].split(' ').collect();
         let post: Vec<&str> = p[1].split(' ').collect();
 
         if post.len() != 3 {
-            warn!(sl!(), "mountinfo corrupted!");
+            warn!(sl!(), "can't parse {} line {:?}", MOUNTS, l);
             continue;
         }
 
@@ -1027,23 +1051,10 @@ impl Manager {
     }
 }
 
+// get the guest's online cpus.
 pub fn get_guest_cpuset() -> Result<String> {
-    // for cgroup v2
-    if cgroups::hierarchies::is_cgroup2_unified_mode() {
-        let c = fs::read_to_string("/sys/fs/cgroup/cpuset.cpus.effective")?;
-        return Ok(c);
-    }
-
-    // for cgroup v1
-    let m = get_mounts()?;
-    if m.get("cpuset").is_none() {
-        warn!(sl!(), "no cpuset cgroup!");
-        return Err(nix::Error::Sys(Errno::ENOENT).into());
-    }
-
-    let p = format!("{}/cpuset.cpus", m.get("cpuset").unwrap());
-    let c = fs::read_to_string(p.as_str())?;
-    Ok(c)
+    let c = fs::read_to_string(GUEST_CPUS_PATH)?;
+    Ok(c.trim().to_string())
 }
 
 // Since the OCI spec is designed for cgroup v1, in some cases

@@ -7,9 +7,10 @@
 package containerdshim
 
 import (
+	"context"
 	"testing"
 
-	"github.com/containerd/cgroups"
+	"github.com/containerd/cgroups/stats/v1"
 	vc "github.com/kata-containers/kata-containers/src/runtime/virtcontainers"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/vcmock"
 	"github.com/stretchr/testify/assert"
@@ -28,7 +29,7 @@ func TestStatNetworkMetric(t *testing.T) {
 		},
 	}
 
-	expectedNetwork := []*cgroups.NetworkStat{
+	expectedNetwork := []*v1.NetworkStat{
 		{
 			Name:    "test-network",
 			RxBytes: 10,
@@ -50,7 +51,7 @@ func TestStatNetworkMetric(t *testing.T) {
 		sandbox.StatsContainerFunc = nil
 	}()
 
-	resp, err := sandbox.StatsContainer(testContainerID)
+	resp, err := sandbox.StatsContainer(context.Background(), testContainerID)
 	assert.NoError(err)
 
 	metrics := statsToMetrics(&resp)

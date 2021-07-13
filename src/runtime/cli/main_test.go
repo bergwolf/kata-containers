@@ -8,7 +8,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -21,7 +20,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/dlespiau/covertool/pkg/cover"
 	ktu "github.com/kata-containers/kata-containers/src/runtime/pkg/katatestutils"
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/katautils"
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/utils"
@@ -29,7 +27,6 @@ import (
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/compatoci"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/oci"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/vcmock"
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/stretchr/testify/assert"
 
@@ -44,10 +41,8 @@ const (
 	// small docker image used to create root filesystems from
 	testDockerImage = "busybox"
 
-	testSandboxID   = "99999999-9999-9999-99999999999999999"
-	testContainerID = "1"
-	testBundle      = "bundle"
-	testConsole     = "/dev/pts/999"
+	testBundle  = "bundle"
+	testConsole = "/dev/pts/999"
 )
 
 var (
@@ -156,16 +151,6 @@ func runUnitTests(m *testing.M) {
 // TestMain is the common main function used by ALL the test functions
 // for this package.
 func TestMain(m *testing.M) {
-	// Parse the command line using the stdlib flag package so the flags defined
-	// in the testing package get populated.
-	cover.ParseAndStripTestFlags()
-
-	// Make sure we have the opportunity to flush the coverage report to disk when
-	// terminating the process.
-	defer func() {
-		cover.FlushProfiles()
-	}()
-
 	// If the test binary name is kata-runtime.coverage, we've are being asked to
 	// run the coverage-instrumented kata-runtime.
 	if path.Base(os.Args[0]) == name+".coverage" ||
@@ -385,44 +370,6 @@ func makeOCIBundle(bundleDir string) error {
 	}
 
 	return nil
-}
-
-func writeOCIConfigFile(spec specs.Spec, configPath string) error {
-	if configPath == "" {
-		return errors.New("BUG: need config file path")
-	}
-
-	bytes, err := json.MarshalIndent(spec, "", "\t")
-	if err != nil {
-		return err
-	}
-
-	return ioutil.WriteFile(configPath, bytes, testFileMode)
-}
-
-func newSingleContainerStatus(containerID string, containerState types.ContainerState, annotations map[string]string, spec *specs.Spec) vc.ContainerStatus {
-	return vc.ContainerStatus{
-		ID:          containerID,
-		State:       containerState,
-		Annotations: annotations,
-		Spec:        spec,
-	}
-}
-
-func execCLICommandFunc(assertHandler *assert.Assertions, cliCommand cli.Command, set *flag.FlagSet, expectedErr bool) {
-	ctx := createCLIContext(set)
-	ctx.App.Name = "foo"
-
-	fn, ok := cliCommand.Action.(func(context *cli.Context) error)
-	assertHandler.True(ok)
-
-	err := fn(ctx)
-
-	if expectedErr {
-		assertHandler.Error(err)
-	} else {
-		assertHandler.Nil(err)
-	}
 }
 
 func createCLIContextWithApp(flagSet *flag.FlagSet, app *cli.App) *cli.Context {
@@ -911,7 +858,7 @@ func TestMainCreateRuntime(t *testing.T) {
 	assert := assert.New(t)
 
 	const cmd = "foo"
-	const msg = "moo FAILURE"
+	const msg = "moo message"
 
 	resetCLIGlobals()
 
@@ -984,7 +931,7 @@ func TestMainFatalWriter(t *testing.T) {
 	assert := assert.New(t)
 
 	const cmd = "foo"
-	const msg = "moo FAILURE"
+	const msg = "moo message"
 
 	// create buffer to save logger output
 	buf := &bytes.Buffer{}

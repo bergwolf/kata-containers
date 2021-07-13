@@ -6,9 +6,9 @@
 package virtcontainers
 
 import (
+	"context"
 	"fmt"
 	"net"
-	"os"
 	"reflect"
 	"testing"
 
@@ -19,23 +19,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/vishvananda/netlink"
 )
-
-func TestCreateDeleteNetNS(t *testing.T) {
-	assert := assert.New(t)
-	if tc.NotValid(ktu.NeedRoot()) {
-		t.Skip(testDisabledAsNonRoot)
-	}
-
-	netNSPath, err := createNetNS()
-	assert.NoError(err)
-	assert.NotEmpty(netNSPath)
-
-	_, err = os.Stat(netNSPath)
-	assert.NoError(err)
-
-	err = deleteNetNS(netNSPath)
-	assert.NoError(err)
-}
 
 func TestGenerateInterfacesAndRoutes(t *testing.T) {
 	//
@@ -92,7 +75,7 @@ func TestGenerateInterfacesAndRoutes(t *testing.T) {
 
 	nns := NetworkNamespace{NetNsPath: "foobar", NetNsCreated: true, Endpoints: endpoints}
 
-	resInterfaces, resRoutes, resNeighs, err := generateVCNetworkStructures(nns)
+	resInterfaces, resRoutes, resNeighs, err := generateVCNetworkStructures(context.Background(), nns)
 
 	//
 	// Build expected results:
@@ -293,10 +276,10 @@ func TestTcRedirectNetwork(t *testing.T) {
 	err = netHandle.LinkSetUp(link)
 	assert.NoError(err)
 
-	err = setupTCFiltering(endpoint, 1, true)
+	err = setupTCFiltering(context.Background(), endpoint, 1, true)
 	assert.NoError(err)
 
-	err = removeTCFiltering(endpoint)
+	err = removeTCFiltering(context.Background(), endpoint)
 	assert.NoError(err)
 
 	// Remove the veth created for testing.
@@ -331,7 +314,7 @@ func TestRxRateLimiter(t *testing.T) {
 	err = netHandle.LinkSetUp(link)
 	assert.NoError(err)
 
-	err = setupTCFiltering(endpoint, 1, true)
+	err = setupTCFiltering(context.Background(), endpoint, 1, true)
 	assert.NoError(err)
 
 	// 10Mb
@@ -345,7 +328,7 @@ func TestRxRateLimiter(t *testing.T) {
 	err = removeRxRateLimiter(endpoint, currentNS.Path())
 	assert.NoError(err)
 
-	err = removeTCFiltering(endpoint)
+	err = removeTCFiltering(context.Background(), endpoint)
 	assert.NoError(err)
 
 	// Remove the veth created for testing.
@@ -380,7 +363,7 @@ func TestTxRateLimiter(t *testing.T) {
 	err = netHandle.LinkSetUp(link)
 	assert.NoError(err)
 
-	err = setupTCFiltering(endpoint, 1, true)
+	err = setupTCFiltering(context.Background(), endpoint, 1, true)
 	assert.NoError(err)
 
 	// 10Mb
@@ -394,7 +377,7 @@ func TestTxRateLimiter(t *testing.T) {
 	err = removeTxRateLimiter(endpoint, currentNS.Path())
 	assert.NoError(err)
 
-	err = removeTCFiltering(endpoint)
+	err = removeTCFiltering(context.Background(), endpoint)
 	assert.NoError(err)
 
 	// Remove the veth created for testing.

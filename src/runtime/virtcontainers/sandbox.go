@@ -26,6 +26,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/vishvananda/netlink"
 
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/katautils/katatrace"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/device/api"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/device/config"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/device/drivers"
@@ -43,10 +44,17 @@ import (
 	vcTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/types"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/utils"
-	"go.opentelemetry.io/otel"
-	otelLabel "go.opentelemetry.io/otel/label"
-	otelTrace "go.opentelemetry.io/otel/trace"
 )
+
+// tracingTags defines tags for the trace span
+func (s *Sandbox) tracingTags() map[string]string {
+	return map[string]string{
+		"source":     "runtime",
+		"package":    "virtcontainers",
+		"subsystem":  "sandbox",
+		"sandbox_id": s.id,
+	}
+}
 
 const (
 	// vmStartTimeout represents the time in seconds a sandbox can wait before
@@ -127,19 +135,6 @@ type SandboxConfig struct {
 	Cgroups *configs.Cgroup
 }
 
-func (s *Sandbox) trace(parent context.Context, name string) (otelTrace.Span, context.Context) {
-	if parent == nil {
-		s.Logger().WithField("type", "bug").Error("trace called before context set")
-		parent = context.Background()
-	}
-
-	tracer := otel.Tracer("kata")
-	ctx, span := tracer.Start(parent, name)
-	span.SetAttributes(otelLabel.Key("subsystem").String("sandbox"))
-
-	return span, ctx
-}
-
 // valid checks that the sandbox configuration is valid.
 func (sandboxConfig *SandboxConfig) valid() bool {
 	if sandboxConfig.ID == "" {
@@ -168,7 +163,7 @@ type Sandbox struct {
 	factory    Factory
 	hypervisor hypervisor
 	agent      agent
-	newStore   persistapi.PersistDriver
+	store      persistapi.PersistDriver
 
 	network Network
 	monitor *monitor
@@ -282,7 +277,7 @@ func (s *Sandbox) GetContainer(containerID string) VCContainer {
 	return nil
 }
 
-// Release closes the agent connection and removes sandbox from internal list.
+// Release closes the agent connection.
 func (s *Sandbox) Release(ctx context.Context) error {
 	s.Logger().Info("release sandbox")
 	if s.monitor != nil {
@@ -293,7 +288,6 @@ func (s *Sandbox) Release(ctx context.Context) error {
 }
 
 // Status gets the status of the sandbox
-// TODO: update container status properly, see kata-containers/runtime#253
 func (s *Sandbox) Status() SandboxStatus {
 	var contStatusList []ContainerStatus
 	for _, c := range s.containers {
@@ -395,7 +389,9 @@ func (s *Sandbox) IOStream(containerID, processID string) (io.WriteCloser, io.Re
 }
 
 func createAssets(ctx context.Context, sandboxConfig *SandboxConfig) error {
-	span, _ := trace(ctx, "createAssets")
+	span, _ := katatrace.Trace(ctx, nil, "createAssets", nil)
+	katatrace.AddTag(span, "sandbox_id", sandboxConfig.ID)
+	katatrace.AddTag(span, "subsystem", "sandbox")
 	defer span.End()
 
 	for _, name := range types.AssetTypes() {
@@ -445,7 +441,9 @@ func (s *Sandbox) getAndStoreGuestDetails(ctx context.Context) error {
 // to physically create that sandbox i.e. starts a VM for that sandbox to eventually
 // be started.
 func createSandbox(ctx context.Context, sandboxConfig SandboxConfig, factory Factory) (*Sandbox, error) {
-	span, ctx := trace(ctx, "createSandbox")
+	span, ctx := katatrace.Trace(ctx, nil, "createSandbox", nil)
+	katatrace.AddTag(span, "sandbox_id", sandboxConfig.ID)
+	katatrace.AddTag(span, "subsystem", "sandbox")
 	defer span.End()
 
 	if err := createAssets(ctx, &sandboxConfig); err != nil {
@@ -483,7 +481,9 @@ func createSandbox(ctx context.Context, sandboxConfig SandboxConfig, factory Fac
 }
 
 func newSandbox(ctx context.Context, sandboxConfig SandboxConfig, factory Factory) (sb *Sandbox, retErr error) {
-	span, ctx := trace(ctx, "newSandbox")
+	span, ctx := katatrace.Trace(ctx, nil, "newSandbox", nil)
+	katatrace.AddTag(span, "sandbox_id", sandboxConfig.ID)
+	katatrace.AddTag(span, "subsystem", "sandbox")
 	defer span.End()
 
 	if !sandboxConfig.valid() {
@@ -491,8 +491,7 @@ func newSandbox(ctx context.Context, sandboxConfig SandboxConfig, factory Factor
 	}
 
 	// create agent instance
-	newAagentFunc := getNewAgentFunc(ctx)
-	agent := newAagentFunc()
+	agent := getNewAgentFunc(ctx)()
 
 	hypervisor, err := newHypervisor(sandboxConfig.HypervisorType)
 	if err != nil {
@@ -518,14 +517,14 @@ func newSandbox(ctx context.Context, sandboxConfig SandboxConfig, factory Factor
 
 	hypervisor.setSandbox(s)
 
-	if s.newStore, err = persist.GetDriver(); err != nil || s.newStore == nil {
+	if s.store, err = persist.GetDriver(); err != nil || s.store == nil {
 		return nil, fmt.Errorf("failed to get fs persist driver: %v", err)
 	}
 
 	defer func() {
 		if retErr != nil {
-			s.Logger().WithError(retErr).WithField("sandboxid", s.id).Error("Create new sandbox failed")
-			s.newStore.Destroy(s.id)
+			s.Logger().WithError(retErr).Error("Create new sandbox failed")
+			s.store.Destroy(s.id)
 		}
 	}()
 
@@ -543,7 +542,7 @@ func newSandbox(ctx context.Context, sandboxConfig SandboxConfig, factory Factor
 		s.Logger().WithError(err).Debug("restore sandbox failed")
 	}
 
-	// new store doesn't require hypervisor to be stored immediately
+	// store doesn't require hypervisor to be stored immediately
 	if err = s.hypervisor.createSandbox(ctx, s.id, s.networkNS, &sandboxConfig.HypervisorConfig); err != nil {
 		return nil, err
 	}
@@ -618,7 +617,7 @@ func (s *Sandbox) createCgroupManager() error {
 
 // storeSandbox stores a sandbox config.
 func (s *Sandbox) storeSandbox(ctx context.Context) error {
-	span, ctx := s.trace(ctx, "storeSandbox")
+	span, _ := katatrace.Trace(ctx, s.Logger(), "storeSandbox", s.tracingTags())
 	defer span.End()
 
 	// flush data to storage
@@ -626,15 +625,6 @@ func (s *Sandbox) storeSandbox(ctx context.Context) error {
 		return err
 	}
 	return nil
-}
-
-func rLockSandbox(sandboxID string) (func() error, error) {
-	store, err := persist.GetDriver()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get fs persist driver: %v", err)
-	}
-
-	return store.Lock(sandboxID, false)
 }
 
 func rwLockSandbox(sandboxID string) (func() error, error) {
@@ -697,13 +687,13 @@ func (s *Sandbox) Delete(ctx context.Context) error {
 
 	for _, c := range s.containers {
 		if err := c.delete(ctx); err != nil {
-			return err
+			s.Logger().WithError(err).WithField("cid", c.id).Debug("failed to delete container")
 		}
 	}
 
 	if !rootless.IsRootless() {
 		if err := s.cgroupsDelete(); err != nil {
-			return err
+			s.Logger().WithError(err).Error("failed to cleanup cgroups")
 		}
 	}
 
@@ -717,12 +707,11 @@ func (s *Sandbox) Delete(ctx context.Context) error {
 
 	s.agent.cleanup(ctx, s)
 
-	return s.newStore.Destroy(s.id)
+	return s.store.Destroy(s.id)
 }
 
 func (s *Sandbox) startNetworkMonitor(ctx context.Context) error {
-	var span otelTrace.Span
-	span, ctx = s.trace(ctx, "startNetworkMonitor")
+	span, ctx := katatrace.Trace(ctx, s.Logger(), "startNetworkMonitor", s.tracingTags())
 	defer span.End()
 
 	binPath, err := os.Executable()
@@ -761,13 +750,16 @@ func (s *Sandbox) createNetwork(ctx context.Context) error {
 		return nil
 	}
 
-	span, ctx := s.trace(ctx, "createNetwork")
+	span, ctx := katatrace.Trace(ctx, s.Logger(), "createNetwork", s.tracingTags())
 	defer span.End()
 
 	s.networkNS = NetworkNamespace{
 		NetNsPath:    s.config.NetworkConfig.NetNSPath,
 		NetNsCreated: s.config.NetworkConfig.NetNsCreated,
 	}
+
+	katatrace.AddTag(span, "networkNS", s.networkNS)
+	katatrace.AddTag(span, "NetworkConfig", s.config.NetworkConfig)
 
 	// In case there is a factory, network interfaces are hotplugged
 	// after vm is started.
@@ -795,8 +787,7 @@ func (s *Sandbox) postCreatedNetwork(ctx context.Context) error {
 }
 
 func (s *Sandbox) removeNetwork(ctx context.Context) error {
-	var span otelTrace.Span
-	span, ctx = s.trace(ctx, "removeNetwork")
+	span, ctx := katatrace.Trace(ctx, s.Logger(), "removeNetwork", s.tracingTags())
 	defer span.End()
 
 	if s.config.NetworkConfig.NetmonConfig.Enable {
@@ -951,7 +942,7 @@ func (cw *consoleWatcher) start(s *Sandbox) (err error) {
 		scanner = bufio.NewScanner(cw.conn)
 	case consoleProtoPty:
 		// read-only
-		cw.ptyConsole, err = os.Open(cw.consoleURL)
+		cw.ptyConsole, _ = os.Open(cw.consoleURL)
 		scanner = bufio.NewScanner(cw.ptyConsole)
 	default:
 		return fmt.Errorf("unknown console proto %s", cw.proto)
@@ -1003,7 +994,7 @@ func (cw *consoleWatcher) stop() {
 
 // startVM starts the VM.
 func (s *Sandbox) startVM(ctx context.Context) (err error) {
-	span, ctx := s.trace(ctx, "startVM")
+	span, ctx := katatrace.Trace(ctx, s.Logger(), "startVM", s.tracingTags())
 	defer span.End()
 
 	s.Logger().Info("Starting VM")
@@ -1038,7 +1029,7 @@ func (s *Sandbox) startVM(ctx context.Context) (err error) {
 
 	defer func() {
 		if err != nil {
-			s.hypervisor.stopSandbox(ctx)
+			s.hypervisor.stopSandbox(ctx, false)
 		}
 	}()
 
@@ -1084,7 +1075,7 @@ func (s *Sandbox) startVM(ctx context.Context) (err error) {
 
 // stopVM: stop the sandbox's VM
 func (s *Sandbox) stopVM(ctx context.Context) error {
-	span, ctx := s.trace(ctx, "stopVM")
+	span, ctx := katatrace.Trace(ctx, s.Logger(), "stopVM", s.tracingTags())
 	defer span.End()
 
 	s.Logger().Info("Stopping sandbox in the VM")
@@ -1092,14 +1083,9 @@ func (s *Sandbox) stopVM(ctx context.Context) error {
 		s.Logger().WithError(err).WithField("sandboxid", s.id).Warning("Agent did not stop sandbox")
 	}
 
-	if s.disableVMShutdown {
-		// Do not kill the VM - allow the agent to shut it down
-		// (only used to support static agent tracing).
-		return nil
-	}
-
 	s.Logger().Info("Stopping VM")
-	return s.hypervisor.stopSandbox(ctx)
+
+	return s.hypervisor.stopSandbox(ctx, s.disableVMShutdown)
 }
 
 func (s *Sandbox) addContainer(c *Container) error {
@@ -1115,14 +1101,10 @@ func (s *Sandbox) addContainer(c *Container) error {
 // This should be called only when the sandbox is already created.
 // It will add new container config to sandbox.config.Containers
 func (s *Sandbox) CreateContainer(ctx context.Context, contConfig ContainerConfig) (VCContainer, error) {
-	// Create the container object, add devices to the sandbox's device-manager:
-	c, err := newContainer(ctx, s, &contConfig)
-	if err != nil {
-		return nil, err
-	}
-
 	// Update sandbox config to include the new container's config
 	s.config.Containers = append(s.config.Containers, contConfig)
+
+	var err error
 
 	defer func() {
 		if err != nil {
@@ -1132,6 +1114,12 @@ func (s *Sandbox) CreateContainer(ctx context.Context, contConfig ContainerConfi
 			}
 		}
 	}()
+
+	// Create the container object, add devices to the sandbox's device-manager:
+	c, err := newContainer(ctx, s, &s.config.Containers[len(s.config.Containers)-1])
+	if err != nil {
+		return nil, err
+	}
 
 	// create and start the container
 	err = c.create(ctx)
@@ -1284,21 +1272,7 @@ func (s *Sandbox) DeleteContainer(ctx context.Context, containerID string) (VCCo
 	return c, nil
 }
 
-// ProcessListContainer lists every process running inside a specific
-// container in the sandbox.
-func (s *Sandbox) ProcessListContainer(ctx context.Context, containerID string, options ProcessListOptions) (ProcessList, error) {
-	// Fetch the container.
-	c, err := s.findContainer(containerID)
-	if err != nil {
-		return nil, err
-	}
-
-	// Get the process list related to the container.
-	return c.processList(ctx, options)
-}
-
 // StatusContainer gets the status of a container
-// TODO: update container status properly, see kata-containers/runtime#253
 func (s *Sandbox) StatusContainer(containerID string) (ContainerStatus, error) {
 	if containerID == "" {
 		return ContainerStatus{}, vcTypes.ErrNeedContainerID
@@ -1460,12 +1434,12 @@ func (s *Sandbox) ResumeContainer(ctx context.Context, containerID string) error
 // createContainers registers all containers, create the
 // containers in the guest and starts one shim per container.
 func (s *Sandbox) createContainers(ctx context.Context) error {
-	span, ctx := s.trace(ctx, "createContainers")
+	span, ctx := katatrace.Trace(ctx, s.Logger(), "createContainers", s.tracingTags())
 	defer span.End()
 
-	for _, contConfig := range s.config.Containers {
+	for i := range s.config.Containers {
 
-		c, err := newContainer(ctx, s, &contConfig)
+		c, err := newContainer(ctx, s, &s.config.Containers[i])
 		if err != nil {
 			return err
 		}
@@ -1532,7 +1506,7 @@ func (s *Sandbox) Start(ctx context.Context) error {
 // will be destroyed.
 // When force is true, ignore guest related stop failures.
 func (s *Sandbox) Stop(ctx context.Context, force bool) error {
-	span, ctx := s.trace(ctx, "Stop")
+	span, ctx := katatrace.Trace(ctx, s.Logger(), "Stop", s.tracingTags())
 	defer span.End()
 
 	if s.state.State == types.StateStopped {
@@ -1556,7 +1530,7 @@ func (s *Sandbox) Stop(ctx context.Context, force bool) error {
 
 	// shutdown console watcher if exists
 	if s.cw != nil {
-		s.Logger().Debug("stop the sandbox")
+		s.Logger().Debug("stop the console watcher")
 		s.cw.stop()
 	}
 
@@ -1643,7 +1617,7 @@ func (s *Sandbox) unsetSandboxBlockIndex(index int) error {
 // HotplugAddDevice is used for add a device to sandbox
 // Sandbox implement DeviceReceiver interface from device/api/interface.go
 func (s *Sandbox) HotplugAddDevice(ctx context.Context, device api.Device, devType config.DeviceType) error {
-	span, ctx := s.trace(ctx, "HotplugAddDevice")
+	span, ctx := katatrace.Trace(ctx, s.Logger(), "HotplugAddDevice", s.tracingTags())
 	defer span.End()
 
 	if s.config.SandboxCgroupOnly {
@@ -1737,6 +1711,11 @@ func (s *Sandbox) HotplugRemoveDevice(ctx context.Context, device api.Device, de
 		blockDrive, ok := device.GetDeviceInfo().(*config.BlockDrive)
 		if !ok {
 			return fmt.Errorf("device type mismatch, expect device type to be %s", devType)
+		}
+		// PMEM devices cannot be hot removed
+		if blockDrive.Pmem {
+			s.Logger().WithField("path", blockDrive.File).Infof("Skip device: cannot hot remove PMEM devices")
+			return nil
 		}
 		_, err := s.hypervisor.hotplugRemoveDevice(ctx, blockDrive, blockDev)
 		return err
@@ -1863,7 +1842,11 @@ func (s *Sandbox) updateResources(ctx context.Context) error {
 	s.Logger().WithField("memory-sandbox-size-byte", sandboxMemoryByte).Debugf("Request to hypervisor to update memory")
 	newMemory, updatedMemoryDevice, err := s.hypervisor.resizeMemory(ctx, uint32(sandboxMemoryByte>>utils.MibToBytesShift), s.state.GuestMemoryBlockSizeMB, s.state.GuestMemoryHotplugProbe)
 	if err != nil {
-		return err
+		if err == noGuestMemHotplugErr {
+			s.Logger().Warnf("%s, memory specifications cannot be guaranteed", err)
+		} else {
+			return err
+		}
 	}
 	s.Logger().Debugf("Sandbox memory size: %d MB", newMemory)
 	if s.state.GuestMemoryHotplugProbe && updatedMemoryDevice.addr != 0 {
@@ -2292,7 +2275,7 @@ func fetchSandbox(ctx context.Context, sandboxID string) (sandbox *Sandbox, err 
 	// load sandbox config fromld store.
 	c, err := loadSandboxConfig(sandboxID)
 	if err != nil {
-		virtLog.WithError(err).Warning("failed to get sandbox config from new store")
+		virtLog.WithError(err).Warning("failed to get sandbox config from store")
 		return nil, err
 	}
 

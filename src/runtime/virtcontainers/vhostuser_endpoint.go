@@ -13,8 +13,8 @@ import (
 
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/device/config"
 	persistapi "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/persist/api"
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/utils"
 	vcTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/types"
+	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/utils"
 )
 
 // Long term, this should be made more configurable.  For now matching path
@@ -22,6 +22,8 @@ import (
 // github.com/clearcontainers/ovsdpdk.  The plugins create the socket on the host system
 // using this path.
 const hostSocketSearchPath = "/tmp/vhostuser_%s/vhu.sock"
+
+var vhostuserTrace = getNetworkTrace(VhostUserEndpointType)
 
 // VhostUserEndpoint represents a vhost-user socket based network interface
 type VhostUserEndpoint struct {
@@ -77,6 +79,9 @@ func (endpoint *VhostUserEndpoint) NetworkPair() *NetworkInterfacePair {
 
 // Attach for vhostuser endpoint
 func (endpoint *VhostUserEndpoint) Attach(ctx context.Context, s *Sandbox) error {
+	span, ctx := vhostuserTrace(ctx, "Attach", endpoint)
+	defer span.End()
+
 	// Generate a unique ID to be used for hypervisor commandline fields
 	randBytes, err := utils.GenerateRandomBytes(8)
 	if err != nil {

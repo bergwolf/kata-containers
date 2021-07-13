@@ -222,6 +222,10 @@ type Param struct {
 
 // HypervisorConfig is the hypervisor configuration.
 type HypervisorConfig struct {
+	// PCIeRootPort is used to indicate the number of PCIe Root Port devices
+	// The PCIe Root Port device is used to hot-plug the PCIe device
+	PCIeRootPort uint32
+
 	// NumVCPUs specifies default number of vCPUs for the VM.
 	NumVCPUs uint32
 
@@ -240,9 +244,6 @@ type HypervisorConfig struct {
 
 	// MemSlots specifies default memory slots the VM.
 	MemSlots uint32
-
-	// MemOffset specifies memory space for nvdimm device
-	MemOffset uint32
 
 	// VirtioFSCacheSize is the DAX cache size in MiB
 	VirtioFSCacheSize uint32
@@ -318,6 +319,12 @@ type HypervisorConfig struct {
 	// VirtioFSDaemon is the virtio-fs vhost-user daemon path
 	VirtioFSDaemon string
 
+	// File based memory backend root directory
+	FileBackedMemRootDir string
+
+	// EntropySourceList is the list of valid entropy sources
+	EntropySourceList []string
+
 	// VirtioFSDaemonList is the list of valid virtiofs names for annotations
 	VirtioFSDaemonList []string
 
@@ -327,14 +334,17 @@ type HypervisorConfig struct {
 	// VirtioFSExtraArgs passes options to virtiofsd daemon
 	VirtioFSExtraArgs []string
 
-	// File based memory backend root directory
-	FileBackedMemRootDir string
+	// Enable annotations by name
+	EnableAnnotations []string
 
 	// FileBackedMemRootList is the list of valid root directories values for annotations
 	FileBackedMemRootList []string
 
 	// PFlash image paths
 	PFlash []string
+
+	// VhostUserStorePathList is the list of valid values for vhost-user paths
+	VhostUserStorePathList []string
 
 	// customAssets is a map of assets.
 	// Each value in that map takes precedence over the configured assets.
@@ -398,9 +408,14 @@ type HypervisorConfig struct {
 	// root bus instead of a bridge.
 	HotplugVFIOOnRootBus bool
 
-	// PCIeRootPort is used to indicate the number of PCIe Root Port devices
-	// The PCIe Root Port device is used to hot-plug the PCIe device
-	PCIeRootPort uint32
+	// GuestMemoryDumpPaging is used to indicate if enable paging
+	// for QEMU dump-guest-memory command
+	GuestMemoryDumpPaging bool
+
+	// Enable confidential guest support.
+	// Enable or disable different hardware features, ranging
+	// from memory encryption to both memory and CPU-state encryption and integrity.
+	ConfidentialGuest bool
 
 	// BootToBeTemplate used to indicate if the VM is created to be a template VM
 	BootToBeTemplate bool
@@ -418,8 +433,8 @@ type HypervisorConfig struct {
 	// related folders, sockets and device nodes should be.
 	VhostUserStorePath string
 
-	// VhostUserStorePathList is the list of valid values for vhost-user paths
-	VhostUserStorePathList []string
+	// GuestCoredumpPath is the path in host for saving guest memory dump
+	GuestMemoryDumpPath string
 
 	// GuestHookPath is the path within the VM that will be used for 'drop-in' hooks
 	GuestHookPath string
@@ -431,25 +446,18 @@ type HypervisorConfig struct {
 	// SELinux label for the VM
 	SELinuxProcessLabel string
 
+	// SGXEPCSize specifies the size in bytes for the EPC Section.
+	// Enable SGX. Hardware-based isolation and memory encryption.
+	SGXEPCSize int64
+
 	// RxRateLimiterMaxRate is used to control network I/O inbound bandwidth on VM level.
 	RxRateLimiterMaxRate uint64
 
 	// TxRateLimiterMaxRate is used to control network I/O outbound bandwidth on VM level.
 	TxRateLimiterMaxRate uint64
 
-	// SGXEPCSize specifies the size in bytes for the EPC Section.
-	// Enable SGX. Hardware-based isolation and memory encryption.
-	SGXEPCSize int64
-
-	// Enable annotations by name
-	EnableAnnotations []string
-
-	// GuestCoredumpPath is the path in host for saving guest memory dump
-	GuestMemoryDumpPath string
-
-	// GuestMemoryDumpPaging is used to indicate if enable paging
-	// for QEMU dump-guest-memory command
-	GuestMemoryDumpPaging bool
+	// MemOffset specifies memory space for nvdimm device
+	MemOffset uint64
 }
 
 // vcpu mapping from vcpu number to thread number
@@ -502,6 +510,8 @@ func (conf *HypervisorConfig) valid() error {
 
 	if conf.BlockDeviceDriver == "" {
 		conf.BlockDeviceDriver = defaultBlockDriver
+	} else if conf.BlockDeviceDriver == config.VirtioBlock && conf.HypervisorMachineType == "s390-ccw-virtio" {
+		conf.BlockDeviceDriver = config.VirtioBlockCCW
 	}
 
 	if conf.DefaultMaxVCPUs == 0 {
@@ -714,21 +724,61 @@ func getHostMemorySizeKb(memInfoPath string) (uint64, error) {
 	return 0, fmt.Errorf("unable get MemTotal from %s", memInfoPath)
 }
 
-// RunningOnVMM checks if the system is running inside a VM.
-func RunningOnVMM(cpuInfoPath string) (bool, error) {
-	if runtime.GOARCH == "arm64" || runtime.GOARCH == "ppc64le" || runtime.GOARCH == "s390x" {
-		virtLog.Info("Unable to know if the system is running inside a VM")
-		return false, nil
-	}
-
-	flagsField := "flags"
-
-	f, err := os.Open(cpuInfoPath)
+// CheckCmdline checks whether an option or parameter is present in the kernel command line.
+// Search is case-insensitive.
+// Takes path to file that contains the kernel command line, desired option, and permitted values
+// (empty values to check for options).
+func CheckCmdline(kernelCmdlinePath, searchParam string, searchValues []string) (bool, error) {
+	f, err := os.Open(kernelCmdlinePath)
 	if err != nil {
 		return false, err
 	}
 	defer f.Close()
 
+	// Create check function -- either check for verbatim option
+	// or check for parameter and permitted values
+	var check func(string, string, []string) bool
+	if len(searchValues) == 0 {
+		check = func(option, searchParam string, _ []string) bool {
+			return strings.EqualFold(option, searchParam)
+		}
+	} else {
+		check = func(param, searchParam string, searchValues []string) bool {
+			// split parameter and value
+			split := strings.SplitN(param, "=", 2)
+			if len(split) < 2 || split[0] != searchParam {
+				return false
+			}
+			for _, value := range searchValues {
+				if strings.EqualFold(value, split[1]) {
+					return true
+				}
+			}
+			return false
+		}
+	}
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		for _, field := range strings.Fields(scanner.Text()) {
+			if check(field, searchParam, searchValues) {
+				return true, nil
+			}
+		}
+	}
+	return false, err
+}
+
+func CPUFlags(cpuInfoPath string) (map[string]bool, error) {
+	flagsField := "flags"
+
+	f, err := os.Open(cpuInfoPath)
+	if err != nil {
+		return map[string]bool{}, err
+	}
+	defer f.Close()
+
+	flags := make(map[string]bool)
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
 		// Expected format: ["flags", ":", ...] or ["flags:", ...]
@@ -742,23 +792,31 @@ func RunningOnVMM(cpuInfoPath string) (bool, error) {
 		}
 
 		for _, field := range fields[1:] {
-			if field == "hypervisor" {
-				return true, nil
-			}
+			flags[field] = true
 		}
 
-		// As long as we have been able to analyze the fields from
-		// "flags", there is no reason to check what comes next from
-		// /proc/cpuinfo, because we already know we are not running
-		// on a VMM.
-		return false, nil
+		return flags, nil
 	}
 
 	if err := scanner.Err(); err != nil {
-		return false, err
+		return map[string]bool{}, err
 	}
 
-	return false, fmt.Errorf("Couldn't find %q from %q output", flagsField, cpuInfoPath)
+	return map[string]bool{}, fmt.Errorf("Couldn't find %q from %q output", flagsField, cpuInfoPath)
+}
+
+// RunningOnVMM checks if the system is running inside a VM.
+func RunningOnVMM(cpuInfoPath string) (bool, error) {
+	if runtime.GOARCH == "amd64" {
+		flags, err := CPUFlags(cpuInfoPath)
+		if err != nil {
+			return false, err
+		}
+		return flags["hypervisor"], nil
+	}
+
+	virtLog.WithField("arch", runtime.GOARCH).Info("Unable to know if the system is running inside a VM")
+	return false, nil
 }
 
 func getHypervisorPid(h hypervisor) int {
@@ -787,7 +845,9 @@ func generateVMSocket(id string, vmStogarePath string) (interface{}, error) {
 type hypervisor interface {
 	createSandbox(ctx context.Context, id string, networkNS NetworkNamespace, hypervisorConfig *HypervisorConfig) error
 	startSandbox(ctx context.Context, timeout int) error
-	stopSandbox(ctx context.Context) error
+	// If wait is set, don't actively stop the sandbox:
+	// just perform cleanup.
+	stopSandbox(ctx context.Context, waitOnly bool) error
 	pauseSandbox(ctx context.Context) error
 	saveSandbox() error
 	resumeSandbox(ctx context.Context) error
@@ -805,6 +865,7 @@ type hypervisor interface {
 	// getPids returns a slice of hypervisor related process ids.
 	// The hypervisor pid must be put at index 0.
 	getPids() []int
+	getVirtioFsPid() *int
 	fromGrpc(ctx context.Context, hypervisorConfig *HypervisorConfig, j []byte) error
 	toGrpc(ctx context.Context) ([]byte, error)
 	check() error

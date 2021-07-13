@@ -52,66 +52,66 @@ const MOUNTINFOFORMAT: &str = "{d} {d} {d}:{d} {} {} {} {}";
 const PROC_PATH: &str = "/proc";
 
 // since libc didn't defined this const for musl, thus redefined it here.
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[cfg(all(target_os = "linux", target_env = "gnu", not(target_arch = "s390x")))]
 const PROC_SUPER_MAGIC: libc::c_long = 0x00009fa0;
 #[cfg(all(target_os = "linux", target_env = "musl"))]
 const PROC_SUPER_MAGIC: libc::c_ulong = 0x00009fa0;
+#[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "s390x"))]
+const PROC_SUPER_MAGIC: libc::c_uint = 0x00009fa0;
 
 lazy_static! {
     static ref PROPAGATION: HashMap<&'static str, MsFlags> = {
         let mut m = HashMap::new();
-        m.insert("shared", MsFlags::MS_SHARED);
-        m.insert("rshared", MsFlags::MS_SHARED | MsFlags::MS_REC);
         m.insert("private", MsFlags::MS_PRIVATE);
         m.insert("rprivate", MsFlags::MS_PRIVATE | MsFlags::MS_REC);
-        m.insert("slave", MsFlags::MS_SLAVE);
+        m.insert("rshared", MsFlags::MS_SHARED | MsFlags::MS_REC);
         m.insert("rslave", MsFlags::MS_SLAVE | MsFlags::MS_REC);
+        m.insert("runbindable", MsFlags::MS_UNBINDABLE | MsFlags::MS_REC);
+        m.insert("shared", MsFlags::MS_SHARED);
+        m.insert("slave", MsFlags::MS_SLAVE);
+        m.insert("unbindable", MsFlags::MS_UNBINDABLE);
         m
     };
     static ref OPTIONS: HashMap<&'static str, (bool, MsFlags)> = {
         let mut m = HashMap::new();
+        m.insert("acl", (false, MsFlags::MS_POSIXACL));
+        m.insert("async", (true, MsFlags::MS_SYNCHRONOUS));
+        m.insert("atime", (true, MsFlags::MS_NOATIME));
+        m.insert("bind", (false, MsFlags::MS_BIND));
         m.insert("defaults", (false, MsFlags::empty()));
+        m.insert("dev", (true, MsFlags::MS_NODEV));
+        m.insert("diratime", (true, MsFlags::MS_NODIRATIME));
+        m.insert("dirsync", (false, MsFlags::MS_DIRSYNC));
+        m.insert("exec", (true, MsFlags::MS_NOEXEC));
+        m.insert("iversion", (false, MsFlags::MS_I_VERSION));
+        m.insert("lazytime", (false, MsFlags::MS_LAZYTIME));
+        m.insert("loud", (true, MsFlags::MS_SILENT));
+        m.insert("mand", (false, MsFlags::MS_MANDLOCK));
+        m.insert("noacl", (true, MsFlags::MS_POSIXACL));
+        m.insert("noatime", (false, MsFlags::MS_NOATIME));
+        m.insert("nodev", (false, MsFlags::MS_NODEV));
+        m.insert("nodiratime", (false, MsFlags::MS_NODIRATIME));
+        m.insert("noexec", (false, MsFlags::MS_NOEXEC));
+        m.insert("noiversion", (true, MsFlags::MS_I_VERSION));
+        m.insert("nolazytime", (true, MsFlags::MS_LAZYTIME));
+        m.insert("nomand", (true, MsFlags::MS_MANDLOCK));
+        m.insert("norelatime", (true, MsFlags::MS_RELATIME));
+        m.insert("nostrictatime", (true, MsFlags::MS_STRICTATIME));
+        m.insert("nosuid", (false, MsFlags::MS_NOSUID));
+        m.insert("rbind", (false, MsFlags::MS_BIND | MsFlags::MS_REC));
+        m.insert("relatime", (false, MsFlags::MS_RELATIME));
+        m.insert("remount", (false, MsFlags::MS_REMOUNT));
         m.insert("ro", (false, MsFlags::MS_RDONLY));
         m.insert("rw", (true, MsFlags::MS_RDONLY));
-        m.insert("suid", (true, MsFlags::MS_NOSUID));
-        m.insert("nosuid", (false, MsFlags::MS_NOSUID));
-        m.insert("dev", (true, MsFlags::MS_NODEV));
-        m.insert("nodev", (false, MsFlags::MS_NODEV));
-        m.insert("exec", (true, MsFlags::MS_NOEXEC));
-        m.insert("noexec", (false, MsFlags::MS_NOEXEC));
-        m.insert("sync", (false, MsFlags::MS_SYNCHRONOUS));
-        m.insert("async", (true, MsFlags::MS_SYNCHRONOUS));
-        m.insert("dirsync", (false, MsFlags::MS_DIRSYNC));
-        m.insert("remount", (false, MsFlags::MS_REMOUNT));
-        m.insert("mand", (false, MsFlags::MS_MANDLOCK));
-        m.insert("nomand", (true, MsFlags::MS_MANDLOCK));
-        m.insert("atime", (true, MsFlags::MS_NOATIME));
-        m.insert("noatime", (false, MsFlags::MS_NOATIME));
-        m.insert("diratime", (true, MsFlags::MS_NODIRATIME));
-        m.insert("nodiratime", (false, MsFlags::MS_NODIRATIME));
-        m.insert("bind", (false, MsFlags::MS_BIND));
-        m.insert("rbind", (false, MsFlags::MS_BIND | MsFlags::MS_REC));
-        m.insert("unbindable", (false, MsFlags::MS_UNBINDABLE));
-        m.insert(
-            "runbindable",
-            (false, MsFlags::MS_UNBINDABLE | MsFlags::MS_REC),
-        );
-        m.insert("private", (false, MsFlags::MS_PRIVATE));
-        m.insert("rprivate", (false, MsFlags::MS_PRIVATE | MsFlags::MS_REC));
-        m.insert("shared", (false, MsFlags::MS_SHARED));
-        m.insert("rshared", (false, MsFlags::MS_SHARED | MsFlags::MS_REC));
-        m.insert("slave", (false, MsFlags::MS_SLAVE));
-        m.insert("rslave", (false, MsFlags::MS_SLAVE | MsFlags::MS_REC));
-        m.insert("relatime", (false, MsFlags::MS_RELATIME));
-        m.insert("norelatime", (true, MsFlags::MS_RELATIME));
+        m.insert("silent", (false, MsFlags::MS_SILENT));
         m.insert("strictatime", (false, MsFlags::MS_STRICTATIME));
-        m.insert("nostrictatime", (true, MsFlags::MS_STRICTATIME));
+        m.insert("suid", (true, MsFlags::MS_NOSUID));
+        m.insert("sync", (false, MsFlags::MS_SYNCHRONOUS));
         m
     };
 }
 
 #[inline(always)]
-#[allow(unused_variables)]
 pub fn mount<
     P1: ?Sized + NixPath,
     P2: ?Sized + NixPath,
@@ -131,7 +131,6 @@ pub fn mount<
 }
 
 #[inline(always)]
-#[allow(unused_variables)]
 pub fn umount2<P: ?Sized + NixPath>(
     target: &P,
     flags: MntFlags,
@@ -190,7 +189,7 @@ pub fn init_rootfs(
 
     let mut bind_mount_dev = false;
     for m in &spec.mounts {
-        let (mut flags, data) = parse_mount(&m);
+        let (mut flags, pgflags, data) = parse_mount(&m);
         if !m.destination.starts_with('/') || m.destination.contains("..") {
             return Err(anyhow!(
                 "the mount destination {} is invalid",
@@ -232,13 +231,15 @@ pub fn init_rootfs(
             // effective.
             // first check that we have non-default options required before attempting a
             // remount
-            if m.r#type == "bind" {
-                for o in &m.options {
-                    if let Some(fl) = PROPAGATION.get(o.as_str()) {
-                        let dest = secure_join(rootfs, &m.destination);
-                        mount(None::<&str>, dest.as_str(), None::<&str>, *fl, None::<&str>)?;
-                    }
-                }
+            if m.r#type == "bind" && !pgflags.is_empty() {
+                let dest = secure_join(rootfs, &m.destination);
+                mount(
+                    None::<&str>,
+                    dest.as_str(),
+                    None::<&str>,
+                    pgflags,
+                    None::<&str>,
+                )?;
             }
         }
     }
@@ -449,7 +450,6 @@ fn mount_cgroups(
     Ok(())
 }
 
-#[allow(unused_variables)]
 fn pivot_root<P1: ?Sized + NixPath, P2: ?Sized + NixPath>(
     new_root: &P1,
     put_old: &P2,
@@ -582,7 +582,6 @@ fn parse_mount_table() -> Result<Vec<Info>> {
 }
 
 #[inline(always)]
-#[allow(unused_variables)]
 fn chroot<P: ?Sized + NixPath>(path: &P) -> Result<(), nix::Error> {
     #[cfg(not(test))]
     return unistd::chroot(path);
@@ -655,26 +654,27 @@ pub fn ms_move_root(rootfs: &str) -> Result<bool> {
     Ok(true)
 }
 
-fn parse_mount(m: &Mount) -> (MsFlags, String) {
+fn parse_mount(m: &Mount) -> (MsFlags, MsFlags, String) {
     let mut flags = MsFlags::empty();
+    let mut pgflags = MsFlags::empty();
     let mut data = Vec::new();
 
     for o in &m.options {
-        match OPTIONS.get(o.as_str()) {
-            Some(v) => {
-                let (clear, fl) = *v;
-                if clear {
-                    flags &= !fl;
-                } else {
-                    flags |= fl;
-                }
+        if let Some(v) = OPTIONS.get(o.as_str()) {
+            let (clear, fl) = *v;
+            if clear {
+                flags &= !fl;
+            } else {
+                flags |= fl;
             }
-
-            None => data.push(o.clone()),
+        } else if let Some(fl) = PROPAGATION.get(o.as_str()) {
+            pgflags |= *fl;
+        } else {
+            data.push(o.clone());
         }
     }
 
-    (flags, data.join(","))
+    (flags, pgflags, data.join(","))
 }
 
 // This function constructs a canonicalized path by combining the `rootfs` and `unsafe_path` elements.
@@ -920,7 +920,7 @@ pub fn finish_rootfs(cfd_log: RawFd, spec: &Spec) -> Result<()> {
 
     for m in spec.mounts.iter() {
         if m.destination == "/dev" {
-            let (flags, _) = parse_mount(m);
+            let (flags, _, _) = parse_mount(m);
             if flags.contains(MsFlags::MS_RDONLY) {
                 mount(
                     Some("/dev"),
@@ -1365,7 +1365,7 @@ mod tests {
             let msg = format!("{}, result: {:?}", msg, result);
 
             // Perform the checks
-            assert!(result == t.result, msg);
+            assert!(result == t.result, "{}", msg);
         }
     }
 }

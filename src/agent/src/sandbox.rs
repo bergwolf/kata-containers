@@ -8,6 +8,8 @@ use crate::mount::{get_mount_fs_type, remove_mounts, TYPE_ROOTFS};
 use crate::namespace::Namespace;
 use crate::netlink::Handle;
 use crate::network::Network;
+use crate::uevent::{Uevent, UeventMatcher};
+use crate::watcher::BindWatcher;
 use anyhow::{anyhow, Context, Result};
 use libc::pid_t;
 use oci::{Hook, Hooks};
@@ -25,7 +27,11 @@ use std::path::Path;
 use std::sync::Arc;
 use std::{thread, time};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::oneshot;
 use tokio::sync::Mutex;
+use tracing::instrument;
+
+type UeventWatcher = (Box<dyn UeventMatcher>, oneshot::Sender<Uevent>);
 
 #[derive(Debug)]
 pub struct Sandbox {
@@ -36,7 +42,8 @@ pub struct Sandbox {
     pub network: Network,
     pub mounts: Vec<String>,
     pub container_mounts: HashMap<String, Vec<String>>,
-    pub pci_device_map: HashMap<String, String>,
+    pub uevent_map: HashMap<String, Uevent>,
+    pub uevent_watchers: Vec<Option<UeventWatcher>>,
     pub shared_utsns: Namespace,
     pub shared_ipcns: Namespace,
     pub sandbox_pidns: Option<Namespace>,
@@ -48,9 +55,11 @@ pub struct Sandbox {
     pub hooks: Option<Hooks>,
     pub event_rx: Arc<Mutex<Receiver<String>>>,
     pub event_tx: Option<Sender<String>>,
+    pub bind_watcher: BindWatcher,
 }
 
 impl Sandbox {
+    #[instrument]
     pub fn new(logger: &Logger) -> Result<Self> {
         let fs_type = get_mount_fs_type("/")?;
         let logger = logger.new(o!("subsystem" => "sandbox"));
@@ -65,7 +74,8 @@ impl Sandbox {
             containers: HashMap::new(),
             mounts: Vec::new(),
             container_mounts: HashMap::new(),
-            pci_device_map: HashMap::new(),
+            uevent_map: HashMap::new(),
+            uevent_watchers: Vec::new(),
             shared_utsns: Namespace::new(&logger),
             shared_ipcns: Namespace::new(&logger),
             sandbox_pidns: None,
@@ -77,6 +87,7 @@ impl Sandbox {
             hooks: None,
             event_rx,
             event_tx: Some(tx),
+            bind_watcher: BindWatcher::new(),
         })
     }
 
@@ -88,6 +99,7 @@ impl Sandbox {
     //
     // It's assumed that caller is calling this method after
     // acquiring a lock on sandbox.
+    #[instrument]
     pub fn set_sandbox_storage(&mut self, path: &str) -> bool {
         match self.storages.get_mut(path) {
             None => {
@@ -110,6 +122,7 @@ impl Sandbox {
     //
     // It's assumed that caller is calling this method after
     // acquiring a lock on sandbox.
+    #[instrument]
     pub fn unset_sandbox_storage(&mut self, path: &str) -> Result<bool> {
         match self.storages.get_mut(path) {
             None => Err(anyhow!("Sandbox storage with path {} not found", path)),
@@ -129,6 +142,7 @@ impl Sandbox {
     //
     // It's assumed that caller is calling this method after
     // acquiring a lock on sandbox.
+    #[instrument]
     pub fn remove_sandbox_storage(&self, path: &str) -> Result<()> {
         let mounts = vec![path.to_string()];
         remove_mounts(&mounts)?;
@@ -142,6 +156,7 @@ impl Sandbox {
     //
     // It's assumed that caller is calling this method after
     // acquiring a lock on sandbox.
+    #[instrument]
     pub fn unset_and_remove_sandbox_storage(&mut self, path: &str) -> Result<()> {
         if self.unset_sandbox_storage(path)? {
             return self.remove_sandbox_storage(path);
@@ -150,6 +165,7 @@ impl Sandbox {
         Ok(())
     }
 
+    #[instrument]
     pub async fn setup_shared_namespaces(&mut self) -> Result<bool> {
         // Set up shared IPC namespace
         self.shared_ipcns = Namespace::new(&self.logger)
@@ -172,6 +188,7 @@ impl Sandbox {
         self.containers.insert(c.id.clone(), c);
     }
 
+    #[instrument]
     pub fn update_shared_pidns(&mut self, c: &LinuxContainer) -> Result<()> {
         // Populate the shared pid path only if this is an infra container and
         // sandbox_pidns has not been passed in the create_sandbox request.
@@ -209,6 +226,7 @@ impl Sandbox {
         None
     }
 
+    #[instrument]
     pub async fn destroy(&mut self) -> Result<()> {
         for ctr in self.containers.values_mut() {
             ctr.destroy().await?;
@@ -216,6 +234,7 @@ impl Sandbox {
         Ok(())
     }
 
+    #[instrument]
     pub fn online_cpu_memory(&self, req: &OnlineCPUMemRequest) -> Result<()> {
         if req.nb_cpus > 0 {
             // online cpus
@@ -259,6 +278,7 @@ impl Sandbox {
         Ok(())
     }
 
+    #[instrument]
     pub fn add_hooks(&mut self, dir: &str) -> Result<()> {
         let mut hooks = Hooks::default();
         if let Ok(hook) = self.find_hooks(dir, "prestart") {
@@ -274,6 +294,7 @@ impl Sandbox {
         Ok(())
     }
 
+    #[instrument]
     fn find_hooks(&self, hook_path: &str, hook_type: &str) -> Result<Vec<Hook>> {
         let mut hooks = Vec::new();
         for entry in fs::read_dir(Path::new(hook_path).join(hook_type))? {
@@ -310,6 +331,7 @@ impl Sandbox {
         Ok(hooks)
     }
 
+    #[instrument]
     pub async fn run_oom_event_monitor(&self, mut rx: Receiver<String>, container_id: String) {
         let logger = self.logger.clone();
 
@@ -342,6 +364,7 @@ impl Sandbox {
     }
 }
 
+#[instrument]
 fn online_resources(logger: &Logger, path: &str, pattern: &str, num: i32) -> Result<i32> {
     let mut count = 0;
     let re = Regex::new(pattern)?;
@@ -387,6 +410,7 @@ fn online_resources(logger: &Logger, path: &str, pattern: &str, num: i32) -> Res
 const ONLINE_CPUMEM_WATI_MILLIS: u64 = 50;
 const ONLINE_CPUMEM_MAX_RETRIES: u32 = 100;
 
+#[instrument]
 fn online_cpus(logger: &Logger, num: i32) -> Result<i32> {
     let mut onlined_count: i32 = 0;
 
@@ -416,6 +440,7 @@ fn online_cpus(logger: &Logger, num: i32) -> Result<i32> {
     ))
 }
 
+#[instrument]
 fn online_memory(logger: &Logger) -> Result<()> {
     online_resources(logger, SYSFS_MEMORY_ONLINE_PATH, r"memory[0-9]+", -1)?;
     Ok(())
@@ -531,7 +556,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(unused_assignments)]
     async fn unset_and_remove_sandbox_storage() {
         skip_if_not_root!();
 
@@ -565,7 +589,7 @@ mod tests {
         assert_eq!(s.set_sandbox_storage(&destdir_path), true);
         assert!(s.unset_and_remove_sandbox_storage(&destdir_path).is_ok());
 
-        let mut other_dir_str = String::new();
+        let other_dir_str;
         {
             // Create another folder in a separate scope to ensure that is
             // deleted

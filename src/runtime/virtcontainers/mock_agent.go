@@ -22,6 +22,7 @@ import (
 type mockAgent struct {
 }
 
+// nolint:golint
 func NewMockAgent() agent {
 	return &mockAgent{}
 }
@@ -83,11 +84,6 @@ func (n *mockAgent) stopContainer(ctx context.Context, sandbox *Sandbox, c Conta
 // signalProcess is the Noop agent Container signaling implementation. It does nothing.
 func (n *mockAgent) signalProcess(ctx context.Context, c *Container, processID string, signal syscall.Signal, all bool) error {
 	return nil
-}
-
-// processListContainer is the Noop agent Container ps implementation. It does nothing.
-func (n *mockAgent) processListContainer(ctx context.Context, sandbox *Sandbox, c Container, options ProcessListOptions) (ProcessList, error) {
-	return nil, nil
 }
 
 // updateContainer is the Noop agent Container update implementation. It does nothing.
@@ -175,12 +171,12 @@ func (n *mockAgent) resumeContainer(ctx context.Context, sandbox *Sandbox, c Con
 	return nil
 }
 
-// configHypervisor is the Noop agent hypervisor configuration implementation. It does nothing.
-func (n *mockAgent) configure(ctx context.Context, h hypervisor, id, sharePath string, config interface{}) error {
+// configure is the Noop agent configuration implementation. It does nothing.
+func (n *mockAgent) configure(ctx context.Context, h hypervisor, id, sharePath string, config KataAgentConfig) error {
 	return nil
 }
 
-func (n *mockAgent) configureFromGrpc(h hypervisor, id string, config interface{}) error {
+func (n *mockAgent) configureFromGrpc(ctx context.Context, h hypervisor, id string, config KataAgentConfig) error {
 	return nil
 }
 
@@ -237,6 +233,6 @@ func (n *mockAgent) getOOMEvent(ctx context.Context) (string, error) {
 	return "", nil
 }
 
-func (k *mockAgent) getAgentMetrics(ctx context.Context, req *grpc.GetMetricsRequest) (*grpc.Metrics, error) {
+func (n *mockAgent) getAgentMetrics(ctx context.Context, req *grpc.GetMetricsRequest) (*grpc.Metrics, error) {
 	return nil, nil
 }

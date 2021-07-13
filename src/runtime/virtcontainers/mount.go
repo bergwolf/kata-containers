@@ -9,14 +9,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
 	"syscall"
 
 	merr "github.com/hashicorp/go-multierror"
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/katautils/katatrace"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/utils"
 	"github.com/sirupsen/logrus"
+	otelLabel "go.opentelemetry.io/otel/label"
 )
 
 // DefaultShmSize is the default shm size to be used in case host
@@ -212,6 +215,42 @@ func isDeviceMapper(major, minor int) (bool, error) {
 
 const mountPerm = os.FileMode(0755)
 
+func evalMountPath(source, destination string) (string, string, error) {
+	if source == "" {
+		return "", "", fmt.Errorf("source must be specified")
+	}
+	if destination == "" {
+		return "", "", fmt.Errorf("destination must be specified")
+	}
+
+	absSource, err := filepath.EvalSymlinks(source)
+	if err != nil {
+		return "", "", fmt.Errorf("Could not resolve symlink for source %v", source)
+	}
+
+	if err := ensureDestinationExists(absSource, destination); err != nil {
+		return "", "", fmt.Errorf("Could not create destination mount point %v: %v", destination, err)
+	}
+
+	return absSource, destination, nil
+}
+
+// moveMount moves a mountpoint to another path with some bookkeeping:
+// * evaluate all symlinks
+// * ensure the source exists
+// * recursively create the destination
+func moveMount(ctx context.Context, source, destination string) error {
+	span, _ := katatrace.Trace(ctx, nil, "moveMount", apiTracingTags)
+	defer span.End()
+
+	source, destination, err := evalMountPath(source, destination)
+	if err != nil {
+		return err
+	}
+
+	return syscall.Mount(source, destination, "move", syscall.MS_MOVE, "")
+}
+
 // bindMount bind mounts a source in to a destination. This will
 // do some bookkeeping:
 // * evaluate all symlinks
@@ -219,24 +258,15 @@ const mountPerm = os.FileMode(0755)
 // * recursively create the destination
 // pgtypes stands for propagation types, which are shared, private, slave, and ubind.
 func bindMount(ctx context.Context, source, destination string, readonly bool, pgtypes string) error {
-	span, ctx := trace(ctx, "bindMount")
+	span, _ := katatrace.Trace(ctx, nil, "bindMount", apiTracingTags)
 	defer span.End()
+	span.SetAttributes(otelLabel.String("source", source), otelLabel.String("destination", destination))
 
-	if source == "" {
-		return fmt.Errorf("source must be specified")
-	}
-	if destination == "" {
-		return fmt.Errorf("destination must be specified")
-	}
-
-	absSource, err := filepath.EvalSymlinks(source)
+	absSource, destination, err := evalMountPath(source, destination)
 	if err != nil {
-		return fmt.Errorf("Could not resolve symlink for source %v", source)
+		return err
 	}
-
-	if err := ensureDestinationExists(absSource, destination); err != nil {
-		return fmt.Errorf("Could not create destination mount point %v: %v", destination, err)
-	}
+	span.SetAttributes(otelLabel.String("source_after_eval", absSource))
 
 	if err := syscall.Mount(absSource, destination, "bind", syscall.MS_BIND, ""); err != nil {
 		return fmt.Errorf("Could not bind mount %v to %v: %v", absSource, destination, err)
@@ -265,10 +295,15 @@ func bindMount(ctx context.Context, source, destination string, readonly bool, p
 // The mountflags should match the values used in the original mount() call,
 // except for those parameters that you are trying to change.
 func remount(ctx context.Context, mountflags uintptr, src string) error {
+	span, _ := katatrace.Trace(ctx, nil, "remount", apiTracingTags)
+	defer span.End()
+	span.SetAttributes(otelLabel.String("source", src))
+
 	absSrc, err := filepath.EvalSymlinks(src)
 	if err != nil {
 		return fmt.Errorf("Could not resolve symlink for %s", src)
 	}
+	span.SetAttributes(otelLabel.String("source_after_eval", absSrc))
 
 	if err := syscall.Mount(absSrc, absSrc, "", syscall.MS_REMOUNT|mountflags, ""); err != nil {
 		return fmt.Errorf("remount %s failed: %v", absSrc, err)
@@ -285,7 +320,7 @@ func remountRo(ctx context.Context, src string) error {
 // bindMountContainerRootfs bind mounts a container rootfs into a 9pfs shared
 // directory between the guest and the host.
 func bindMountContainerRootfs(ctx context.Context, shareDir, cid, cRootFs string, readonly bool) error {
-	span, _ := trace(ctx, "bindMountContainerRootfs")
+	span, _ := katatrace.Trace(ctx, nil, "bindMountContainerRootfs", apiTracingTags)
 	defer span.End()
 
 	rootfsDest := filepath.Join(shareDir, cid, rootfsDir)
@@ -325,8 +360,9 @@ func isSymlink(path string) bool {
 }
 
 func bindUnmountContainerRootfs(ctx context.Context, sharedDir, cID string) error {
-	span, _ := trace(ctx, "bindUnmountContainerRootfs")
+	span, _ := katatrace.Trace(ctx, nil, "bindUnmountContainerRootfs", apiTracingTags)
 	defer span.End()
+	span.SetAttributes(otelLabel.String("shared_dir", sharedDir), otelLabel.String("container_id", cID))
 
 	rootfsDest := filepath.Join(sharedDir, cID, rootfsDir)
 	if isSymlink(filepath.Join(sharedDir, cID)) || isSymlink(rootfsDest) {
@@ -347,8 +383,9 @@ func bindUnmountContainerRootfs(ctx context.Context, sharedDir, cID string) erro
 }
 
 func bindUnmountAllRootfs(ctx context.Context, sharedDir string, sandbox *Sandbox) error {
-	span, ctx := trace(ctx, "bindUnmountAllRootfs")
+	span, ctx := katatrace.Trace(ctx, nil, "bindUnmountAllRootfs", apiTracingTags)
 	defer span.End()
+	span.SetAttributes(otelLabel.String("shared_dir", sharedDir), otelLabel.String("sandbox_id", sandbox.id))
 
 	var errors *merr.Error
 	for _, c := range sandbox.containers {
@@ -383,7 +420,9 @@ func IsDockerVolume(path string) bool {
 
 const (
 	// K8sEmptyDir is the k8s specific path for `empty-dir` volumes
-	K8sEmptyDir = "kubernetes.io~empty-dir"
+	K8sEmptyDir  = "kubernetes.io~empty-dir"
+	K8sConfigMap = "kubernetes.io~configmap"
+	K8sSecret    = "kubernetes.io~secret"
 )
 
 // IsEphemeralStorage returns true if the given path
@@ -421,13 +460,78 @@ func Isk8sHostEmptyDir(path string) bool {
 	return false
 }
 
-func isEmptyDir(path string) bool {
+func checkKubernetesVolume(path, volumeType string) bool {
 	splitSourceSlice := strings.Split(path, "/")
 	if len(splitSourceSlice) > 1 {
 		storageType := splitSourceSlice[len(splitSourceSlice)-2]
-		if storageType == K8sEmptyDir {
+		if storageType == volumeType {
 			return true
 		}
 	}
+
+	return false
+}
+
+func isEmptyDir(path string) bool {
+	return checkKubernetesVolume(path, K8sEmptyDir)
+}
+
+func isConfigMap(path string) bool {
+	return checkKubernetesVolume(path, K8sConfigMap)
+}
+
+func isSecret(path string) bool {
+	return checkKubernetesVolume(path, K8sSecret)
+}
+
+// countFiles will return the number of files within a given path. If the total number of
+// files observed is greater than limit, break and return -1
+func countFiles(path string, limit int) (numFiles int, err error) {
+
+	// First, check to see if the path exists
+	file, err := os.Stat(path)
+	if os.IsNotExist(err) {
+		return 0, err
+	}
+
+	// Special case if this is just a file, not a directory:
+	if !file.IsDir() {
+		return 1, nil
+	}
+
+	files, err := ioutil.ReadDir(path)
+	if err != nil {
+		return 0, err
+	}
+
+	for _, file := range files {
+		if file.IsDir() {
+			inc, err := countFiles(filepath.Join(path, file.Name()), (limit - numFiles))
+			if err != nil {
+				return numFiles, err
+			}
+			numFiles = numFiles + inc
+		} else {
+			numFiles++
+		}
+		if numFiles > limit {
+			return -1, nil
+		}
+	}
+	return numFiles, nil
+}
+
+func isWatchableMount(path string) bool {
+	if isSecret(path) || isConfigMap(path) {
+		// we have a cap on number of FDs which can be present in mount
+		// to determine if watchable. A similar check exists within the agent,
+		// which may or may not help handle case where extra files are added to
+		// a mount after the fact
+		count, _ := countFiles(path, 8)
+		if count > 0 {
+			return true
+		}
+	}
+
 	return false
 }

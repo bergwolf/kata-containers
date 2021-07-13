@@ -16,16 +16,15 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/katautils/katatrace"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/device/config"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/device/manager"
+	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/agent/protocols/grpc"
 	vccgroups "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/cgroups"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/rootless"
 	vcTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/types"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/utils"
-	"go.opentelemetry.io/otel"
-	otelLabel "go.opentelemetry.io/otel/label"
-	otelTrace "go.opentelemetry.io/otel/trace"
 
 	"github.com/containerd/cgroups"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
@@ -33,6 +32,16 @@ import (
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 )
+
+// tracingTags defines tags for the trace span
+func (c *Container) tracingTags() map[string]string {
+	return map[string]string{
+		"source":       "runtime",
+		"package":      "virtcontainers",
+		"subsystem":    "container",
+		"container_id": c.id,
+	}
+}
 
 // https://github.com/torvalds/linux/blob/master/include/uapi/linux/major.h
 // This file has definitions for major device numbers.
@@ -353,19 +362,6 @@ func (c *Container) Logger() *logrus.Entry {
 	})
 }
 
-func (c *Container) trace(parent context.Context, name string) (otelTrace.Span, context.Context) {
-	if parent == nil {
-		c.Logger().WithField("type", "bug").Error("trace called before context set")
-		parent = context.Background()
-	}
-
-	tracer := otel.Tracer("kata")
-	ctx, span := tracer.Start(parent, name)
-	span.SetAttributes(otelLabel.Key("subsystem").String("container"))
-
-	return span, ctx
-}
-
 // Sandbox returns the sandbox handler related to this container.
 func (c *Container) Sandbox() VCSandbox {
 	return c.sandbox
@@ -437,14 +433,14 @@ func (c *Container) setContainerState(state types.StateString) error {
 	return nil
 }
 
-func (c *Container) shareFiles(ctx context.Context, m Mount, idx int, hostSharedDir, hostMountDir, guestSharedDir string) (string, bool, error) {
+func (c *Container) shareFiles(ctx context.Context, m Mount, idx int) (string, bool, error) {
 	randBytes, err := utils.GenerateRandomBytes(8)
 	if err != nil {
 		return "", false, err
 	}
 
 	filename := fmt.Sprintf("%s-%s-%s", c.id, hex.EncodeToString(randBytes), filepath.Base(m.Destination))
-	guestDest := filepath.Join(guestSharedDir, filename)
+	guestDest := filepath.Join(kataGuestSharedDir(), filename)
 
 	// copy file to contaier's rootfs if filesystem sharing is not supported, otherwise
 	// bind mount it in the shared directory.
@@ -471,19 +467,37 @@ func (c *Container) shareFiles(ctx context.Context, m Mount, idx int, hostShared
 		}
 	} else {
 		// These mounts are created in the shared dir
-		mountDest := filepath.Join(hostMountDir, filename)
-		if err := bindMount(ctx, m.Source, mountDest, m.ReadOnly, "private"); err != nil {
-			return "", false, err
+		mountDest := filepath.Join(getMountPath(c.sandboxID), filename)
+		if !m.ReadOnly {
+			if err := bindMount(c.ctx, m.Source, mountDest, false, "private"); err != nil {
+				return "", false, err
+			}
+		} else {
+			// For RO mounts, bindmount remount event is not propagated to mount subtrees,
+			// and it doesn't present in the virtiofsd standalone mount namespace either.
+			// So we end up a bit tricky:
+			// 1. make a private bind mount to the mount source
+			// 2. make another ro bind mount on the private mount
+			// 3. move the ro bind mount to mountDest
+			// 4. umount the private bind mount created in step 1
+			privateDest := filepath.Join(getPrivatePath(c.sandboxID), filename)
+			if err := bindMount(c.ctx, m.Source, privateDest, false, "private"); err != nil {
+				return "", false, err
+			}
+			defer func() {
+				syscall.Unmount(privateDest, syscall.MNT_DETACH|UmountNoFollow)
+			}()
+			if err := bindMount(c.ctx, privateDest, privateDest, true, "private"); err != nil {
+				return "", false, err
+			}
+			if err := moveMount(c.ctx, privateDest, mountDest); err != nil {
+				return "", false, err
+			}
+
+			syscall.Unmount(privateDest, syscall.MNT_DETACH|UmountNoFollow)
 		}
 		// Save HostPath mount value into the mount list of the container.
 		c.mounts[idx].HostPath = mountDest
-		// bindmount remount event is not propagated to mount subtrees, so we have to remount the shared dir mountpoint directly.
-		if m.ReadOnly {
-			mountDest = filepath.Join(hostSharedDir, filename)
-			if err := remountRo(c.ctx, mountDest); err != nil {
-				return "", false, err
-			}
-		}
 	}
 
 	return guestDest, false, nil
@@ -494,9 +508,7 @@ func (c *Container) shareFiles(ctx context.Context, m Mount, idx int, hostShared
 // It also updates the container mount list with the HostPath info, and store
 // container mounts to the storage. This way, we will have the HostPath info
 // available when we will need to unmount those mounts.
-func (c *Container) mountSharedDirMounts(ctx context.Context, hostSharedDir, hostMountDir, guestSharedDir string) (sharedDirMounts map[string]Mount, ignoredMounts map[string]Mount, err error) {
-	sharedDirMounts = make(map[string]Mount)
-	ignoredMounts = make(map[string]Mount)
+func (c *Container) mountSharedDirMounts(ctx context.Context, sharedDirMounts, ignoredMounts map[string]Mount) (storages []*grpc.Storage, err error) {
 	var devicesToDetach []string
 	defer func() {
 		if err != nil {
@@ -518,7 +530,7 @@ func (c *Container) mountSharedDirMounts(ctx context.Context, hostSharedDir, hos
 		if len(m.BlockDeviceID) > 0 {
 			// Attach this block device, all other devices passed in the config have been attached at this point
 			if err = c.sandbox.devManager.AttachDevice(ctx, m.BlockDeviceID, c.sandbox); err != nil {
-				return nil, nil, err
+				return storages, err
 			}
 			devicesToDetach = append(devicesToDetach, m.BlockDeviceID)
 			continue
@@ -545,9 +557,9 @@ func (c *Container) mountSharedDirMounts(ctx context.Context, hostSharedDir, hos
 
 		var ignore bool
 		var guestDest string
-		guestDest, ignore, err = c.shareFiles(ctx, m, idx, hostSharedDir, hostMountDir, guestSharedDir)
+		guestDest, ignore, err = c.shareFiles(ctx, m, idx)
 		if err != nil {
-			return nil, nil, err
+			return storages, err
 		}
 
 		// Expand the list of mounts to ignore.
@@ -555,7 +567,6 @@ func (c *Container) mountSharedDirMounts(ctx context.Context, hostSharedDir, hos
 			ignoredMounts[m.Source] = Mount{Source: m.Source}
 			continue
 		}
-
 		sharedDirMount := Mount{
 			Source:      guestDest,
 			Destination: m.Destination,
@@ -564,21 +575,56 @@ func (c *Container) mountSharedDirMounts(ctx context.Context, hostSharedDir, hos
 			ReadOnly:    m.ReadOnly,
 		}
 
+		// virtiofs does not support inotify. To workaround this limitation, we want to special case
+		// mounts that are commonly 'watched'. "watchable" mounts include:
+		//  - Kubernetes configmap
+		//  - Kubernetes secret
+		// If we identify one of these, we'll need to carry out polling in the guest in order to present the
+		// container with a mount that supports inotify. To do this, we create a Storage object for
+		// the "watchable-bind" driver. This will have the agent create a new mount that is watchable,
+		// who's effective source is the original mount (the agent will poll the original mount for changes and
+		// manually update the path that is mounted into the container).
+		// Based on this, let's make sure we update the sharedDirMount structure with the new watchable-mount as
+		// the source (this is what is utilized to update the OCI spec).
+		caps := c.sandbox.hypervisor.capabilities(ctx)
+		if isWatchableMount(m.Source) && caps.IsFsSharingSupported() {
+
+			// Create path in shared directory for creating watchable mount:
+			watchableHostPath := filepath.Join(getMountPath(c.sandboxID), "watchable")
+			if err := os.MkdirAll(watchableHostPath, DirMode); err != nil {
+				return storages, fmt.Errorf("unable to create watchable path: %s: %v", watchableHostPath, err)
+			}
+
+			watchableGuestMount := filepath.Join(kataGuestSharedDir(), "watchable", filepath.Base(guestDest))
+
+			storage := &grpc.Storage{
+				Driver:     kataWatchableBindDevType,
+				Source:     guestDest,
+				Fstype:     "bind",
+				MountPoint: watchableGuestMount,
+				Options:    m.Options,
+			}
+			storages = append(storages, storage)
+
+			// Update the sharedDirMount, in order to identify what will
+			// change in the OCI spec.
+			sharedDirMount.Source = watchableGuestMount
+		}
+
 		sharedDirMounts[sharedDirMount.Destination] = sharedDirMount
 	}
 
-	return sharedDirMounts, ignoredMounts, nil
+	return storages, nil
 }
 
 func (c *Container) unmountHostMounts(ctx context.Context) error {
-	var span otelTrace.Span
-	span, ctx = c.trace(ctx, "unmountHostMounts")
+	span, ctx := katatrace.Trace(ctx, c.Logger(), "unmountHostMounts", c.tracingTags())
 	defer span.End()
 
 	for _, m := range c.mounts {
 		if m.HostPath != "" {
-			span, _ := c.trace(ctx, "unmount")
-			span.SetAttributes(otelLabel.Key("host-path").String(m.HostPath))
+			span, _ := katatrace.Trace(ctx, c.Logger(), "unmount", c.tracingTags())
+			katatrace.AddTag(span, "host-path", m.HostPath)
 
 			if err := syscall.Unmount(m.HostPath, syscall.MNT_DETACH|UmountNoFollow); err != nil {
 				c.Logger().WithFields(logrus.Fields{
@@ -700,7 +746,7 @@ func (c *Container) createBlockDevices(ctx context.Context) error {
 
 // newContainer creates a Container structure from a sandbox and a container configuration.
 func newContainer(ctx context.Context, sandbox *Sandbox, contConfig *ContainerConfig) (*Container, error) {
-	span, ctx := sandbox.trace(ctx, "newContainer")
+	span, ctx := katatrace.Trace(ctx, sandbox.Logger(), "newContainer", sandbox.tracingTags())
 	defer span.End()
 
 	if !contConfig.valid() {
@@ -805,7 +851,7 @@ func (c *Container) checkBlockDeviceSupport(ctx context.Context) bool {
 	return false
 }
 
-// createContainer creates and start a container inside a Sandbox. It has to be
+// create creates and starts a container inside a Sandbox. It has to be
 // called only when a new container, not known by the sandbox, has to be created.
 func (c *Container) create(ctx context.Context) (err error) {
 	// In case the container creation fails, the following takes care
@@ -970,8 +1016,7 @@ func (c *Container) start(ctx context.Context) error {
 }
 
 func (c *Container) stop(ctx context.Context, force bool) error {
-	var span otelTrace.Span
-	span, ctx = c.trace(ctx, "stop")
+	span, ctx := katatrace.Trace(ctx, c.Logger(), "stop", c.tracingTags())
 	defer span.End()
 
 	// In case the container status has been updated implicitly because
@@ -1029,7 +1074,7 @@ func (c *Container) stop(ctx context.Context, force bool) error {
 		return err
 	}
 
-	shareDir := filepath.Join(kataHostSharedDir(), c.sandbox.id, c.id)
+	shareDir := filepath.Join(getMountPath(c.sandbox.id), c.id)
 	if err := syscall.Rmdir(shareDir); err != nil {
 		c.Logger().WithError(err).WithField("share-dir", shareDir).Warn("Could not remove container share dir")
 	}
@@ -1105,18 +1150,6 @@ func (c *Container) ioStream(processID string) (io.WriteCloser, io.Reader, io.Re
 	stream := newIOStream(c.sandbox, c, processID)
 
 	return stream.stdin(), stream.stdout(), stream.stderr(), nil
-}
-
-func (c *Container) processList(ctx context.Context, options ProcessListOptions) (ProcessList, error) {
-	if err := c.checkSandboxRunning("ps"); err != nil {
-		return nil, err
-	}
-
-	if c.state.State != types.StateRunning {
-		return nil, fmt.Errorf("Container not running, impossible to list processes")
-	}
-
-	return c.sandbox.agent.processListContainer(ctx, c.sandbox, *c, options)
 }
 
 func (c *Container) stats(ctx context.Context) (*ContainerStats, error) {
@@ -1408,8 +1441,6 @@ func (c *Container) cgroupsCreate() (err error) {
 	if err != nil {
 		return fmt.Errorf("Could not create cgroup for %v: %v", c.state.CgroupPath, err)
 	}
-
-	c.config.Resources = resources
 
 	// Add shim into cgroup
 	if c.process.Pid > 0 {

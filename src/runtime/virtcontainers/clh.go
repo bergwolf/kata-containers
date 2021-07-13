@@ -25,15 +25,24 @@ import (
 	"github.com/opencontainers/selinux/go-selinux/label"
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
-	"go.opentelemetry.io/otel"
-	otelLabel "go.opentelemetry.io/otel/label"
-	otelTrace "go.opentelemetry.io/otel/trace"
 
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/katautils/katatrace"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/device/config"
+	vcTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/types"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/utils"
-	vcTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/types"
 )
+
+// tracingTags defines tags for the trace span
+func (clh *cloudHypervisor) tracingTags() map[string]string {
+	return map[string]string{
+		"source":     "runtime",
+		"package":    "virtcontainers",
+		"subsystem":  "hypervisor",
+		"type":       "clh",
+		"sandbox_id": clh.id,
+	}
+}
 
 //
 // Constants and type definitions related to cloud hypervisor
@@ -63,8 +72,6 @@ const (
 	clhSocket             = "clh.sock"
 	clhAPISocket          = "clh-api.sock"
 	virtioFsSocket        = "virtiofsd.sock"
-	supportedMajorVersion = 0
-	supportedMinorVersion = 5
 	defaultClhPath        = "/usr/local/bin/cloud-hypervisor"
 	virtioFsCacheAlways   = "always"
 )
@@ -95,12 +102,6 @@ type clhClient interface {
 	VmRemoveDevicePut(ctx context.Context, vmRemoveDevice chclient.VmRemoveDevice) (*http.Response, error)
 }
 
-type CloudHypervisorVersion struct {
-	Major    int
-	Minor    int
-	Revision int
-}
-
 //
 // Cloud hypervisor state
 //
@@ -123,7 +124,6 @@ type cloudHypervisor struct {
 	config    HypervisorConfig
 	ctx       context.Context
 	APIClient clhClient
-	version   CloudHypervisorVersion
 	vmconfig  chclient.VmConfig
 	virtiofsd Virtiofsd
 	store     persistapi.PersistDriver
@@ -131,7 +131,6 @@ type cloudHypervisor struct {
 }
 
 var clhKernelParams = []Param{
-
 	{"root", "/dev/pmem0p1"},
 	{"panic", "1"},         // upon kernel panic wait 1 second before reboot
 	{"no_timer_check", ""}, // do not check broken timer IRQ resources
@@ -141,7 +140,6 @@ var clhKernelParams = []Param{
 }
 
 var clhDebugKernelParams = []Param{
-
 	{"console", "ttyS0,115200n8"},     // enable serial console
 	{"systemd.log_target", "console"}, // send loggng to the console
 }
@@ -152,25 +150,13 @@ var clhDebugKernelParams = []Param{
 //
 //###########################################################
 
-func (clh *cloudHypervisor) checkVersion() error {
-	if clh.version.Major < supportedMajorVersion || (clh.version.Major == supportedMajorVersion && clh.version.Minor < supportedMinorVersion) {
-		errorMessage := fmt.Sprintf("Unsupported version: cloud-hypervisor %d.%d not supported by this driver version (%d.%d)",
-			clh.version.Major,
-			clh.version.Minor,
-			supportedMajorVersion,
-			supportedMinorVersion)
-		return errors.New(errorMessage)
-	}
-	return nil
-}
-
 // For cloudHypervisor this call only sets the internal structure up.
 // The VM will be created and started through startSandbox().
 func (clh *cloudHypervisor) createSandbox(ctx context.Context, id string, networkNS NetworkNamespace, hypervisorConfig *HypervisorConfig) error {
 	clh.ctx = ctx
 
-	var span otelTrace.Span
-	span, clh.ctx = clh.trace(clh.ctx, "createSandbox")
+	span, newCtx := katatrace.Trace(clh.ctx, clh.Logger(), "createSandbox", clh.tracingTags())
+	clh.ctx = newCtx
 	defer span.End()
 
 	err := hypervisorConfig.valid()
@@ -182,31 +168,11 @@ func (clh *cloudHypervisor) createSandbox(ctx context.Context, id string, networ
 	clh.config = *hypervisorConfig
 	clh.state.state = clhNotReady
 
-	// version check only applicable to 'cloud-hypervisor' executable
-	clhPath, perr := clh.clhPath()
-	if perr != nil {
-		return perr
-
-	}
-	if strings.HasSuffix(clhPath, "cloud-hypervisor") {
-		err = clh.getAvailableVersion()
-		if err != nil {
-			return err
-
-		}
-
-		if err := clh.checkVersion(); err != nil {
-			return err
-		}
-
-	}
-
 	clh.Logger().WithField("function", "createSandbox").Info("creating Sandbox")
 
 	virtiofsdSocketPath, err := clh.virtioFsSocketPath(clh.id)
 	if err != nil {
 		return nil
-
 	}
 
 	if clh.state.PID > 0 {
@@ -222,7 +188,7 @@ func (clh *cloudHypervisor) createSandbox(ctx context.Context, id string, networ
 
 	// No need to return an error from there since there might be nothing
 	// to fetch if this is the first time the hypervisor is created.
-	clh.Logger().WithField("function", "createSandbox").WithError(err).Info("Sandbox not found creating ")
+	clh.Logger().WithField("function", "createSandbox").Info("Sandbox not found creating")
 
 	// Set initial memomory size of the virtual machine
 	// Convert to int64 openApiClient only support int64
@@ -260,7 +226,7 @@ func (clh *cloudHypervisor) createSandbox(ctx context.Context, id string, networ
 		params = append(params, clhDebugKernelParams...)
 	}
 
-	// Followed by extra debug parameters defined in the configuration file
+	// Followed by extra kernel parameters defined in the configuration file
 	params = append(params, clh.config.KernelParams...)
 
 	clh.vmconfig.Cmdline.Args = kernelParamsToString(params)
@@ -291,7 +257,6 @@ func (clh *cloudHypervisor) createSandbox(ctx context.Context, id string, networ
 		clh.vmconfig.Serial = chclient.ConsoleConfig{
 			Mode: cctTTY,
 		}
-
 	} else {
 		clh.vmconfig.Serial = chclient.ConsoleConfig{
 			Mode: cctNULL,
@@ -311,8 +276,8 @@ func (clh *cloudHypervisor) createSandbox(ctx context.Context, id string, networ
 	// Overwrite the default value of HTTP API socket path for cloud hypervisor
 	apiSocketPath, err := clh.apiSocketPath(id)
 	if err != nil {
-		clh.Logger().Info("Invalid api socket path for cloud-hypervisor")
-		return nil
+		clh.Logger().WithError(err).Info("Invalid api socket path for cloud-hypervisor")
+		return err
 	}
 	clh.state.apiSocket = apiSocketPath
 
@@ -339,7 +304,7 @@ func (clh *cloudHypervisor) createSandbox(ctx context.Context, id string, networ
 
 // startSandbox will start the VMM and boot the virtual machine for the given sandbox.
 func (clh *cloudHypervisor) startSandbox(ctx context.Context, timeout int) error {
-	span, ctx := clh.trace(ctx, "startSandbox")
+	span, _ := katatrace.Trace(ctx, clh.Logger(), "startSandbox", clh.tracingTags())
 	defer span.End()
 
 	ctx, cancel := context.WithTimeout(context.Background(), clhAPITimeout*time.Second)
@@ -368,7 +333,9 @@ func (clh *cloudHypervisor) startSandbox(ctx context.Context, timeout int) error
 
 	if clh.config.SharedFS == config.VirtioFS {
 		clh.Logger().WithField("function", "startSandbox").Info("Starting virtiofsd")
-		pid, err := clh.virtiofsd.Start(ctx)
+		pid, err := clh.virtiofsd.Start(ctx, func() {
+			clh.stopSandbox(ctx, false)
+		})
 		if err != nil {
 			return err
 		}
@@ -377,10 +344,10 @@ func (clh *cloudHypervisor) startSandbox(ctx context.Context, timeout int) error
 		return errors.New("cloud-hypervisor only supports virtio based file sharing")
 	}
 
-	pid, err := clh.LaunchClh()
+	pid, err := clh.launchClh()
 	if err != nil {
 		if shutdownErr := clh.virtiofsd.Stop(ctx); shutdownErr != nil {
-			clh.Logger().WithField("error", shutdownErr).Warn("error shutting down Virtiofsd")
+			clh.Logger().WithError(shutdownErr).Warn("error shutting down Virtiofsd")
 		}
 		return fmt.Errorf("failed to launch cloud-hypervisor: %q", err)
 	}
@@ -400,7 +367,7 @@ func (clh *cloudHypervisor) getSandboxConsole(ctx context.Context, id string) (s
 	clh.Logger().WithField("function", "getSandboxConsole").WithField("id", id).Info("Get Sandbox Console")
 	master, slave, err := console.NewPty()
 	if err != nil {
-		clh.Logger().Debugf("Error create pseudo tty: %v", err)
+		clh.Logger().WithError(err).Error("Error create pseudo tty")
 		return consoleProtoPty, "", err
 	}
 	clh.console = master
@@ -427,6 +394,27 @@ func clhDriveIndexToID(i int) string {
 	return "clh_drive_" + strconv.Itoa(i)
 }
 
+// Various cloud-hypervisor APIs report a PCI address in "BB:DD.F"
+// form within the PciDeviceInfo struct.  This is a broken API,
+// because there's no way clh can reliably know the guest side bdf for
+// a device, since the bus number depends on how the guest firmware
+// and/or kernel enumerates it.  They get away with it only because
+// they don't use bridges, and so the bus is always 0.  Under that
+// assumption convert a clh PciDeviceInfo into a PCI path
+func clhPciInfoToPath(pciInfo chclient.PciDeviceInfo) (vcTypes.PciPath, error) {
+	tokens := strings.Split(pciInfo.Bdf, ":")
+	if len(tokens) != 3 || tokens[0] != "0000" || tokens[1] != "00" {
+		return vcTypes.PciPath{}, fmt.Errorf("Unexpected PCI address %q from clh hotplug", pciInfo.Bdf)
+	}
+
+	tokens = strings.Split(tokens[2], ".")
+	if len(tokens) != 2 || tokens[1] != "0" || len(tokens[0]) != 2 {
+		return vcTypes.PciPath{}, fmt.Errorf("Unexpected PCI address %q from clh hotplug", pciInfo.Bdf)
+	}
+
+	return vcTypes.PciPathFromString(tokens[0])
+}
+
 func (clh *cloudHypervisor) hotplugAddBlockDevice(drive *config.BlockDrive) error {
 	if clh.config.BlockDeviceDriver != config.VirtioBlock {
 		return fmt.Errorf("incorrect hypervisor configuration on 'block_device_driver':"+
@@ -441,24 +429,24 @@ func (clh *cloudHypervisor) hotplugAddBlockDevice(drive *config.BlockDrive) erro
 
 	driveID := clhDriveIndexToID(drive.Index)
 
-	//Explicitly set PCIPath to NULL, so that VirtPath can be used
-	drive.PCIPath = vcTypes.PciPath{}
-
 	if drive.Pmem {
-		err = fmt.Errorf("pmem device hotplug not supported")
-	} else {
-		blkDevice := chclient.DiskConfig{
-			Path:      drive.File,
-			Readonly:  drive.ReadOnly,
-			VhostUser: false,
-			Id:        driveID,
-		}
-		_, _, err = cl.VmAddDiskPut(ctx, blkDevice)
+		return fmt.Errorf("pmem device hotplug not supported")
 	}
+
+	blkDevice := chclient.DiskConfig{
+		Path:      drive.File,
+		Readonly:  drive.ReadOnly,
+		VhostUser: false,
+		Id:        driveID,
+	}
+	pciInfo, _, err := cl.VmAddDiskPut(ctx, blkDevice)
 
 	if err != nil {
-		err = fmt.Errorf("failed to hotplug block device %+v %s", drive, openAPIClientError(err))
+		return fmt.Errorf("failed to hotplug block device %+v %s", drive, openAPIClientError(err))
 	}
+
+	drive.PCIPath, err = clhPciInfoToPath(pciInfo)
+
 	return err
 }
 
@@ -475,7 +463,7 @@ func (clh *cloudHypervisor) hotPlugVFIODevice(device config.VFIODev) error {
 }
 
 func (clh *cloudHypervisor) hotplugAddDevice(ctx context.Context, devInfo interface{}, devType deviceType) (interface{}, error) {
-	span, _ := clh.trace(ctx, "hotplugAddDevice")
+	span, _ := katatrace.Trace(ctx, clh.Logger(), "hotplugAddDevice", clh.tracingTags())
 	defer span.End()
 
 	switch devType {
@@ -492,7 +480,7 @@ func (clh *cloudHypervisor) hotplugAddDevice(ctx context.Context, devInfo interf
 }
 
 func (clh *cloudHypervisor) hotplugRemoveDevice(ctx context.Context, devInfo interface{}, devType deviceType) (interface{}, error) {
-	span, ctx := clh.trace(ctx, "hotplugRemoveDevice")
+	span, _ := katatrace.Trace(ctx, clh.Logger(), "hotplugRemoveDevice", clh.tracingTags())
 	defer span.End()
 
 	var deviceID string
@@ -514,7 +502,6 @@ func (clh *cloudHypervisor) hotplugRemoveDevice(ctx context.Context, devInfo int
 	defer cancel()
 
 	_, err := cl.VmRemoveDevicePut(ctx, chclient.VmRemoveDevice{Id: deviceID})
-
 	if err != nil {
 		err = fmt.Errorf("failed to hotplug remove (unplug) device %+v: %s", devInfo, openAPIClientError(err))
 	}
@@ -576,14 +563,14 @@ func (clh *cloudHypervisor) resizeMemory(ctx context.Context, reqMemMB uint32, m
 	}
 
 	cl := clh.client()
-	ctx, cancelResize := context.WithTimeout(context.Background(), clhAPITimeout*time.Second)
+	ctx, cancelResize := context.WithTimeout(ctx, clhAPITimeout*time.Second)
 	defer cancelResize()
 
 	// OpenApi does not support uint64, convert to int64
 	resize := chclient.VmResize{DesiredRam: int64(newMem.ToBytes())}
 	clh.Logger().WithFields(log.Fields{"current-memory": currentMem, "new-memory": newMem}).Debug("updating VM memory")
 	if _, err = cl.VmResizePut(ctx, resize); err != nil {
-		clh.Logger().WithFields(log.Fields{"current-memory": currentMem, "new-memory": newMem}).Warnf("failed to update memory %s", openAPIClientError(err))
+		clh.Logger().WithError(err).WithFields(log.Fields{"current-memory": currentMem, "new-memory": newMem}).Warnf("failed to update memory %s", openAPIClientError(err))
 		err = fmt.Errorf("Failed to resize memory from %d to %d: %s", currentMem, newMem, openAPIClientError(err))
 		return uint32(currentMem.ToMiB()), memoryDevice{}, openAPIClientError(err)
 	}
@@ -620,7 +607,7 @@ func (clh *cloudHypervisor) resizeVCPUs(ctx context.Context, reqVCPUs uint32) (c
 	}
 
 	// Resize (hot-plug) vCPUs via HTTP API
-	ctx, cancel := context.WithTimeout(context.Background(), clhAPITimeout*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, clhAPITimeout*time.Second)
 	defer cancel()
 	if _, err = cl.VmResizePut(ctx, chclient.VmResize{DesiredVcpus: int32(reqVCPUs)}); err != nil {
 		return currentVCPUs, newVCPUs, errors.Wrap(err, "[clh] VmResizePut failed")
@@ -652,11 +639,11 @@ func (clh *cloudHypervisor) resumeSandbox(ctx context.Context) error {
 }
 
 // stopSandbox will stop the Sandbox's VM.
-func (clh *cloudHypervisor) stopSandbox(ctx context.Context) (err error) {
-	span, ctx := clh.trace(ctx, "stopSandbox")
+func (clh *cloudHypervisor) stopSandbox(ctx context.Context, waitOnly bool) (err error) {
+	span, _ := katatrace.Trace(ctx, clh.Logger(), "stopSandbox", clh.tracingTags())
 	defer span.End()
 	clh.Logger().WithField("function", "stopSandbox").Info("Stop Sandbox")
-	return clh.terminate(ctx)
+	return clh.terminate(ctx, waitOnly)
 }
 
 func (clh *cloudHypervisor) fromGrpc(ctx context.Context, hypervisorConfig *HypervisorConfig, j []byte) error {
@@ -698,8 +685,12 @@ func (clh *cloudHypervisor) getPids() []int {
 	return pids
 }
 
+func (clh *cloudHypervisor) getVirtioFsPid() *int {
+	return &clh.state.VirtiofsdPID
+}
+
 func (clh *cloudHypervisor) addDevice(ctx context.Context, devInfo interface{}, devType deviceType) error {
-	span, _ := clh.trace(ctx, "addDevice")
+	span, _ := katatrace.Trace(ctx, clh.Logger(), "addDevice", clh.tracingTags())
 	defer span.End()
 
 	var err error
@@ -733,7 +724,7 @@ func (clh *cloudHypervisor) Logger() *log.Entry {
 
 // Adds all capabilities supported by cloudHypervisor implementation of hypervisor interface
 func (clh *cloudHypervisor) capabilities(ctx context.Context) types.Capabilities {
-	span, _ := clh.trace(ctx, "capabilities")
+	span, _ := katatrace.Trace(ctx, clh.Logger(), "capabilities", clh.tracingTags())
 	defer span.End()
 
 	clh.Logger().WithField("function", "capabilities").Info("get Capabilities")
@@ -743,21 +734,8 @@ func (clh *cloudHypervisor) capabilities(ctx context.Context) types.Capabilities
 	return caps
 }
 
-func (clh *cloudHypervisor) trace(parent context.Context, name string) (otelTrace.Span, context.Context) {
-	if parent == nil {
-		clh.Logger().WithField("type", "bug").Error("trace called before context set")
-		parent = context.Background()
-	}
-
-	tracer := otel.Tracer("kata")
-	ctx, span := tracer.Start(parent, name)
-	span.SetAttributes([]otelLabel.KeyValue{otelLabel.Key("subsystem").String("hypervisor"), otelLabel.Key("type").String("clh")}...)
-
-	return span, ctx
-}
-
-func (clh *cloudHypervisor) terminate(ctx context.Context) (err error) {
-	span, ctx := clh.trace(ctx, "terminate")
+func (clh *cloudHypervisor) terminate(ctx context.Context, waitOnly bool) (err error) {
+	span, _ := katatrace.Trace(ctx, clh.Logger(), "terminate", clh.tracingTags())
 	defer span.End()
 
 	pid := clh.state.PID
@@ -775,7 +753,7 @@ func (clh *cloudHypervisor) terminate(ctx context.Context) (err error) {
 
 	clh.Logger().Debug("Stopping Cloud Hypervisor")
 
-	if pidRunning {
+	if pidRunning && !waitOnly {
 		clhRunning, _ := clh.isClhRunning(clhStopSandboxTimeout)
 		if clhRunning {
 			ctx, cancel := context.WithTimeout(context.Background(), clhStopSandboxTimeout*time.Second)
@@ -786,31 +764,8 @@ func (clh *cloudHypervisor) terminate(ctx context.Context) (err error) {
 		}
 	}
 
-	// At this point the VMM was stop nicely, but need to check if PID is still running
-	// Wait for the VM process to terminate
-	tInit := time.Now()
-	for {
-		if err = syscall.Kill(pid, syscall.Signal(0)); err != nil {
-			pidRunning = false
-			break
-		}
-
-		if time.Since(tInit).Seconds() >= clhStopSandboxTimeout {
-			pidRunning = true
-			clh.Logger().Warnf("VM still running after waiting %ds", clhStopSandboxTimeout)
-			break
-		}
-
-		// Let's avoid to run a too busy loop
-		time.Sleep(time.Duration(50) * time.Millisecond)
-	}
-
-	// Let's try with a hammer now, a SIGKILL should get rid of the
-	// VM process.
-	if pidRunning {
-		if err = syscall.Kill(pid, syscall.SIGKILL); err != nil {
-			return fmt.Errorf("Fatal, failed to kill hypervisor process, error: %s", err)
-		}
+	if err = utils.WaitLocalProcess(pid, clhStopSandboxTimeout, syscall.Signal(0), clh.Logger()); err != nil {
+		return err
 	}
 
 	if clh.virtiofsd == nil {
@@ -819,7 +774,7 @@ func (clh *cloudHypervisor) terminate(ctx context.Context) (err error) {
 
 	clh.Logger().Debug("stop virtiofsd")
 	if err = clh.virtiofsd.Stop(ctx); err != nil {
-		clh.Logger().Error("failed to stop virtiofsd")
+		clh.Logger().WithError(err).Error("failed to stop virtiofsd")
 	}
 
 	return
@@ -856,7 +811,6 @@ func (clh *cloudHypervisor) apiSocketPath(id string) (string, error) {
 
 func (clh *cloudHypervisor) waitVMM(timeout uint) error {
 	clhRunning, err := clh.isClhRunning(timeout)
-
 	if err != nil {
 		return err
 	}
@@ -882,67 +836,10 @@ func (clh *cloudHypervisor) clhPath() (string, error) {
 		return "", fmt.Errorf("Cloud-Hypervisor path (%s) does not exist", p)
 	}
 
-	return p, nil
+	return p, err
 }
 
-func (clh *cloudHypervisor) getAvailableVersion() error {
-
-	clhPath, err := clh.clhPath()
-	if err != nil {
-		return err
-
-	}
-
-	cmd := exec.Command(clhPath, "--version")
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return err
-	}
-
-	words := strings.Fields(string(out))
-	if len(words) != 2 {
-		return errors.New("Failed to parse cloud-hypervisor version response. Illegal length")
-
-	}
-	versionSplit := strings.SplitN(words[1], ".", -1)
-	if len(versionSplit) != 3 {
-		return errors.New("Failed to parse cloud-hypervisor version field. Illegal length")
-
-	}
-
-	// Remove 'v' prefix if has one
-	versionSplit[0] = strings.TrimLeft(versionSplit[0], "v")
-	major, err := strconv.ParseUint(versionSplit[0], 10, 64)
-	if err != nil {
-		return err
-
-	}
-	minor, err := strconv.ParseUint(versionSplit[1], 10, 64)
-	if err != nil {
-		return err
-
-	}
-
-	// revision could have aditional commit information separated by '-'
-	revisionSplit := strings.SplitN(versionSplit[2], "-", -1)
-	if len(revisionSplit) < 1 {
-		return errors.Errorf("Failed parse cloud-hypervisor revision %s", versionSplit[2])
-	}
-	revision, err := strconv.ParseUint(revisionSplit[0], 10, 64)
-	if err != nil {
-		return err
-	}
-
-	clh.version = CloudHypervisorVersion{
-		Major:    int(major),
-		Minor:    int(minor),
-		Revision: int(revision),
-	}
-	return nil
-
-}
-
-func (clh *cloudHypervisor) LaunchClh() (int, error) {
+func (clh *cloudHypervisor) launchClh() (int, error) {
 
 	clhPath, err := clh.clhPath()
 	if err != nil {
@@ -993,7 +890,7 @@ func (clh *cloudHypervisor) LaunchClh() (int, error) {
 	}
 
 	if err := clh.waitVMM(clhTimeout); err != nil {
-		clh.Logger().WithField("error", err).Warn("cloud-hypervisor init failed")
+		clh.Logger().WithError(err).Warn("cloud-hypervisor init failed")
 		return -1, err
 	}
 
@@ -1026,7 +923,6 @@ func kernelParamsToString(params []Param) string {
 	for _, p := range params {
 		paramBuilder.WriteString(p.Key)
 		if len(p.Value) > 0 {
-
 			paramBuilder.WriteString("=")
 			paramBuilder.WriteString(p.Value)
 		}
@@ -1084,7 +980,6 @@ func (clh *cloudHypervisor) newAPIClient() *chclient.DefaultApiService {
 			addr, err := net.ResolveUnixAddr("unix", clh.state.apiSocket)
 			if err != nil {
 				return nil, err
-
 			}
 
 			return net.DialUnix("unix", nil, addr)
@@ -1123,13 +1018,11 @@ func (clh *cloudHypervisor) bootVM(ctx context.Context) error {
 		clh.Logger().WithField("body", string(bodyBuf)).Debug("VM config")
 	}
 	_, err := cl.CreateVM(ctx, clh.vmconfig)
-
 	if err != nil {
 		return openAPIClientError(err)
 	}
 
 	info, err := clh.vmInfo()
-
 	if err != nil {
 		return err
 	}
@@ -1142,13 +1035,11 @@ func (clh *cloudHypervisor) bootVM(ctx context.Context) error {
 
 	clh.Logger().Debug("Booting VM")
 	_, err = cl.BootVM(ctx)
-
 	if err != nil {
 		return openAPIClientError(err)
 	}
 
 	info, err = clh.vmInfo()
-
 	if err != nil {
 		return err
 	}
@@ -1176,13 +1067,11 @@ func (clh *cloudHypervisor) addNet(e Endpoint) error {
 
 	mac := e.HardwareAddr()
 	netPair := e.NetworkPair()
-
 	if netPair == nil {
 		return errors.New("net Pair to be added is nil, needed to get TAP path")
 	}
 
 	tapPath := netPair.TapInterface.TAPIface.Name
-
 	if tapPath == "" {
 		return errors.New("TAP path in network pair is empty")
 	}
@@ -1242,7 +1131,7 @@ func (clh *cloudHypervisor) cleanupVM(force bool) error {
 	path, err := clh.vsockSocketPath(clh.id)
 	if err == nil {
 		if err := os.Remove(path); err != nil {
-			clh.Logger().WithField("path", path).Warn("removing vm socket failed")
+			clh.Logger().WithError(err).WithField("path", path).Warn("removing vm socket failed")
 		}
 	}
 
@@ -1301,7 +1190,6 @@ func (clh *cloudHypervisor) vmInfo() (chclient.VmInfo, error) {
 		clh.Logger().WithError(openAPIClientError(err)).Warn("VmInfoGet failed")
 	}
 	return info, openAPIClientError(err)
-
 }
 
 func (clh *cloudHypervisor) isRateLimiterBuiltin() bool {

@@ -18,9 +18,6 @@ import (
 	pb "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/agent/protocols/grpc"
 )
 
-// DefaultMockHookBinPath is populated at link time.
-var DefaultMockHookBinPath string
-
 var testKataMockHybridVSockURLTempl = "mock://%s/kata-mock-hybrid-vsock.sock"
 
 func GenerateKataMockHybridVSock() (string, error) {
@@ -108,10 +105,6 @@ func (p *HybridVSockTTRPCMockImp) SignalProcess(ctx context.Context, req *pb.Sig
 
 func (p *HybridVSockTTRPCMockImp) WaitProcess(ctx context.Context, req *pb.WaitProcessRequest) (*pb.WaitProcessResponse, error) {
 	return &pb.WaitProcessResponse{}, nil
-}
-
-func (p *HybridVSockTTRPCMockImp) ListProcesses(ctx context.Context, req *pb.ListProcessesRequest) (*pb.ListProcessesResponse, error) {
-	return &pb.ListProcessesResponse{}, nil
 }
 
 func (p *HybridVSockTTRPCMockImp) UpdateContainer(ctx context.Context, req *pb.UpdateContainerRequest) (*gpb.Empty, error) {

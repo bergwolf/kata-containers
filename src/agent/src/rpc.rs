@@ -20,9 +20,8 @@ use anyhow::{anyhow, Context, Result};
 use oci::{LinuxNamespace, Root, Spec};
 use protobuf::{RepeatedField, SingularPtrField};
 use protocols::agent::{
-    AgentDetails, CopyFileRequest, GuestDetailsResponse, Interfaces, ListProcessesResponse,
-    Metrics, OOMEvent, ReadStreamResponse, Routes, StatsContainerResponse, WaitProcessResponse,
-    WriteStreamResponse,
+    AgentDetails, CopyFileRequest, GuestDetailsResponse, Interfaces, Metrics, OOMEvent,
+    ReadStreamResponse, Routes, StatsContainerResponse, WaitProcessResponse, WriteStreamResponse,
 };
 use protocols::empty::Empty;
 use protocols::health::{
@@ -52,6 +51,14 @@ use crate::sandbox::Sandbox;
 use crate::version::{AGENT_VERSION, API_VERSION};
 use crate::AGENT_CONFIG;
 
+use crate::trace_rpc_call;
+use crate::tracer::extract_carrier_from_ttrpc;
+use opentelemetry::global;
+use tracing::span;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+use tracing::instrument;
+
 use libc::{self, c_ushort, pid_t, winsize, TIOCSWINSZ};
 use std::convert::TryFrom;
 use std::fs;
@@ -75,17 +82,37 @@ macro_rules! sl {
     };
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct AgentService {
     sandbox: Arc<Mutex<Sandbox>>,
 }
 
+// A container ID must match this regex:
+//
+//     ^[a-zA-Z0-9][a-zA-Z0-9_.-]+$
+//
+fn verify_cid(id: &str) -> Result<()> {
+    let valid = id.len() > 1
+        && id.chars().next().unwrap().is_alphanumeric()
+        && id
+            .chars()
+            .all(|c| (c.is_alphanumeric() || ['.', '-', '_'].contains(&c)));
+
+    match valid {
+        true => Ok(()),
+        false => Err(anyhow!("invalid container ID: {:?}", id)),
+    }
+}
+
 impl AgentService {
+    #[instrument]
     async fn do_create_container(
         &self,
         req: protocols::agent::CreateContainerRequest,
     ) -> Result<()> {
         let cid = req.container_id.clone();
+
+        verify_cid(&cid)?;
 
         let mut oci_spec = req.OCI.clone();
         let use_sandbox_pidns = req.get_sandbox_pidns();
@@ -178,6 +205,7 @@ impl AgentService {
         Ok(())
     }
 
+    #[instrument]
     async fn do_start_container(&self, req: protocols::agent::StartContainerRequest) -> Result<()> {
         let cid = req.container_id;
 
@@ -203,6 +231,7 @@ impl AgentService {
         Ok(())
     }
 
+    #[instrument]
     async fn do_remove_container(
         &self,
         req: protocols::agent::RemoveContainerRequest,
@@ -235,11 +264,14 @@ impl AgentService {
         if req.timeout == 0 {
             let s = Arc::clone(&self.sandbox);
             let mut sandbox = s.lock().await;
-            let ctr = sandbox
-                .get_container(&cid)
-                .ok_or_else(|| anyhow!("Invalid container id"))?;
 
-            ctr.destroy().await?;
+            sandbox.bind_watcher.remove_container(&cid).await;
+
+            sandbox
+                .get_container(&cid)
+                .ok_or_else(|| anyhow!("Invalid container id"))?
+                .destroy()
+                .await?;
 
             remove_container_resources(&mut sandbox)?;
 
@@ -255,6 +287,7 @@ impl AgentService {
             let mut sandbox = s.lock().await;
             if let Some(ctr) = sandbox.get_container(&cid2) {
                 ctr.destroy().await.unwrap();
+                sandbox.bind_watcher.remove_container(&cid2).await;
                 tx.send(1).unwrap();
             };
         });
@@ -280,6 +313,7 @@ impl AgentService {
         Ok(())
     }
 
+    #[instrument]
     async fn do_exec_process(&self, req: protocols::agent::ExecProcessRequest) -> Result<()> {
         let cid = req.container_id.clone();
         let exec_id = req.exec_id.clone();
@@ -308,6 +342,7 @@ impl AgentService {
         Ok(())
     }
 
+    #[instrument]
     async fn do_signal_process(&self, req: protocols::agent::SignalProcessRequest) -> Result<()> {
         let cid = req.container_id.clone();
         let eid = req.exec_id.clone();
@@ -342,6 +377,7 @@ impl AgentService {
         Ok(())
     }
 
+    #[instrument]
     async fn do_wait_process(
         &self,
         req: protocols::agent::WaitProcessRequest,
@@ -351,7 +387,6 @@ impl AgentService {
         let s = self.sandbox.clone();
         let mut resp = WaitProcessResponse::new();
         let pid: pid_t;
-        let stream;
 
         let (exit_send, mut exit_recv) = tokio::sync::mpsc::channel(100);
 
@@ -362,22 +397,20 @@ impl AgentService {
             "exec-id" => eid.clone()
         );
 
-        {
+        let exit_rx = {
             let mut sandbox = s.lock().await;
             let p = find_process(&mut sandbox, cid.as_str(), eid.as_str(), false)?;
 
-            stream = p.get_reader(StreamType::ExitPipeR);
-
             p.exit_watchers.push(exit_send);
             pid = p.pid;
-        }
 
-        if stream.is_some() {
-            info!(sl!(), "reading exit pipe");
+            p.exit_rx.clone()
+        };
 
-            let reader = stream.unwrap();
-            let mut content: Vec<u8> = vec![0, 1];
-            let _ = reader.lock().await.read(&mut content).await;
+        if let Some(mut exit_rx) = exit_rx {
+            info!(sl!(), "cid {} eid {} waiting for exit signal", &cid, &eid);
+            while exit_rx.changed().await.is_ok() {}
+            info!(sl!(), "cid {} eid {} received exit signal", &cid, &eid);
         }
 
         let mut sandbox = s.lock().await;
@@ -494,9 +527,10 @@ impl AgentService {
 impl protocols::agent_ttrpc::AgentService for AgentService {
     async fn create_container(
         &self,
-        _ctx: &TtrpcContext,
+        ctx: &TtrpcContext,
         req: protocols::agent::CreateContainerRequest,
     ) -> ttrpc::Result<Empty> {
+        trace_rpc_call!(ctx, "create_container", req);
         match self.do_create_container(req).await {
             Err(e) => Err(ttrpc_error(ttrpc::Code::INTERNAL, e.to_string())),
             Ok(_) => Ok(Empty::new()),
@@ -505,9 +539,10 @@ impl protocols::agent_ttrpc::AgentService for AgentService {
 
     async fn start_container(
         &self,
-        _ctx: &TtrpcContext,
+        ctx: &TtrpcContext,
         req: protocols::agent::StartContainerRequest,
     ) -> ttrpc::Result<Empty> {
+        trace_rpc_call!(ctx, "start_container", req);
         match self.do_start_container(req).await {
             Err(e) => Err(ttrpc_error(ttrpc::Code::INTERNAL, e.to_string())),
             Ok(_) => Ok(Empty::new()),
@@ -516,9 +551,10 @@ impl protocols::agent_ttrpc::AgentService for AgentService {
 
     async fn remove_container(
         &self,
-        _ctx: &TtrpcContext,
+        ctx: &TtrpcContext,
         req: protocols::agent::RemoveContainerRequest,
     ) -> ttrpc::Result<Empty> {
+        trace_rpc_call!(ctx, "remove_container", req);
         match self.do_remove_container(req).await {
             Err(e) => Err(ttrpc_error(ttrpc::Code::INTERNAL, e.to_string())),
             Ok(_) => Ok(Empty::new()),
@@ -527,9 +563,10 @@ impl protocols::agent_ttrpc::AgentService for AgentService {
 
     async fn exec_process(
         &self,
-        _ctx: &TtrpcContext,
+        ctx: &TtrpcContext,
         req: protocols::agent::ExecProcessRequest,
     ) -> ttrpc::Result<Empty> {
+        trace_rpc_call!(ctx, "exec_process", req);
         match self.do_exec_process(req).await {
             Err(e) => Err(ttrpc_error(ttrpc::Code::INTERNAL, e.to_string())),
             Ok(_) => Ok(Empty::new()),
@@ -538,9 +575,10 @@ impl protocols::agent_ttrpc::AgentService for AgentService {
 
     async fn signal_process(
         &self,
-        _ctx: &TtrpcContext,
+        ctx: &TtrpcContext,
         req: protocols::agent::SignalProcessRequest,
     ) -> ttrpc::Result<Empty> {
+        trace_rpc_call!(ctx, "signal_process", req);
         match self.do_signal_process(req).await {
             Err(e) => Err(ttrpc_error(ttrpc::Code::INTERNAL, e.to_string())),
             Ok(_) => Ok(Empty::new()),
@@ -549,104 +587,21 @@ impl protocols::agent_ttrpc::AgentService for AgentService {
 
     async fn wait_process(
         &self,
-        _ctx: &TtrpcContext,
+        ctx: &TtrpcContext,
         req: protocols::agent::WaitProcessRequest,
     ) -> ttrpc::Result<WaitProcessResponse> {
+        trace_rpc_call!(ctx, "wait_process", req);
         self.do_wait_process(req)
             .await
             .map_err(|e| ttrpc_error(ttrpc::Code::INTERNAL, e.to_string()))
     }
 
-    async fn list_processes(
-        &self,
-        _ctx: &TtrpcContext,
-        req: protocols::agent::ListProcessesRequest,
-    ) -> ttrpc::Result<ListProcessesResponse> {
-        let cid = req.container_id.clone();
-        let format = req.format.clone();
-        let mut args = req.args.into_vec();
-        let mut resp = ListProcessesResponse::new();
-
-        let s = Arc::clone(&self.sandbox);
-        let mut sandbox = s.lock().await;
-
-        let ctr = sandbox.get_container(&cid).ok_or_else(|| {
-            ttrpc_error(
-                ttrpc::Code::INVALID_ARGUMENT,
-                "invalid container id".to_string(),
-            )
-        })?;
-
-        let pids = ctr.processes().unwrap();
-
-        match format.as_str() {
-            "table" => {}
-            "json" => {
-                resp.process_list = serde_json::to_vec(&pids).unwrap();
-                return Ok(resp);
-            }
-            _ => {
-                return Err(ttrpc_error(
-                    ttrpc::Code::INVALID_ARGUMENT,
-                    "invalid format!".to_string(),
-                ));
-            }
-        }
-
-        // format "table"
-        if args.is_empty() {
-            // default argument
-            args = vec!["-ef".to_string()];
-        }
-
-        let output = tokio::process::Command::new("ps")
-            .args(args.as_slice())
-            .stdout(Stdio::piped())
-            .output()
-            .await
-            .expect("ps failed");
-
-        let out: String = String::from_utf8(output.stdout).unwrap();
-        let mut lines: Vec<String> = out.split('\n').map(|v| v.to_string()).collect();
-
-        let pid_index = lines[0]
-            .split_whitespace()
-            .position(|v| v == "PID")
-            .unwrap();
-
-        let mut result = String::new();
-        result.push_str(lines[0].as_str());
-
-        lines.remove(0);
-        for line in &lines {
-            if line.trim().is_empty() {
-                continue;
-            }
-
-            let fields: Vec<String> = line.split_whitespace().map(|v| v.to_string()).collect();
-
-            if fields.len() < pid_index + 1 {
-                warn!(sl!(), "corrupted output?");
-                continue;
-            }
-            let pid = fields[pid_index].trim().parse::<i32>().unwrap();
-
-            for p in &pids {
-                if pid == *p {
-                    result.push_str(line.as_str());
-                }
-            }
-        }
-
-        resp.process_list = Vec::from(result);
-        Ok(resp)
-    }
-
     async fn update_container(
         &self,
-        _ctx: &TtrpcContext,
+        ctx: &TtrpcContext,
         req: protocols::agent::UpdateContainerRequest,
     ) -> ttrpc::Result<Empty> {
+        trace_rpc_call!(ctx, "update_container", req);
         let cid = req.container_id.clone();
         let res = req.resources;
 
@@ -678,9 +633,10 @@ impl protocols::agent_ttrpc::AgentService for AgentService {
 
     async fn stats_container(
         &self,
-        _ctx: &TtrpcContext,
+        ctx: &TtrpcContext,
         req: protocols::agent::StatsContainerRequest,
     ) -> ttrpc::Result<StatsContainerResponse> {
+        trace_rpc_call!(ctx, "stats_container", req);
         let cid = req.container_id;
         let s = Arc::clone(&self.sandbox);
         let mut sandbox = s.lock().await;
@@ -698,9 +654,10 @@ impl protocols::agent_ttrpc::AgentService for AgentService {
 
     async fn pause_container(
         &self,
-        _ctx: &TtrpcContext,
+        ctx: &TtrpcContext,
         req: protocols::agent::PauseContainerRequest,
     ) -> ttrpc::Result<protocols::empty::Empty> {
+        trace_rpc_call!(ctx, "pause_container", req);
         let cid = req.get_container_id();
         let s = Arc::clone(&self.sandbox);
         let mut sandbox = s.lock().await;
@@ -720,9 +677,10 @@ impl protocols::agent_ttrpc::AgentService for AgentService {
 
     async fn resume_container(
         &self,
-        _ctx: &TtrpcContext,
+        ctx: &TtrpcContext,
         req: protocols::agent::ResumeContainerRequest,
     ) -> ttrpc::Result<protocols::empty::Empty> {
+        trace_rpc_call!(ctx, "resume_container", req);
         let cid = req.get_container_id();
         let s = Arc::clone(&self.sandbox);
         let mut sandbox = s.lock().await;
@@ -772,9 +730,11 @@ impl protocols::agent_ttrpc::AgentService for AgentService {
 
     async fn close_stdin(
         &self,
-        _ctx: &TtrpcContext,
+        ctx: &TtrpcContext,
         req: protocols::agent::CloseStdinRequest,
     ) -> ttrpc::Result<Empty> {
+        trace_rpc_call!(ctx, "close_stdin", req);
+
         let cid = req.container_id.clone();
         let eid = req.exec_id;
         let s = Arc::clone(&self.sandbox);
@@ -806,9 +766,11 @@ impl protocols::agent_ttrpc::AgentService for AgentService {
 
     async fn tty_win_resize(
         &self,
-        _ctx: &TtrpcContext,
+        ctx: &TtrpcContext,
         req: protocols::agent::TtyWinResizeRequest,
     ) -> ttrpc::Result<Empty> {
+        trace_rpc_call!(ctx, "tty_win_resize", req);
+
         let cid = req.container_id.clone();
         let eid = req.exec_id.clone();
         let s = Arc::clone(&self.sandbox);
@@ -844,9 +806,11 @@ impl protocols::agent_ttrpc::AgentService for AgentService {
 
     async fn update_interface(
         &self,
-        _ctx: &TtrpcContext,
+        ctx: &TtrpcContext,
         req: protocols::agent::UpdateInterfaceRequest,
     ) -> ttrpc::Result<Interface> {
+        trace_rpc_call!(ctx, "update_interface", req);
+
         let interface = req.interface.into_option().ok_or_else(|| {
             ttrpc_error(
                 ttrpc::Code::INVALID_ARGUMENT,
@@ -869,9 +833,11 @@ impl protocols::agent_ttrpc::AgentService for AgentService {
 
     async fn update_routes(
         &self,
-        _ctx: &TtrpcContext,
+        ctx: &TtrpcContext,
         req: protocols::agent::UpdateRoutesRequest,
     ) -> ttrpc::Result<Routes> {
+        trace_rpc_call!(ctx, "update_routes", req);
+
         let new_routes = req
             .routes
             .into_option()
@@ -907,9 +873,11 @@ impl protocols::agent_ttrpc::AgentService for AgentService {
 
     async fn list_interfaces(
         &self,
-        _ctx: &TtrpcContext,
-        _req: protocols::agent::ListInterfacesRequest,
+        ctx: &TtrpcContext,
+        req: protocols::agent::ListInterfacesRequest,
     ) -> ttrpc::Result<Interfaces> {
+        trace_rpc_call!(ctx, "list_interfaces", req);
+
         let list = self
             .sandbox
             .lock()
@@ -932,9 +900,11 @@ impl protocols::agent_ttrpc::AgentService for AgentService {
 
     async fn list_routes(
         &self,
-        _ctx: &TtrpcContext,
-        _req: protocols::agent::ListRoutesRequest,
+        ctx: &TtrpcContext,
+        req: protocols::agent::ListRoutesRequest,
     ) -> ttrpc::Result<Routes> {
+        trace_rpc_call!(ctx, "list_routes", req);
+
         let list = self
             .sandbox
             .lock()
@@ -969,9 +939,11 @@ impl protocols::agent_ttrpc::AgentService for AgentService {
 
     async fn create_sandbox(
         &self,
-        _ctx: &TtrpcContext,
+        ctx: &TtrpcContext,
         req: protocols::agent::CreateSandboxRequest,
     ) -> ttrpc::Result<Empty> {
+        trace_rpc_call!(ctx, "create_sandbox", req);
+
         {
             let sandbox = self.sandbox.clone();
             let mut s = sandbox.lock().await;
@@ -996,7 +968,7 @@ impl protocols::agent_ttrpc::AgentService for AgentService {
             }
 
             for m in req.kernel_modules.iter() {
-                let _ = load_kernel_module(m)
+                load_kernel_module(m)
                     .map_err(|e| ttrpc_error(ttrpc::Code::INTERNAL, e.to_string()))?;
             }
 
@@ -1032,9 +1004,11 @@ impl protocols::agent_ttrpc::AgentService for AgentService {
 
     async fn destroy_sandbox(
         &self,
-        _ctx: &TtrpcContext,
-        _req: protocols::agent::DestroySandboxRequest,
+        ctx: &TtrpcContext,
+        req: protocols::agent::DestroySandboxRequest,
     ) -> ttrpc::Result<Empty> {
+        trace_rpc_call!(ctx, "destroy_sandbox", req);
+
         let s = Arc::clone(&self.sandbox);
         let mut sandbox = s.lock().await;
         // destroy all containers, clean up, notify agent to exit
@@ -1051,9 +1025,11 @@ impl protocols::agent_ttrpc::AgentService for AgentService {
 
     async fn add_arp_neighbors(
         &self,
-        _ctx: &TtrpcContext,
+        ctx: &TtrpcContext,
         req: protocols::agent::AddARPNeighborsRequest,
     ) -> ttrpc::Result<Empty> {
+        trace_rpc_call!(ctx, "add_arp_neighbors", req);
+
         let neighs = req
             .neighbors
             .into_option()
@@ -1083,11 +1059,12 @@ impl protocols::agent_ttrpc::AgentService for AgentService {
 
     async fn online_cpu_mem(
         &self,
-        _ctx: &TtrpcContext,
+        ctx: &TtrpcContext,
         req: protocols::agent::OnlineCPUMemRequest,
     ) -> ttrpc::Result<Empty> {
         let s = Arc::clone(&self.sandbox);
         let sandbox = s.lock().await;
+        trace_rpc_call!(ctx, "online_cpu_mem", req);
 
         sandbox
             .online_cpu_memory(&req)
@@ -1098,9 +1075,11 @@ impl protocols::agent_ttrpc::AgentService for AgentService {
 
     async fn reseed_random_dev(
         &self,
-        _ctx: &TtrpcContext,
+        ctx: &TtrpcContext,
         req: protocols::agent::ReseedRandomDevRequest,
     ) -> ttrpc::Result<Empty> {
+        trace_rpc_call!(ctx, "reseed_random_dev", req);
+
         random::reseed_rng(req.data.as_slice())
             .map_err(|e| ttrpc_error(ttrpc::Code::INTERNAL, e.to_string()))?;
 
@@ -1109,9 +1088,11 @@ impl protocols::agent_ttrpc::AgentService for AgentService {
 
     async fn get_guest_details(
         &self,
-        _ctx: &TtrpcContext,
+        ctx: &TtrpcContext,
         req: protocols::agent::GuestDetailsRequest,
     ) -> ttrpc::Result<GuestDetailsResponse> {
+        trace_rpc_call!(ctx, "get_guest_details", req);
+
         info!(sl!(), "get guest details!");
         let mut resp = GuestDetailsResponse::new();
         // to get memory block size
@@ -1135,9 +1116,11 @@ impl protocols::agent_ttrpc::AgentService for AgentService {
 
     async fn mem_hotplug_by_probe(
         &self,
-        _ctx: &TtrpcContext,
+        ctx: &TtrpcContext,
         req: protocols::agent::MemHotplugByProbeRequest,
     ) -> ttrpc::Result<Empty> {
+        trace_rpc_call!(ctx, "mem_hotplug_by_probe", req);
+
         do_mem_hotplug_by_probe(&req.memHotplugProbeAddr)
             .map_err(|e| ttrpc_error(ttrpc::Code::INTERNAL, e.to_string()))?;
 
@@ -1146,9 +1129,11 @@ impl protocols::agent_ttrpc::AgentService for AgentService {
 
     async fn set_guest_date_time(
         &self,
-        _ctx: &TtrpcContext,
+        ctx: &TtrpcContext,
         req: protocols::agent::SetGuestDateTimeRequest,
     ) -> ttrpc::Result<Empty> {
+        trace_rpc_call!(ctx, "set_guest_date_time", req);
+
         do_set_guest_date_time(req.Sec, req.Usec)
             .map_err(|e| ttrpc_error(ttrpc::Code::INTERNAL, e.to_string()))?;
 
@@ -1157,9 +1142,11 @@ impl protocols::agent_ttrpc::AgentService for AgentService {
 
     async fn copy_file(
         &self,
-        _ctx: &TtrpcContext,
+        ctx: &TtrpcContext,
         req: protocols::agent::CopyFileRequest,
     ) -> ttrpc::Result<Empty> {
+        trace_rpc_call!(ctx, "copy_file", req);
+
         do_copy_file(&req).map_err(|e| ttrpc_error(ttrpc::Code::INTERNAL, e.to_string()))?;
 
         Ok(Empty::new())
@@ -1167,9 +1154,11 @@ impl protocols::agent_ttrpc::AgentService for AgentService {
 
     async fn get_metrics(
         &self,
-        _ctx: &TtrpcContext,
+        ctx: &TtrpcContext,
         req: protocols::agent::GetMetricsRequest,
     ) -> ttrpc::Result<Metrics> {
+        trace_rpc_call!(ctx, "get_metrics", req);
+
         match get_metrics(&req) {
             Err(e) => Err(ttrpc_error(ttrpc::Code::INTERNAL, e.to_string())),
             Ok(s) => {
@@ -1599,27 +1588,22 @@ fn setup_bundle(cid: &str, spec: &mut Spec) -> Result<PathBuf> {
 fn cleanup_process(p: &mut Process) -> Result<()> {
     if p.parent_stdin.is_some() {
         p.close_stream(StreamType::ParentStdin);
-        let _ = unistd::close(p.parent_stdin.unwrap())?;
+        unistd::close(p.parent_stdin.unwrap())?;
     }
 
     if p.parent_stdout.is_some() {
         p.close_stream(StreamType::ParentStdout);
-        let _ = unistd::close(p.parent_stdout.unwrap())?;
+        unistd::close(p.parent_stdout.unwrap())?;
     }
 
     if p.parent_stderr.is_some() {
         p.close_stream(StreamType::ParentStderr);
-        let _ = unistd::close(p.parent_stderr.unwrap())?;
+        unistd::close(p.parent_stderr.unwrap())?;
     }
 
     if p.term_master.is_some() {
         p.close_stream(StreamType::TermMaster);
-        let _ = unistd::close(p.term_master.unwrap())?;
-    }
-
-    if p.exit_pipe_r.is_some() {
-        p.close_stream(StreamType::ExitPipeR);
-        let _ = unistd::close(p.exit_pipe_r.unwrap())?;
+        unistd::close(p.term_master.unwrap())?;
     }
 
     p.notify_term_close();
@@ -1777,5 +1761,232 @@ mod tests {
         let result = agent_service.add_arp_neighbors(&ctx, req).await;
 
         assert!(result.is_err(), "expected add arp neighbors to fail");
+    }
+
+    #[tokio::test]
+    async fn test_verify_cid() {
+        #[derive(Debug)]
+        struct TestData<'a> {
+            id: &'a str,
+            expect_error: bool,
+        }
+
+        let tests = &[
+            TestData {
+                // Cannot be blank
+                id: "",
+                expect_error: true,
+            },
+            TestData {
+                // Cannot be a space
+                id: " ",
+                expect_error: true,
+            },
+            TestData {
+                // Must start with an alphanumeric
+                id: ".",
+                expect_error: true,
+            },
+            TestData {
+                // Must start with an alphanumeric
+                id: "-",
+                expect_error: true,
+            },
+            TestData {
+                // Must start with an alphanumeric
+                id: "_",
+                expect_error: true,
+            },
+            TestData {
+                // Must start with an alphanumeric
+                id: " a",
+                expect_error: true,
+            },
+            TestData {
+                // Must start with an alphanumeric
+                id: ".a",
+                expect_error: true,
+            },
+            TestData {
+                // Must start with an alphanumeric
+                id: "-a",
+                expect_error: true,
+            },
+            TestData {
+                // Must start with an alphanumeric
+                id: "_a",
+                expect_error: true,
+            },
+            TestData {
+                // Must start with an alphanumeric
+                id: "..",
+                expect_error: true,
+            },
+            TestData {
+                // Too short
+                id: "a",
+                expect_error: true,
+            },
+            TestData {
+                // Too short
+                id: "z",
+                expect_error: true,
+            },
+            TestData {
+                // Too short
+                id: "A",
+                expect_error: true,
+            },
+            TestData {
+                // Too short
+                id: "Z",
+                expect_error: true,
+            },
+            TestData {
+                // Too short
+                id: "0",
+                expect_error: true,
+            },
+            TestData {
+                // Too short
+                id: "9",
+                expect_error: true,
+            },
+            TestData {
+                // Must start with an alphanumeric
+                id: "-1",
+                expect_error: true,
+            },
+            TestData {
+                id: "/",
+                expect_error: true,
+            },
+            TestData {
+                id: "a/",
+                expect_error: true,
+            },
+            TestData {
+                id: "a/../",
+                expect_error: true,
+            },
+            TestData {
+                id: "../a",
+                expect_error: true,
+            },
+            TestData {
+                id: "../../a",
+                expect_error: true,
+            },
+            TestData {
+                id: "../../../a",
+                expect_error: true,
+            },
+            TestData {
+                id: "foo/../bar",
+                expect_error: true,
+            },
+            TestData {
+                id: "foo bar",
+                expect_error: true,
+            },
+            TestData {
+                id: "a.",
+                expect_error: false,
+            },
+            TestData {
+                id: "a..",
+                expect_error: false,
+            },
+            TestData {
+                id: "aa",
+                expect_error: false,
+            },
+            TestData {
+                id: "aa.",
+                expect_error: false,
+            },
+            TestData {
+                id: "hello..world",
+                expect_error: false,
+            },
+            TestData {
+                id: "hello/../world",
+                expect_error: true,
+            },
+            TestData {
+                id: "aa1245124sadfasdfgasdga.",
+                expect_error: false,
+            },
+            TestData {
+                id: "aAzZ0123456789_.-",
+                expect_error: false,
+            },
+            TestData {
+                id: "abcdefghijklmnopqrstuvwxyz0123456789.-_",
+                expect_error: false,
+            },
+            TestData {
+                id: "0123456789abcdefghijklmnopqrstuvwxyz.-_",
+                expect_error: false,
+            },
+            TestData {
+                id: " abcdefghijklmnopqrstuvwxyz0123456789.-_",
+                expect_error: true,
+            },
+            TestData {
+                id: ".abcdefghijklmnopqrstuvwxyz0123456789.-_",
+                expect_error: true,
+            },
+            TestData {
+                id: "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_",
+                expect_error: false,
+            },
+            TestData {
+                id: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ.-_",
+                expect_error: false,
+            },
+            TestData {
+                id: " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_",
+                expect_error: true,
+            },
+            TestData {
+                id: ".ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_",
+                expect_error: true,
+            },
+            TestData {
+                id: "/a/b/c",
+                expect_error: true,
+            },
+            TestData {
+                id: "a/b/c",
+                expect_error: true,
+            },
+            TestData {
+                id: "foo/../../../etc/passwd",
+                expect_error: true,
+            },
+            TestData {
+                id: "../../../../../../etc/motd",
+                expect_error: true,
+            },
+            TestData {
+                id: "/etc/passwd",
+                expect_error: true,
+            },
+        ];
+
+        for (i, d) in tests.iter().enumerate() {
+            let msg = format!("test[{}]: {:?}", i, d);
+
+            let result = verify_cid(d.id);
+
+            let msg = format!("{}, result: {:?}", msg, result);
+
+            if result.is_ok() {
+                assert!(!d.expect_error, "{}", msg);
+            } else {
+                assert!(d.expect_error, "{}", msg);
+            }
+        }
     }
 }

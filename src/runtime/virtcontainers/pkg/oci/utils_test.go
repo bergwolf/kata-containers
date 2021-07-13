@@ -188,163 +188,6 @@ func TestMinimalSandboxConfig(t *testing.T) {
 	assert.NoError(os.Remove(configPath))
 }
 
-func testStatusToOCIStateSuccessful(t *testing.T, cStatus vc.ContainerStatus, expected specs.State) {
-	ociState := StatusToOCIState(cStatus)
-	assert.Exactly(t, ociState, expected)
-}
-
-func TestStatusToOCIStateSuccessfulWithReadyState(t *testing.T) {
-
-	testContID := "testContID"
-	testPID := 12345
-	testRootFs := "testRootFs"
-
-	state := types.ContainerState{
-		State: types.StateReady,
-	}
-
-	containerAnnotations := map[string]string{
-		vcAnnotations.BundlePathKey: tempBundlePath,
-	}
-
-	cStatus := vc.ContainerStatus{
-		ID:          testContID,
-		State:       state,
-		PID:         testPID,
-		RootFs:      testRootFs,
-		Annotations: containerAnnotations,
-	}
-
-	expected := specs.State{
-		Version:     specs.Version,
-		ID:          testContID,
-		Status:      "created",
-		Pid:         testPID,
-		Bundle:      tempBundlePath,
-		Annotations: containerAnnotations,
-	}
-
-	testStatusToOCIStateSuccessful(t, cStatus, expected)
-
-}
-
-func TestStatusToOCIStateSuccessfulWithRunningState(t *testing.T) {
-
-	testContID := "testContID"
-	testPID := 12345
-	testRootFs := "testRootFs"
-
-	state := types.ContainerState{
-		State: types.StateRunning,
-	}
-
-	containerAnnotations := map[string]string{
-		vcAnnotations.BundlePathKey: tempBundlePath,
-	}
-
-	cStatus := vc.ContainerStatus{
-		ID:          testContID,
-		State:       state,
-		PID:         testPID,
-		RootFs:      testRootFs,
-		Annotations: containerAnnotations,
-	}
-
-	expected := specs.State{
-		Version:     specs.Version,
-		ID:          testContID,
-		Status:      "running",
-		Pid:         testPID,
-		Bundle:      tempBundlePath,
-		Annotations: containerAnnotations,
-	}
-
-	testStatusToOCIStateSuccessful(t, cStatus, expected)
-
-}
-
-func TestStatusToOCIStateSuccessfulWithStoppedState(t *testing.T) {
-	testContID := "testContID"
-	testPID := 12345
-	testRootFs := "testRootFs"
-
-	state := types.ContainerState{
-		State: types.StateStopped,
-	}
-
-	containerAnnotations := map[string]string{
-		vcAnnotations.BundlePathKey: tempBundlePath,
-	}
-
-	cStatus := vc.ContainerStatus{
-		ID:          testContID,
-		State:       state,
-		PID:         testPID,
-		RootFs:      testRootFs,
-		Annotations: containerAnnotations,
-	}
-
-	expected := specs.State{
-		Version:     specs.Version,
-		ID:          testContID,
-		Status:      "stopped",
-		Pid:         testPID,
-		Bundle:      tempBundlePath,
-		Annotations: containerAnnotations,
-	}
-
-	testStatusToOCIStateSuccessful(t, cStatus, expected)
-
-}
-
-func TestStatusToOCIStateSuccessfulWithNoState(t *testing.T) {
-	testContID := "testContID"
-	testPID := 12345
-	testRootFs := "testRootFs"
-
-	containerAnnotations := map[string]string{
-		vcAnnotations.BundlePathKey: tempBundlePath,
-	}
-
-	cStatus := vc.ContainerStatus{
-		ID:          testContID,
-		PID:         testPID,
-		RootFs:      testRootFs,
-		Annotations: containerAnnotations,
-	}
-
-	expected := specs.State{
-		Version:     specs.Version,
-		ID:          testContID,
-		Status:      "",
-		Pid:         testPID,
-		Bundle:      tempBundlePath,
-		Annotations: containerAnnotations,
-	}
-
-	testStatusToOCIStateSuccessful(t, cStatus, expected)
-
-}
-
-func TestStateToOCIState(t *testing.T) {
-	var state types.StateString
-	assert := assert.New(t)
-
-	assert.Empty(StateToOCIState(state))
-
-	state = types.StateReady
-	assert.Equal(StateToOCIState(state), "created")
-
-	state = types.StateRunning
-	assert.Equal(StateToOCIState(state), "running")
-
-	state = types.StateStopped
-	assert.Equal(StateToOCIState(state), "stopped")
-
-	state = types.StatePaused
-	assert.Equal(StateToOCIState(state), "paused")
-}
-
 func TestEnvVars(t *testing.T) {
 	assert := assert.New(t)
 	envVars := []string{"foo=bar", "TERM=xterm", "HOME=/home/foo", "TERM=\"bar\"", "foo=\"\""}
@@ -849,6 +692,7 @@ func TestAddHypervisorAnnotations(t *testing.T) {
 	ocispec.Annotations[vcAnnotations.SharedFS] = "virtio-fs"
 	ocispec.Annotations[vcAnnotations.VirtioFSDaemon] = "/bin/false"
 	ocispec.Annotations[vcAnnotations.VirtioFSCache] = "/home/cache"
+	ocispec.Annotations[vcAnnotations.VirtioFSExtraArgs] = "[ \"arg0\", \"arg1\" ]"
 	ocispec.Annotations[vcAnnotations.Msize9p] = "512"
 	ocispec.Annotations[vcAnnotations.MachineType] = "q35"
 	ocispec.Annotations[vcAnnotations.MachineAccelerators] = "nofw"
@@ -858,7 +702,6 @@ func TestAddHypervisorAnnotations(t *testing.T) {
 	ocispec.Annotations[vcAnnotations.DisableImageNvdimm] = "true"
 	ocispec.Annotations[vcAnnotations.HotplugVFIOOnRootBus] = "true"
 	ocispec.Annotations[vcAnnotations.PCIeRootPort] = "2"
-	ocispec.Annotations[vcAnnotations.EntropySource] = "/dev/urandom"
 	ocispec.Annotations[vcAnnotations.IOMMUPlatform] = "true"
 	ocispec.Annotations[vcAnnotations.SGXEPC] = "64Mi"
 	// 10Mbit
@@ -870,7 +713,7 @@ func TestAddHypervisorAnnotations(t *testing.T) {
 	assert.Equal(config.HypervisorConfig.DefaultMaxVCPUs, uint32(1))
 	assert.Equal(config.HypervisorConfig.MemorySize, uint32(1024))
 	assert.Equal(config.HypervisorConfig.MemSlots, uint32(20))
-	assert.Equal(config.HypervisorConfig.MemOffset, uint32(512))
+	assert.Equal(config.HypervisorConfig.MemOffset, uint64(512))
 	assert.Equal(config.HypervisorConfig.VirtioMem, true)
 	assert.Equal(config.HypervisorConfig.MemPrealloc, true)
 	assert.Equal(config.HypervisorConfig.Mlock, false)
@@ -886,6 +729,7 @@ func TestAddHypervisorAnnotations(t *testing.T) {
 	assert.Equal(config.HypervisorConfig.SharedFS, "virtio-fs")
 	assert.Equal(config.HypervisorConfig.VirtioFSDaemon, "/bin/false")
 	assert.Equal(config.HypervisorConfig.VirtioFSCache, "/home/cache")
+	assert.ElementsMatch(config.HypervisorConfig.VirtioFSExtraArgs, [2]string{"arg0", "arg1"})
 	assert.Equal(config.HypervisorConfig.Msize9p, uint32(512))
 	assert.Equal(config.HypervisorConfig.HypervisorMachineType, "q35")
 	assert.Equal(config.HypervisorConfig.MachineAccelerators, "nofw")
@@ -895,7 +739,6 @@ func TestAddHypervisorAnnotations(t *testing.T) {
 	assert.Equal(config.HypervisorConfig.DisableImageNvdimm, true)
 	assert.Equal(config.HypervisorConfig.HotplugVFIOOnRootBus, true)
 	assert.Equal(config.HypervisorConfig.PCIeRootPort, uint32(2))
-	assert.Equal(config.HypervisorConfig.EntropySource, "/dev/urandom")
 	assert.Equal(config.HypervisorConfig.IOMMUPlatform, true)
 	assert.Equal(config.HypervisorConfig.SGXEPCSize, int64(67108864))
 	assert.Equal(config.HypervisorConfig.RxRateLimiterMaxRate, uint64(10000000))
@@ -945,22 +788,27 @@ func TestAddProtectedHypervisorAnnotations(t *testing.T) {
 
 	ocispec.Annotations[vcAnnotations.FileBackedMemRootDir] = "/dev/shm"
 	ocispec.Annotations[vcAnnotations.VirtioFSDaemon] = "/bin/false"
+	ocispec.Annotations[vcAnnotations.EntropySource] = "/dev/urandom"
 
 	config.HypervisorConfig.FileBackedMemRootDir = "do-not-touch"
 	config.HypervisorConfig.VirtioFSDaemon = "dangerous-daemon"
+	config.HypervisorConfig.EntropySource = "truly-random"
 
 	err = addAnnotations(ocispec, &config, runtimeConfig)
 	assert.Error(err)
 	assert.Equal(config.HypervisorConfig.FileBackedMemRootDir, "do-not-touch")
 	assert.Equal(config.HypervisorConfig.VirtioFSDaemon, "dangerous-daemon")
+	assert.Equal(config.HypervisorConfig.EntropySource, "truly-random")
 
 	// Now enable them and check again
 	runtimeConfig.HypervisorConfig.FileBackedMemRootList = []string{"/dev/*m"}
 	runtimeConfig.HypervisorConfig.VirtioFSDaemonList = []string{"/bin/*ls*"}
+	runtimeConfig.HypervisorConfig.EntropySourceList = []string{"/dev/*random*"}
 	err = addAnnotations(ocispec, &config, runtimeConfig)
 	assert.NoError(err)
 	assert.Equal(config.HypervisorConfig.FileBackedMemRootDir, "/dev/shm")
 	assert.Equal(config.HypervisorConfig.VirtioFSDaemon, "/bin/false")
+	assert.Equal(config.HypervisorConfig.EntropySource, "/dev/urandom")
 
 	// In case an absurd large value is provided, the config value if not over-ridden
 	ocispec.Annotations[vcAnnotations.DefaultVCPUs] = "655536"
@@ -1096,5 +944,147 @@ func TestIsCRIOContainerManager(t *testing.T) {
 		}
 		result := IsCRIOContainerManager(&ocispec)
 		assert.Equal(tc.result, result, "test case %d", (i + 1))
+	}
+}
+
+func TestParseAnnotationUintConfiguration(t *testing.T) {
+	assert := assert.New(t)
+
+	const key = "my_key"
+
+	validErr := fmt.Errorf("invalid value range: must between [10-1000]")
+	validFunc := func(v uint64) error {
+		if v < 10 || v > 1000 {
+			return validErr
+		}
+		return nil
+	}
+
+	testCases := []struct {
+		annotations map[string]string
+		expected    uint64
+		err         error
+		validFunc   func(uint64) error
+	}{
+		{
+			annotations: map[string]string{key: ""},
+			expected:    0,
+			err:         fmt.Errorf(errAnnotationPositiveNumericKey, key),
+			validFunc:   nil,
+		},
+		{
+			annotations: map[string]string{key: "a"},
+			expected:    0,
+			err:         fmt.Errorf(errAnnotationPositiveNumericKey, key),
+			validFunc:   nil,
+		},
+		{
+			annotations: map[string]string{key: "16"},
+			expected:    16,
+			err:         nil,
+			validFunc:   nil,
+		},
+		{
+			annotations: map[string]string{key: "16"},
+			expected:    16,
+			err:         nil,
+			validFunc:   validFunc,
+		},
+		{
+			annotations: map[string]string{key: "8"},
+			expected:    0,
+			err:         validErr,
+			validFunc:   validFunc,
+		},
+		{
+			annotations: map[string]string{key: "0"},
+			expected:    0,
+			err:         nil,
+			validFunc:   nil,
+		},
+		{
+			annotations: map[string]string{key: "-1"},
+			expected:    0,
+			err:         fmt.Errorf(errAnnotationPositiveNumericKey, key),
+			validFunc:   nil,
+		},
+	}
+
+	for i := range testCases {
+		tc := testCases[i]
+		ocispec := specs.Spec{
+			Annotations: tc.annotations,
+		}
+		var val uint64 = 0
+
+		err := newAnnotationConfiguration(ocispec, key).setUintWithCheck(func(v uint64) error {
+			if tc.validFunc != nil {
+				if err := tc.validFunc(v); err != nil {
+					return err
+				}
+			}
+			val = v
+			return nil
+		})
+
+		assert.Equal(tc.err, err, "test case %d check error", (i + 1))
+		if tc.err == nil {
+			assert.Equal(tc.expected, val, "test case %d check parsed result", (i + 1))
+		}
+	}
+}
+
+func TestParseAnnotationBoolConfiguration(t *testing.T) {
+	assert := assert.New(t)
+
+	const (
+		u32Key  = "u32_key"
+		u64Key  = "u64_key"
+		boolKey = "bool_key"
+	)
+
+	testCases := []struct {
+		annotationKey       string
+		annotationValueList []string
+		expected            bool
+		err                 error
+	}{
+		{
+			annotationKey:       boolKey,
+			annotationValueList: []string{"1", "t", "T", "true", "TRUE", "True"},
+			expected:            true,
+			err:                 nil,
+		},
+		{
+			annotationKey:       boolKey,
+			annotationValueList: []string{"0", "f", "F", "false", "FALSE", "False"},
+			expected:            false,
+			err:                 nil,
+		},
+		{
+			annotationKey:       boolKey,
+			annotationValueList: []string{"a", "FalSE", "Fal", "TRue", "TRU", "falsE"},
+			expected:            false,
+			err:                 fmt.Errorf(errAnnotationBoolKey, boolKey),
+		},
+	}
+
+	for i := range testCases {
+		tc := testCases[i]
+		for _, annotaionValue := range tc.annotationValueList {
+			ocispec := specs.Spec{
+				Annotations: map[string]string{tc.annotationKey: annotaionValue},
+			}
+			var val bool = false
+
+			err := newAnnotationConfiguration(ocispec, tc.annotationKey).setBool(func(v bool) {
+				val = v
+			})
+
+			assert.Equal(tc.err, err, "test case %d check error", (i + 1))
+			if tc.err == nil {
+				assert.Equal(tc.expected, val, "test case %d check parsed result", (i + 1))
+			}
+		}
 	}
 }

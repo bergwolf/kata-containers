@@ -2,14 +2,18 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 //
-use anyhow::{anyhow, Result};
+use crate::tracer;
+use anyhow::{bail, ensure, Context, Result};
 use std::env;
 use std::fs;
 use std::time;
+use tracing::instrument;
 
 const DEBUG_CONSOLE_FLAG: &str = "agent.debug_console";
 const DEV_MODE_FLAG: &str = "agent.devmode";
+const TRACE_MODE_OPTION: &str = "agent.trace";
 const LOG_LEVEL_OPTION: &str = "agent.log";
+const SERVER_ADDR_OPTION: &str = "agent.server_addr";
 const HOTPLUG_TIMOUT_OPTION: &str = "agent.hotplug_timeout";
 const DEBUG_CONSOLE_VPORT_OPTION: &str = "agent.debug_console_vport";
 const LOG_VPORT_OPTION: &str = "agent.log_vport";
@@ -25,6 +29,23 @@ const VSOCK_PORT: u16 = 1024;
 // Environment variables used for development and testing
 const SERVER_ADDR_ENV_VAR: &str = "KATA_AGENT_SERVER_ADDR";
 const LOG_LEVEL_ENV_VAR: &str = "KATA_AGENT_LOG_LEVEL";
+const TRACE_TYPE_ENV_VAR: &str = "KATA_AGENT_TRACE_TYPE";
+
+const ERR_INVALID_LOG_LEVEL: &str = "invalid log level";
+const ERR_INVALID_LOG_LEVEL_PARAM: &str = "invalid log level parameter";
+const ERR_INVALID_GET_VALUE_PARAM: &str = "expected name=value";
+const ERR_INVALID_GET_VALUE_NO_NAME: &str = "name=value parameter missing name";
+const ERR_INVALID_GET_VALUE_NO_VALUE: &str = "name=value parameter missing value";
+const ERR_INVALID_LOG_LEVEL_KEY: &str = "invalid log level key name";
+
+const ERR_INVALID_HOTPLUG_TIMEOUT: &str = "invalid hotplug timeout parameter";
+const ERR_INVALID_HOTPLUG_TIMEOUT_PARAM: &str = "unable to parse hotplug timeout";
+const ERR_INVALID_HOTPLUG_TIMEOUT_KEY: &str = "invalid hotplug timeout key name";
+
+const ERR_INVALID_CONTAINER_PIPE_SIZE: &str = "invalid container pipe size parameter";
+const ERR_INVALID_CONTAINER_PIPE_SIZE_PARAM: &str = "unable to parse container pipe size";
+const ERR_INVALID_CONTAINER_PIPE_SIZE_KEY: &str = "invalid container pipe size key name";
+const ERR_INVALID_CONTAINER_PIPE_NEGATIVE: &str = "container pipe size should not be negative";
 
 #[derive(Debug)]
 pub struct AgentConfig {
@@ -37,6 +58,7 @@ pub struct AgentConfig {
     pub container_pipe_size: i32,
     pub server_addr: String,
     pub unified_cgroup_hierarchy: bool,
+    pub tracing: tracer::TraceType,
 }
 
 // parse_cmdline_param parse commandline parameters.
@@ -81,9 +103,11 @@ impl AgentConfig {
             container_pipe_size: DEFAULT_CONTAINER_PIPE_SIZE,
             server_addr: format!("{}:{}", VSOCK_ADDR, VSOCK_PORT),
             unified_cgroup_hierarchy: false,
+            tracing: tracer::TraceType::Disabled,
         }
     }
 
+    #[instrument]
     pub fn parse_cmdline(&mut self, file: &str) -> Result<()> {
         let cmdline = fs::read_to_string(file)?;
         let params: Vec<&str> = cmdline.split_ascii_whitespace().collect();
@@ -92,8 +116,23 @@ impl AgentConfig {
             parse_cmdline_param!(param, DEBUG_CONSOLE_FLAG, self.debug_console);
             parse_cmdline_param!(param, DEV_MODE_FLAG, self.dev_mode);
 
+            // Support "bare" tracing option for backwards compatibility with
+            // Kata 1.x.
+            if param == &TRACE_MODE_OPTION {
+                self.tracing = tracer::TraceType::Isolated;
+                continue;
+            }
+
+            parse_cmdline_param!(param, TRACE_MODE_OPTION, self.tracing, get_trace_type);
+
             // parse cmdline options
             parse_cmdline_param!(param, LOG_LEVEL_OPTION, self.log_level, get_log_level);
+            parse_cmdline_param!(
+                param,
+                SERVER_ADDR_OPTION,
+                self.server_addr,
+                get_string_value
+            );
 
             // ensure the timeout is a positive value
             parse_cmdline_param!(
@@ -144,15 +183,20 @@ impl AgentConfig {
             }
         }
 
+        if let Ok(value) = env::var(TRACE_TYPE_ENV_VAR) {
+            if let Ok(result) = value.parse::<tracer::TraceType>() {
+                self.tracing = result;
+            }
+        }
+
         Ok(())
     }
 }
 
+#[instrument]
 fn get_vsock_port(p: &str) -> Result<i32> {
     let fields: Vec<&str> = p.split('=').collect();
-    if fields.len() != 2 {
-        return Err(anyhow!("invalid port parameter"));
-    }
+    ensure!(fields.len() == 2, "invalid port parameter");
 
     Ok(fields[1].parse::<i32>()?)
 }
@@ -162,6 +206,7 @@ fn get_vsock_port(p: &str) -> Result<i32> {
 //
 // Note: Logrus names are used for compatability with the previous
 // golang-based agent.
+#[instrument]
 fn logrus_to_slog_level(logrus_level: &str) -> Result<slog::Level> {
     let level = match logrus_level {
         // Note: different semantics to logrus: log, but don't panic.
@@ -176,48 +221,57 @@ fn logrus_to_slog_level(logrus_level: &str) -> Result<slog::Level> {
         // Not in logrus
         "trace" => slog::Level::Trace,
 
-        _ => {
-            return Err(anyhow!("invalid log level"));
-        }
+        _ => bail!(ERR_INVALID_LOG_LEVEL),
     };
 
     Ok(level)
 }
 
+#[instrument]
 fn get_log_level(param: &str) -> Result<slog::Level> {
     let fields: Vec<&str> = param.split('=').collect();
+    ensure!(fields.len() == 2, ERR_INVALID_LOG_LEVEL_PARAM);
+    ensure!(fields[0] == LOG_LEVEL_OPTION, ERR_INVALID_LOG_LEVEL_KEY);
 
-    if fields.len() != 2 {
-        return Err(anyhow!("invalid log level parameter"));
-    }
-
-    if fields[0] != LOG_LEVEL_OPTION {
-        Err(anyhow!("invalid log level key name"))
-    } else {
-        Ok(logrus_to_slog_level(fields[1])?)
-    }
+    logrus_to_slog_level(fields[1])
 }
 
+#[instrument]
+fn get_trace_type(param: &str) -> Result<tracer::TraceType> {
+    ensure!(!param.is_empty(), "invalid trace type parameter");
+
+    let fields: Vec<&str> = param.split('=').collect();
+    ensure!(
+        fields[0] == TRACE_MODE_OPTION,
+        "invalid trace type key name"
+    );
+
+    if fields.len() == 1 {
+        return Ok(tracer::TraceType::Isolated);
+    }
+
+    let result = fields[1].parse::<tracer::TraceType>()?;
+
+    Ok(result)
+}
+
+#[instrument]
 fn get_hotplug_timeout(param: &str) -> Result<time::Duration> {
     let fields: Vec<&str> = param.split('=').collect();
+    ensure!(fields.len() == 2, ERR_INVALID_HOTPLUG_TIMEOUT);
+    ensure!(
+        fields[0] == HOTPLUG_TIMOUT_OPTION,
+        ERR_INVALID_HOTPLUG_TIMEOUT_KEY
+    );
 
-    if fields.len() != 2 {
-        return Err(anyhow!("invalid hotplug timeout parameter"));
-    }
+    let value = fields[1]
+        .parse::<u64>()
+        .with_context(|| ERR_INVALID_HOTPLUG_TIMEOUT_PARAM)?;
 
-    let key = fields[0];
-    if key != HOTPLUG_TIMOUT_OPTION {
-        return Err(anyhow!("invalid hotplug timeout key name"));
-    }
-
-    let value = fields[1].parse::<u64>();
-    if value.is_err() {
-        return Err(anyhow!("unable to parse hotplug timeout"));
-    }
-
-    Ok(time::Duration::from_secs(value.unwrap()))
+    Ok(time::Duration::from_secs(value))
 }
 
+#[instrument]
 fn get_bool_value(param: &str) -> Result<bool> {
     let fields: Vec<&str> = param.split('=').collect();
 
@@ -234,27 +288,44 @@ fn get_bool_value(param: &str) -> Result<bool> {
     })
 }
 
+// Return the value from a "name=value" string.
+//
+// Note:
+//
+// - A name *and* a value is required.
+// - A value can contain any number of equal signs.
+// - We could/should maybe check if the name is pure whitespace
+//   since this is considered to be invalid.
+#[instrument]
+fn get_string_value(param: &str) -> Result<String> {
+    let fields: Vec<&str> = param.split('=').collect();
+    ensure!(fields.len() >= 2, ERR_INVALID_GET_VALUE_PARAM);
+
+    // We need name (but the value can be blank)
+    ensure!(!fields[0].is_empty(), ERR_INVALID_GET_VALUE_NO_NAME);
+
+    let value = fields[1..].join("=");
+    ensure!(!value.is_empty(), ERR_INVALID_GET_VALUE_NO_VALUE);
+
+    Ok(value)
+}
+
+#[instrument]
 fn get_container_pipe_size(param: &str) -> Result<i32> {
     let fields: Vec<&str> = param.split('=').collect();
-
-    if fields.len() != 2 {
-        return Err(anyhow!("invalid container pipe size parameter"));
-    }
+    ensure!(fields.len() == 2, ERR_INVALID_CONTAINER_PIPE_SIZE);
 
     let key = fields[0];
-    if key != CONTAINER_PIPE_SIZE_OPTION {
-        return Err(anyhow!("invalid container pipe size key name"));
-    }
+    ensure!(
+        key == CONTAINER_PIPE_SIZE_OPTION,
+        ERR_INVALID_CONTAINER_PIPE_SIZE_KEY
+    );
 
-    let res = fields[1].parse::<i32>();
-    if res.is_err() {
-        return Err(anyhow!("unable to parse container pipe size"));
-    }
+    let value = fields[1]
+        .parse::<i32>()
+        .with_context(|| ERR_INVALID_CONTAINER_PIPE_SIZE_PARAM)?;
 
-    let value = res.unwrap();
-    if value < 0 {
-        return Err(anyhow!("container pipe size should not be negative"));
-    }
+    ensure!(value >= 0, ERR_INVALID_CONTAINER_PIPE_NEGATIVE);
 
     Ok(value)
 }
@@ -262,29 +333,15 @@ fn get_container_pipe_size(param: &str) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyhow::Error;
+    use anyhow::anyhow;
     use std::fs::File;
     use std::io::Write;
     use std::time;
     use tempfile::tempdir;
 
-    const ERR_INVALID_LOG_LEVEL: &str = "invalid log level";
-    const ERR_INVALID_LOG_LEVEL_PARAM: &str = "invalid log level parameter";
-    const ERR_INVALID_LOG_LEVEL_KEY: &str = "invalid log level key name";
-
-    const ERR_INVALID_HOTPLUG_TIMEOUT: &str = "invalid hotplug timeout parameter";
-    const ERR_INVALID_HOTPLUG_TIMEOUT_PARAM: &str = "unable to parse hotplug timeout";
-    const ERR_INVALID_HOTPLUG_TIMEOUT_KEY: &str = "invalid hotplug timeout key name";
-
-    const ERR_INVALID_CONTAINER_PIPE_SIZE: &str = "invalid container pipe size parameter";
-    const ERR_INVALID_CONTAINER_PIPE_SIZE_PARAM: &str = "unable to parse container pipe size";
-    const ERR_INVALID_CONTAINER_PIPE_SIZE_KEY: &str = "invalid container pipe size key name";
-    const ERR_INVALID_CONTAINER_PIPE_NEGATIVE: &str = "container pipe size should not be negative";
-
-    // helper function to make errors less crazy-long
-    fn make_err(desc: &str) -> Error {
-        anyhow!(desc.to_string())
-    }
+    const ERR_INVALID_TRACE_TYPE_PARAM: &str = "invalid trace type parameter";
+    const ERR_INVALID_TRACE_TYPE: &str = "invalid trace type";
+    const ERR_INVALID_TRACE_TYPE_KEY: &str = "invalid trace type key name";
 
     // Parameters:
     //
@@ -296,15 +353,18 @@ mod tests {
             if $expected_result.is_ok() {
                 let expected_level = $expected_result.as_ref().unwrap();
                 let actual_level = $actual_result.unwrap();
-                assert!(*expected_level == actual_level, $msg);
+                assert!(*expected_level == actual_level, "{}", $msg);
             } else {
                 let expected_error = $expected_result.as_ref().unwrap_err();
-                let actual_error = $actual_result.unwrap_err();
-
                 let expected_error_msg = format!("{:?}", expected_error);
-                let actual_error_msg = format!("{:?}", actual_error);
 
-                assert!(expected_error_msg == actual_error_msg, $msg);
+                if let Err(actual_error) = $actual_result {
+                    let actual_error_msg = format!("{:?}", actual_error);
+
+                    assert!(expected_error_msg == actual_error_msg, "{}", $msg);
+                } else {
+                    assert!(expected_error_msg == "expected error, got OK", "{}", $msg);
+                }
             }
         };
     }
@@ -333,481 +393,324 @@ mod tests {
             container_pipe_size: i32,
             server_addr: &'a str,
             unified_cgroup_hierarchy: bool,
+            tracing: tracer::TraceType,
+        }
+
+        impl Default for TestData<'_> {
+            fn default() -> Self {
+                TestData {
+                    contents: "",
+                    env_vars: Vec::new(),
+                    debug_console: false,
+                    dev_mode: false,
+                    log_level: DEFAULT_LOG_LEVEL,
+                    hotplug_timeout: DEFAULT_HOTPLUG_TIMEOUT,
+                    container_pipe_size: DEFAULT_CONTAINER_PIPE_SIZE,
+                    server_addr: TEST_SERVER_ADDR,
+                    unified_cgroup_hierarchy: false,
+                    tracing: tracer::TraceType::Disabled,
+                }
+            }
         }
 
         let tests = &[
             TestData {
                 contents: "agent.debug_consolex agent.devmode",
-                env_vars: Vec::new(),
-                debug_console: false,
                 dev_mode: true,
-                log_level: DEFAULT_LOG_LEVEL,
-                hotplug_timeout: DEFAULT_HOTPLUG_TIMEOUT,
-                container_pipe_size: DEFAULT_CONTAINER_PIPE_SIZE,
-                server_addr: TEST_SERVER_ADDR,
-                unified_cgroup_hierarchy: false,
+                ..Default::default()
             },
             TestData {
                 contents: "agent.debug_console agent.devmodex",
-                env_vars: Vec::new(),
                 debug_console: true,
-                dev_mode: false,
-                log_level: DEFAULT_LOG_LEVEL,
-                hotplug_timeout: DEFAULT_HOTPLUG_TIMEOUT,
-                container_pipe_size: DEFAULT_CONTAINER_PIPE_SIZE,
-                server_addr: TEST_SERVER_ADDR,
-                unified_cgroup_hierarchy: false,
+                ..Default::default()
             },
             TestData {
                 contents: "agent.logx=debug",
-                env_vars: Vec::new(),
-                debug_console: false,
-                dev_mode: false,
-                log_level: DEFAULT_LOG_LEVEL,
-                hotplug_timeout: DEFAULT_HOTPLUG_TIMEOUT,
-                container_pipe_size: DEFAULT_CONTAINER_PIPE_SIZE,
-                server_addr: TEST_SERVER_ADDR,
-                unified_cgroup_hierarchy: false,
+                ..Default::default()
             },
             TestData {
                 contents: "agent.log=debug",
-                env_vars: Vec::new(),
-                debug_console: false,
-                dev_mode: false,
                 log_level: slog::Level::Debug,
-                hotplug_timeout: DEFAULT_HOTPLUG_TIMEOUT,
-                container_pipe_size: DEFAULT_CONTAINER_PIPE_SIZE,
-                server_addr: TEST_SERVER_ADDR,
-                unified_cgroup_hierarchy: false,
+                ..Default::default()
             },
             TestData {
                 contents: "agent.log=debug",
                 env_vars: vec!["KATA_AGENT_LOG_LEVEL=trace"],
-                debug_console: false,
-                dev_mode: false,
                 log_level: slog::Level::Trace,
-                hotplug_timeout: DEFAULT_HOTPLUG_TIMEOUT,
-                container_pipe_size: DEFAULT_CONTAINER_PIPE_SIZE,
-                server_addr: TEST_SERVER_ADDR,
-                unified_cgroup_hierarchy: false,
+                ..Default::default()
             },
             TestData {
                 contents: "",
-                env_vars: Vec::new(),
-                debug_console: false,
-                dev_mode: false,
-                log_level: DEFAULT_LOG_LEVEL,
-                hotplug_timeout: DEFAULT_HOTPLUG_TIMEOUT,
-                container_pipe_size: DEFAULT_CONTAINER_PIPE_SIZE,
-                server_addr: TEST_SERVER_ADDR,
-                unified_cgroup_hierarchy: false,
+                ..Default::default()
             },
             TestData {
                 contents: "foo",
-                env_vars: Vec::new(),
-                debug_console: false,
-                dev_mode: false,
-                log_level: DEFAULT_LOG_LEVEL,
-                hotplug_timeout: DEFAULT_HOTPLUG_TIMEOUT,
-                container_pipe_size: DEFAULT_CONTAINER_PIPE_SIZE,
-                server_addr: TEST_SERVER_ADDR,
-                unified_cgroup_hierarchy: false,
+                ..Default::default()
             },
             TestData {
                 contents: "foo bar",
-                env_vars: Vec::new(),
-                debug_console: false,
-                dev_mode: false,
-                log_level: DEFAULT_LOG_LEVEL,
-                hotplug_timeout: DEFAULT_HOTPLUG_TIMEOUT,
-                container_pipe_size: DEFAULT_CONTAINER_PIPE_SIZE,
-                server_addr: TEST_SERVER_ADDR,
-                unified_cgroup_hierarchy: false,
+                ..Default::default()
             },
             TestData {
                 contents: "foo bar",
-                env_vars: Vec::new(),
-                debug_console: false,
-                dev_mode: false,
-                log_level: DEFAULT_LOG_LEVEL,
-                hotplug_timeout: DEFAULT_HOTPLUG_TIMEOUT,
-                container_pipe_size: DEFAULT_CONTAINER_PIPE_SIZE,
-                server_addr: TEST_SERVER_ADDR,
-                unified_cgroup_hierarchy: false,
+                ..Default::default()
             },
             TestData {
                 contents: "foo agent bar",
-                env_vars: Vec::new(),
-                debug_console: false,
-                dev_mode: false,
-                log_level: DEFAULT_LOG_LEVEL,
-                hotplug_timeout: DEFAULT_HOTPLUG_TIMEOUT,
-                container_pipe_size: DEFAULT_CONTAINER_PIPE_SIZE,
-                server_addr: TEST_SERVER_ADDR,
-                unified_cgroup_hierarchy: false,
+                ..Default::default()
             },
             TestData {
                 contents: "foo debug_console agent bar devmode",
-                env_vars: Vec::new(),
-                debug_console: false,
-                dev_mode: false,
-                log_level: DEFAULT_LOG_LEVEL,
-                hotplug_timeout: DEFAULT_HOTPLUG_TIMEOUT,
-                container_pipe_size: DEFAULT_CONTAINER_PIPE_SIZE,
-                server_addr: TEST_SERVER_ADDR,
-                unified_cgroup_hierarchy: false,
+                ..Default::default()
             },
             TestData {
                 contents: "agent.debug_console",
-                env_vars: Vec::new(),
                 debug_console: true,
-                dev_mode: false,
-                log_level: DEFAULT_LOG_LEVEL,
-                hotplug_timeout: DEFAULT_HOTPLUG_TIMEOUT,
-                container_pipe_size: DEFAULT_CONTAINER_PIPE_SIZE,
-                server_addr: TEST_SERVER_ADDR,
-                unified_cgroup_hierarchy: false,
+                ..Default::default()
             },
             TestData {
                 contents: "   agent.debug_console ",
-                env_vars: Vec::new(),
                 debug_console: true,
-                dev_mode: false,
-                log_level: DEFAULT_LOG_LEVEL,
-                hotplug_timeout: DEFAULT_HOTPLUG_TIMEOUT,
-                container_pipe_size: DEFAULT_CONTAINER_PIPE_SIZE,
-                server_addr: TEST_SERVER_ADDR,
-                unified_cgroup_hierarchy: false,
+                ..Default::default()
             },
             TestData {
                 contents: "agent.debug_console foo",
-                env_vars: Vec::new(),
                 debug_console: true,
-                dev_mode: false,
-                log_level: DEFAULT_LOG_LEVEL,
-                hotplug_timeout: DEFAULT_HOTPLUG_TIMEOUT,
-                container_pipe_size: DEFAULT_CONTAINER_PIPE_SIZE,
-                server_addr: TEST_SERVER_ADDR,
-                unified_cgroup_hierarchy: false,
+                ..Default::default()
             },
             TestData {
                 contents: " agent.debug_console foo",
-                env_vars: Vec::new(),
                 debug_console: true,
-                dev_mode: false,
-                log_level: DEFAULT_LOG_LEVEL,
-                hotplug_timeout: DEFAULT_HOTPLUG_TIMEOUT,
-                container_pipe_size: DEFAULT_CONTAINER_PIPE_SIZE,
-                server_addr: TEST_SERVER_ADDR,
-                unified_cgroup_hierarchy: false,
+                ..Default::default()
             },
             TestData {
                 contents: "foo agent.debug_console bar",
-                env_vars: Vec::new(),
                 debug_console: true,
-                dev_mode: false,
-                log_level: DEFAULT_LOG_LEVEL,
-                hotplug_timeout: DEFAULT_HOTPLUG_TIMEOUT,
-                container_pipe_size: DEFAULT_CONTAINER_PIPE_SIZE,
-                server_addr: TEST_SERVER_ADDR,
-                unified_cgroup_hierarchy: false,
+                ..Default::default()
             },
             TestData {
                 contents: "foo agent.debug_console",
-                env_vars: Vec::new(),
                 debug_console: true,
-                dev_mode: false,
-                log_level: DEFAULT_LOG_LEVEL,
-                hotplug_timeout: DEFAULT_HOTPLUG_TIMEOUT,
-                container_pipe_size: DEFAULT_CONTAINER_PIPE_SIZE,
-                server_addr: TEST_SERVER_ADDR,
-                unified_cgroup_hierarchy: false,
+                ..Default::default()
             },
             TestData {
                 contents: "foo agent.debug_console ",
-                env_vars: Vec::new(),
                 debug_console: true,
-                dev_mode: false,
-                log_level: DEFAULT_LOG_LEVEL,
-                hotplug_timeout: DEFAULT_HOTPLUG_TIMEOUT,
-                container_pipe_size: DEFAULT_CONTAINER_PIPE_SIZE,
-                server_addr: TEST_SERVER_ADDR,
-                unified_cgroup_hierarchy: false,
+                ..Default::default()
             },
             TestData {
                 contents: "agent.devmode",
-                env_vars: Vec::new(),
-                debug_console: false,
                 dev_mode: true,
-                log_level: DEFAULT_LOG_LEVEL,
-                hotplug_timeout: DEFAULT_HOTPLUG_TIMEOUT,
-                container_pipe_size: DEFAULT_CONTAINER_PIPE_SIZE,
-                server_addr: TEST_SERVER_ADDR,
-                unified_cgroup_hierarchy: false,
+                ..Default::default()
             },
             TestData {
                 contents: "   agent.devmode ",
-                env_vars: Vec::new(),
-                debug_console: false,
                 dev_mode: true,
-                log_level: DEFAULT_LOG_LEVEL,
-                hotplug_timeout: DEFAULT_HOTPLUG_TIMEOUT,
-                container_pipe_size: DEFAULT_CONTAINER_PIPE_SIZE,
-                server_addr: TEST_SERVER_ADDR,
-                unified_cgroup_hierarchy: false,
+                ..Default::default()
             },
             TestData {
                 contents: "agent.devmode foo",
-                env_vars: Vec::new(),
-                debug_console: false,
                 dev_mode: true,
-                log_level: DEFAULT_LOG_LEVEL,
-                hotplug_timeout: DEFAULT_HOTPLUG_TIMEOUT,
-                container_pipe_size: DEFAULT_CONTAINER_PIPE_SIZE,
-                server_addr: TEST_SERVER_ADDR,
-                unified_cgroup_hierarchy: false,
+                ..Default::default()
             },
             TestData {
                 contents: " agent.devmode foo",
-                env_vars: Vec::new(),
-                debug_console: false,
                 dev_mode: true,
-                log_level: DEFAULT_LOG_LEVEL,
-                hotplug_timeout: DEFAULT_HOTPLUG_TIMEOUT,
-                container_pipe_size: DEFAULT_CONTAINER_PIPE_SIZE,
-                server_addr: TEST_SERVER_ADDR,
-                unified_cgroup_hierarchy: false,
+                ..Default::default()
             },
             TestData {
                 contents: "foo agent.devmode bar",
-                env_vars: Vec::new(),
-                debug_console: false,
                 dev_mode: true,
-                log_level: DEFAULT_LOG_LEVEL,
-                hotplug_timeout: DEFAULT_HOTPLUG_TIMEOUT,
-                container_pipe_size: DEFAULT_CONTAINER_PIPE_SIZE,
-                server_addr: TEST_SERVER_ADDR,
-                unified_cgroup_hierarchy: false,
+                ..Default::default()
             },
             TestData {
                 contents: "foo agent.devmode",
-                env_vars: Vec::new(),
-                debug_console: false,
                 dev_mode: true,
-                log_level: DEFAULT_LOG_LEVEL,
-                hotplug_timeout: DEFAULT_HOTPLUG_TIMEOUT,
-                container_pipe_size: DEFAULT_CONTAINER_PIPE_SIZE,
-                server_addr: TEST_SERVER_ADDR,
-                unified_cgroup_hierarchy: false,
+                ..Default::default()
             },
             TestData {
                 contents: "foo agent.devmode ",
-                env_vars: Vec::new(),
-                debug_console: false,
                 dev_mode: true,
-                log_level: DEFAULT_LOG_LEVEL,
-                hotplug_timeout: DEFAULT_HOTPLUG_TIMEOUT,
-                container_pipe_size: DEFAULT_CONTAINER_PIPE_SIZE,
-                server_addr: TEST_SERVER_ADDR,
-                unified_cgroup_hierarchy: false,
+                ..Default::default()
             },
             TestData {
                 contents: "agent.devmode agent.debug_console",
-                env_vars: Vec::new(),
                 debug_console: true,
                 dev_mode: true,
-                log_level: DEFAULT_LOG_LEVEL,
-                hotplug_timeout: DEFAULT_HOTPLUG_TIMEOUT,
-                container_pipe_size: DEFAULT_CONTAINER_PIPE_SIZE,
-                server_addr: TEST_SERVER_ADDR,
-                unified_cgroup_hierarchy: false,
+                ..Default::default()
             },
             TestData {
                 contents: "agent.devmode agent.debug_console agent.hotplug_timeout=100 agent.unified_cgroup_hierarchy=a",
-                env_vars: Vec::new(),
                 debug_console: true,
                 dev_mode: true,
-                log_level: DEFAULT_LOG_LEVEL,
                 hotplug_timeout: time::Duration::from_secs(100),
-                container_pipe_size: DEFAULT_CONTAINER_PIPE_SIZE,
-                server_addr: TEST_SERVER_ADDR,
-                unified_cgroup_hierarchy: false,
+                ..Default::default()
             },
             TestData {
                 contents: "agent.devmode agent.debug_console agent.hotplug_timeout=0 agent.unified_cgroup_hierarchy=11",
-                env_vars: Vec::new(),
                 debug_console: true,
                 dev_mode: true,
-                log_level: DEFAULT_LOG_LEVEL,
-                hotplug_timeout: DEFAULT_HOTPLUG_TIMEOUT,
-                container_pipe_size: DEFAULT_CONTAINER_PIPE_SIZE,
-                server_addr: TEST_SERVER_ADDR,
                 unified_cgroup_hierarchy: true,
+                ..Default::default()
             },
             TestData {
                 contents: "agent.devmode agent.debug_console agent.container_pipe_size=2097152 agent.unified_cgroup_hierarchy=false",
-                env_vars: Vec::new(),
                 debug_console: true,
                 dev_mode: true,
-                log_level: DEFAULT_LOG_LEVEL,
-                hotplug_timeout: DEFAULT_HOTPLUG_TIMEOUT,
                 container_pipe_size: 2097152,
-                server_addr: TEST_SERVER_ADDR,
-                unified_cgroup_hierarchy: false,
+                ..Default::default()
             },
             TestData {
                 contents: "agent.devmode agent.debug_console agent.container_pipe_size=100 agent.unified_cgroup_hierarchy=true",
-                env_vars: Vec::new(),
                 debug_console: true,
                 dev_mode: true,
-                log_level: DEFAULT_LOG_LEVEL,
-                hotplug_timeout: DEFAULT_HOTPLUG_TIMEOUT,
                 container_pipe_size: 100,
-                server_addr: TEST_SERVER_ADDR,
                 unified_cgroup_hierarchy: true,
+                ..Default::default()
             },
             TestData {
                 contents: "agent.devmode agent.debug_console agent.container_pipe_size=0 agent.unified_cgroup_hierarchy=0",
-                env_vars: Vec::new(),
                 debug_console: true,
                 dev_mode: true,
-                log_level: DEFAULT_LOG_LEVEL,
-                hotplug_timeout: DEFAULT_HOTPLUG_TIMEOUT,
-                container_pipe_size: DEFAULT_CONTAINER_PIPE_SIZE,
-                server_addr: TEST_SERVER_ADDR,
-                unified_cgroup_hierarchy: false,
+                ..Default::default()
             },
             TestData {
                 contents: "agent.devmode agent.debug_console agent.container_pip_siz=100 agent.unified_cgroup_hierarchy=1",
-                env_vars: Vec::new(),
                 debug_console: true,
                 dev_mode: true,
-                log_level: DEFAULT_LOG_LEVEL,
-                hotplug_timeout: DEFAULT_HOTPLUG_TIMEOUT,
-                container_pipe_size: DEFAULT_CONTAINER_PIPE_SIZE,
-                server_addr: TEST_SERVER_ADDR,
                 unified_cgroup_hierarchy: true,
-            },
-            TestData {
-                contents: "",
-                env_vars: Vec::new(),
-                debug_console: false,
-                dev_mode: false,
-                log_level: DEFAULT_LOG_LEVEL,
-                hotplug_timeout: DEFAULT_HOTPLUG_TIMEOUT,
-                container_pipe_size: DEFAULT_CONTAINER_PIPE_SIZE,
-                server_addr: TEST_SERVER_ADDR,
-                unified_cgroup_hierarchy: false,
+                ..Default::default()
             },
             TestData {
                 contents: "",
                 env_vars: vec!["KATA_AGENT_SERVER_ADDR=foo"],
-                debug_console: false,
-                dev_mode: false,
-                log_level: DEFAULT_LOG_LEVEL,
-                hotplug_timeout: DEFAULT_HOTPLUG_TIMEOUT,
-                container_pipe_size: DEFAULT_CONTAINER_PIPE_SIZE,
                 server_addr: "foo",
-                unified_cgroup_hierarchy: false,
+                ..Default::default()
             },
             TestData {
                 contents: "",
                 env_vars: vec!["KATA_AGENT_SERVER_ADDR=="],
-                debug_console: false,
-                dev_mode: false,
-                log_level: DEFAULT_LOG_LEVEL,
-                hotplug_timeout: DEFAULT_HOTPLUG_TIMEOUT,
-                container_pipe_size: DEFAULT_CONTAINER_PIPE_SIZE,
                 server_addr: "=",
-                unified_cgroup_hierarchy: false,
+                ..Default::default()
             },
             TestData {
                 contents: "",
                 env_vars: vec!["KATA_AGENT_SERVER_ADDR==foo"],
-                debug_console: false,
-                dev_mode: false,
-                log_level: DEFAULT_LOG_LEVEL,
-                hotplug_timeout: DEFAULT_HOTPLUG_TIMEOUT,
-                container_pipe_size: DEFAULT_CONTAINER_PIPE_SIZE,
                 server_addr: "=foo",
-                unified_cgroup_hierarchy: false,
+                ..Default::default()
             },
             TestData {
                 contents: "",
                 env_vars: vec!["KATA_AGENT_SERVER_ADDR=foo=bar=baz="],
-                debug_console: false,
-                dev_mode: false,
-                log_level: DEFAULT_LOG_LEVEL,
-                hotplug_timeout: DEFAULT_HOTPLUG_TIMEOUT,
-                container_pipe_size: DEFAULT_CONTAINER_PIPE_SIZE,
                 server_addr: "foo=bar=baz=",
-                unified_cgroup_hierarchy: false,
+                ..Default::default()
             },
             TestData {
                 contents: "",
                 env_vars: vec!["KATA_AGENT_SERVER_ADDR=unix:///tmp/foo.socket"],
-                debug_console: false,
-                dev_mode: false,
-                log_level: DEFAULT_LOG_LEVEL,
-                hotplug_timeout: DEFAULT_HOTPLUG_TIMEOUT,
-                container_pipe_size: DEFAULT_CONTAINER_PIPE_SIZE,
                 server_addr: "unix:///tmp/foo.socket",
-                unified_cgroup_hierarchy: false,
+                ..Default::default()
             },
             TestData {
                 contents: "",
                 env_vars: vec!["KATA_AGENT_SERVER_ADDR=unix://@/tmp/foo.socket"],
-                debug_console: false,
-                dev_mode: false,
-                log_level: DEFAULT_LOG_LEVEL,
-                hotplug_timeout: DEFAULT_HOTPLUG_TIMEOUT,
-                container_pipe_size: DEFAULT_CONTAINER_PIPE_SIZE,
                 server_addr: "unix://@/tmp/foo.socket",
-                unified_cgroup_hierarchy: false,
+                ..Default::default()
             },
             TestData {
                 contents: "",
                 env_vars: vec!["KATA_AGENT_LOG_LEVEL="],
-                debug_console: false,
-                dev_mode: false,
                 log_level: DEFAULT_LOG_LEVEL,
-                hotplug_timeout: DEFAULT_HOTPLUG_TIMEOUT,
-                container_pipe_size: DEFAULT_CONTAINER_PIPE_SIZE,
-                server_addr: TEST_SERVER_ADDR,
-                unified_cgroup_hierarchy: false,
+                ..Default::default()
             },
             TestData {
                 contents: "",
                 env_vars: vec!["KATA_AGENT_LOG_LEVEL=invalid"],
-                debug_console: false,
-                dev_mode: false,
-                log_level: DEFAULT_LOG_LEVEL,
-                hotplug_timeout: DEFAULT_HOTPLUG_TIMEOUT,
-                container_pipe_size: DEFAULT_CONTAINER_PIPE_SIZE,
-                server_addr: TEST_SERVER_ADDR,
-                unified_cgroup_hierarchy: false,
+                ..Default::default()
             },
             TestData {
                 contents: "",
                 env_vars: vec!["KATA_AGENT_LOG_LEVEL=debug"],
-                debug_console: false,
-                dev_mode: false,
                 log_level: slog::Level::Debug,
-                hotplug_timeout: DEFAULT_HOTPLUG_TIMEOUT,
-                container_pipe_size: DEFAULT_CONTAINER_PIPE_SIZE,
-                server_addr: TEST_SERVER_ADDR,
-                unified_cgroup_hierarchy: false,
+                ..Default::default()
             },
             TestData {
                 contents: "",
                 env_vars: vec!["KATA_AGENT_LOG_LEVEL=debugger"],
-                debug_console: false,
-                dev_mode: false,
                 log_level: DEFAULT_LOG_LEVEL,
-                hotplug_timeout: DEFAULT_HOTPLUG_TIMEOUT,
-                container_pipe_size: DEFAULT_CONTAINER_PIPE_SIZE,
+                ..Default::default()
+            },
+            TestData {
+                contents: "server_addr=unix:///tmp/foo.socket",
                 server_addr: TEST_SERVER_ADDR,
-                unified_cgroup_hierarchy: false,
+                ..Default::default()
+            },
+            TestData {
+                contents: "agent.server_address=unix:///tmp/foo.socket",
+                server_addr: TEST_SERVER_ADDR,
+                ..Default::default()
+            },
+            TestData {
+                contents: "agent.server_addr=unix:///tmp/foo.socket",
+                server_addr: "unix:///tmp/foo.socket",
+                ..Default::default()
+            },
+            TestData {
+                contents: " agent.server_addr=unix:///tmp/foo.socket",
+                server_addr: "unix:///tmp/foo.socket",
+                ..Default::default()
+            },
+            TestData {
+                contents: " agent.server_addr=unix:///tmp/foo.socket a",
+                server_addr: "unix:///tmp/foo.socket",
+                ..Default::default()
+            },
+            TestData {
+                contents: "trace",
+                tracing: tracer::TraceType::Disabled,
+                ..Default::default()
+            },
+            TestData {
+                contents: ".trace",
+                tracing: tracer::TraceType::Disabled,
+                ..Default::default()
+            },
+            TestData {
+                contents: "agent.tracer",
+                tracing: tracer::TraceType::Disabled,
+                ..Default::default()
+            },
+            TestData {
+                contents: "agent.trac",
+                tracing: tracer::TraceType::Disabled,
+                ..Default::default()
+            },
+            TestData {
+                contents: "agent.trace",
+                tracing: tracer::TraceType::Isolated,
+                ..Default::default()
+            },
+            TestData {
+                contents: "agent.trace=isolated",
+                tracing: tracer::TraceType::Isolated,
+                ..Default::default()
+            },
+            TestData {
+                contents: "agent.trace=disabled",
+                tracing: tracer::TraceType::Disabled,
+                ..Default::default()
+            },
+            TestData {
+                contents: "",
+                env_vars: vec!["KATA_AGENT_TRACE_TYPE=isolated"],
+                tracing: tracer::TraceType::Isolated,
+                ..Default::default()
+            },
+            TestData {
+                contents: "",
+                env_vars: vec!["KATA_AGENT_TRACE_TYPE=disabled"],
+                tracing: tracer::TraceType::Disabled,
+                ..Default::default()
             },
         ];
 
@@ -862,6 +765,7 @@ mod tests {
             );
             assert_eq!(config.container_pipe_size, 0, "{}", msg);
             assert_eq!(config.server_addr, TEST_SERVER_ADDR, "{}", msg);
+            assert_eq!(config.tracing, tracer::TraceType::Disabled, "{}", msg);
 
             let result = config.parse_cmdline(filename);
             assert!(result.is_ok(), "{}", msg);
@@ -877,6 +781,7 @@ mod tests {
             assert_eq!(d.hotplug_timeout, config.hotplug_timeout, "{}", msg);
             assert_eq!(d.container_pipe_size, config.container_pipe_size, "{}", msg);
             assert_eq!(d.server_addr, config.server_addr, "{}", msg);
+            assert_eq!(d.tracing, config.tracing, "{}", msg);
 
             for v in vars_to_unset {
                 env::remove_var(v);
@@ -895,19 +800,19 @@ mod tests {
         let tests = &[
             TestData {
                 logrus_level: "",
-                result: Err(make_err(ERR_INVALID_LOG_LEVEL)),
+                result: Err(anyhow!(ERR_INVALID_LOG_LEVEL)),
             },
             TestData {
                 logrus_level: "foo",
-                result: Err(make_err(ERR_INVALID_LOG_LEVEL)),
+                result: Err(anyhow!(ERR_INVALID_LOG_LEVEL)),
             },
             TestData {
                 logrus_level: "debugging",
-                result: Err(make_err(ERR_INVALID_LOG_LEVEL)),
+                result: Err(anyhow!(ERR_INVALID_LOG_LEVEL)),
             },
             TestData {
                 logrus_level: "xdebug",
-                result: Err(make_err(ERR_INVALID_LOG_LEVEL)),
+                result: Err(anyhow!(ERR_INVALID_LOG_LEVEL)),
             },
             TestData {
                 logrus_level: "trace",
@@ -969,39 +874,39 @@ mod tests {
         let tests = &[
             TestData {
                 param: "",
-                result: Err(make_err(ERR_INVALID_LOG_LEVEL_PARAM)),
+                result: Err(anyhow!(ERR_INVALID_LOG_LEVEL_PARAM)),
             },
             TestData {
                 param: "=",
-                result: Err(make_err(ERR_INVALID_LOG_LEVEL_KEY)),
+                result: Err(anyhow!(ERR_INVALID_LOG_LEVEL_KEY)),
             },
             TestData {
                 param: "x=",
-                result: Err(make_err(ERR_INVALID_LOG_LEVEL_KEY)),
+                result: Err(anyhow!(ERR_INVALID_LOG_LEVEL_KEY)),
             },
             TestData {
                 param: "=y",
-                result: Err(make_err(ERR_INVALID_LOG_LEVEL_KEY)),
+                result: Err(anyhow!(ERR_INVALID_LOG_LEVEL_KEY)),
             },
             TestData {
                 param: "==",
-                result: Err(make_err(ERR_INVALID_LOG_LEVEL_PARAM)),
+                result: Err(anyhow!(ERR_INVALID_LOG_LEVEL_PARAM)),
             },
             TestData {
                 param: "= =",
-                result: Err(make_err(ERR_INVALID_LOG_LEVEL_PARAM)),
+                result: Err(anyhow!(ERR_INVALID_LOG_LEVEL_PARAM)),
             },
             TestData {
                 param: "x=y",
-                result: Err(make_err(ERR_INVALID_LOG_LEVEL_KEY)),
+                result: Err(anyhow!(ERR_INVALID_LOG_LEVEL_KEY)),
             },
             TestData {
                 param: "agent=debug",
-                result: Err(make_err(ERR_INVALID_LOG_LEVEL_KEY)),
+                result: Err(anyhow!(ERR_INVALID_LOG_LEVEL_KEY)),
             },
             TestData {
                 param: "agent.logg=debug",
-                result: Err(make_err(ERR_INVALID_LOG_LEVEL_KEY)),
+                result: Err(anyhow!(ERR_INVALID_LOG_LEVEL_KEY)),
             },
             TestData {
                 param: "agent.log=trace",
@@ -1063,19 +968,19 @@ mod tests {
         let tests = &[
             TestData {
                 param: "",
-                result: Err(make_err(ERR_INVALID_HOTPLUG_TIMEOUT)),
+                result: Err(anyhow!(ERR_INVALID_HOTPLUG_TIMEOUT)),
             },
             TestData {
                 param: "agent.hotplug_timeout",
-                result: Err(make_err(ERR_INVALID_HOTPLUG_TIMEOUT)),
+                result: Err(anyhow!(ERR_INVALID_HOTPLUG_TIMEOUT)),
             },
             TestData {
                 param: "foo=bar",
-                result: Err(make_err(ERR_INVALID_HOTPLUG_TIMEOUT_KEY)),
+                result: Err(anyhow!(ERR_INVALID_HOTPLUG_TIMEOUT_KEY)),
             },
             TestData {
                 param: "agent.hotplug_timeot=1",
-                result: Err(make_err(ERR_INVALID_HOTPLUG_TIMEOUT_KEY)),
+                result: Err(anyhow!(ERR_INVALID_HOTPLUG_TIMEOUT_KEY)),
             },
             TestData {
                 param: "agent.hotplug_timeout=1",
@@ -1095,19 +1000,39 @@ mod tests {
             },
             TestData {
                 param: "agent.hotplug_timeout=-1",
-                result: Err(make_err(ERR_INVALID_HOTPLUG_TIMEOUT_PARAM)),
+                result: Err(anyhow!(
+                    "unable to parse hotplug timeout
+
+Caused by:
+    invalid digit found in string"
+                )),
             },
             TestData {
                 param: "agent.hotplug_timeout=4jbsdja",
-                result: Err(make_err(ERR_INVALID_HOTPLUG_TIMEOUT_PARAM)),
+                result: Err(anyhow!(
+                    "unable to parse hotplug timeout
+
+Caused by:
+    invalid digit found in string"
+                )),
             },
             TestData {
                 param: "agent.hotplug_timeout=foo",
-                result: Err(make_err(ERR_INVALID_HOTPLUG_TIMEOUT_PARAM)),
+                result: Err(anyhow!(
+                    "unable to parse hotplug timeout
+
+Caused by:
+    invalid digit found in string"
+                )),
             },
             TestData {
                 param: "agent.hotplug_timeout=j",
-                result: Err(make_err(ERR_INVALID_HOTPLUG_TIMEOUT_PARAM)),
+                result: Err(anyhow!(
+                    "unable to parse hotplug timeout
+
+Caused by:
+    invalid digit found in string"
+                )),
             },
         ];
 
@@ -1133,19 +1058,19 @@ mod tests {
         let tests = &[
             TestData {
                 param: "",
-                result: Err(make_err(ERR_INVALID_CONTAINER_PIPE_SIZE)),
+                result: Err(anyhow!(ERR_INVALID_CONTAINER_PIPE_SIZE)),
             },
             TestData {
                 param: "agent.container_pipe_size",
-                result: Err(make_err(ERR_INVALID_CONTAINER_PIPE_SIZE)),
+                result: Err(anyhow!(ERR_INVALID_CONTAINER_PIPE_SIZE)),
             },
             TestData {
                 param: "foo=bar",
-                result: Err(make_err(ERR_INVALID_CONTAINER_PIPE_SIZE_KEY)),
+                result: Err(anyhow!(ERR_INVALID_CONTAINER_PIPE_SIZE_KEY)),
             },
             TestData {
                 param: "agent.container_pip_siz=1",
-                result: Err(make_err(ERR_INVALID_CONTAINER_PIPE_SIZE_KEY)),
+                result: Err(anyhow!(ERR_INVALID_CONTAINER_PIPE_SIZE_KEY)),
             },
             TestData {
                 param: "agent.container_pipe_size=1",
@@ -1165,23 +1090,43 @@ mod tests {
             },
             TestData {
                 param: "agent.container_pipe_size=-1",
-                result: Err(make_err(ERR_INVALID_CONTAINER_PIPE_NEGATIVE)),
+                result: Err(anyhow!(ERR_INVALID_CONTAINER_PIPE_NEGATIVE)),
             },
             TestData {
                 param: "agent.container_pipe_size=foobar",
-                result: Err(make_err(ERR_INVALID_CONTAINER_PIPE_SIZE_PARAM)),
+                result: Err(anyhow!(
+                    "unable to parse container pipe size
+
+Caused by:
+    invalid digit found in string"
+                )),
             },
             TestData {
                 param: "agent.container_pipe_size=j",
-                result: Err(make_err(ERR_INVALID_CONTAINER_PIPE_SIZE_PARAM)),
+                result: Err(anyhow!(
+                    "unable to parse container pipe size
+
+Caused by:
+    invalid digit found in string",
+                )),
             },
             TestData {
                 param: "agent.container_pipe_size=4jbsdja",
-                result: Err(make_err(ERR_INVALID_CONTAINER_PIPE_SIZE_PARAM)),
+                result: Err(anyhow!(
+                    "unable to parse container pipe size
+
+Caused by:
+    invalid digit found in string"
+                )),
             },
             TestData {
                 param: "agent.container_pipe_size=4294967296",
-                result: Err(make_err(ERR_INVALID_CONTAINER_PIPE_SIZE_PARAM)),
+                result: Err(anyhow!(
+                    "unable to parse container pipe size
+
+Caused by:
+    number too large to fit in target type"
+                )),
             },
         ];
 
@@ -1189,6 +1134,142 @@ mod tests {
             let msg = format!("test[{}]: {:?}", i, d);
 
             let result = get_container_pipe_size(d.param);
+
+            let msg = format!("{}: result: {:?}", msg, result);
+
+            assert_result!(d.result, result, msg);
+        }
+    }
+
+    #[test]
+    fn test_get_string_value() {
+        #[derive(Debug)]
+        struct TestData<'a> {
+            param: &'a str,
+            result: Result<String>,
+        }
+
+        let tests = &[
+            TestData {
+                param: "",
+                result: Err(anyhow!(ERR_INVALID_GET_VALUE_PARAM)),
+            },
+            TestData {
+                param: "=",
+                result: Err(anyhow!(ERR_INVALID_GET_VALUE_NO_NAME)),
+            },
+            TestData {
+                param: "==",
+                result: Err(anyhow!(ERR_INVALID_GET_VALUE_NO_NAME)),
+            },
+            TestData {
+                param: "x=",
+                result: Err(anyhow!(ERR_INVALID_GET_VALUE_NO_VALUE)),
+            },
+            TestData {
+                param: "x==",
+                result: Ok("=".into()),
+            },
+            TestData {
+                param: "x===",
+                result: Ok("==".into()),
+            },
+            TestData {
+                param: "x==x",
+                result: Ok("=x".into()),
+            },
+            TestData {
+                param: "x=x",
+                result: Ok("x".into()),
+            },
+            TestData {
+                param: "x=x=",
+                result: Ok("x=".into()),
+            },
+            TestData {
+                param: "x=x=x",
+                result: Ok("x=x".into()),
+            },
+            TestData {
+                param: "foo=bar",
+                result: Ok("bar".into()),
+            },
+            TestData {
+                param: "x= =",
+                result: Ok(" =".into()),
+            },
+            TestData {
+                param: "x= =",
+                result: Ok(" =".into()),
+            },
+            TestData {
+                param: "x= = ",
+                result: Ok(" = ".into()),
+            },
+        ];
+
+        for (i, d) in tests.iter().enumerate() {
+            let msg = format!("test[{}]: {:?}", i, d);
+
+            let result = get_string_value(d.param);
+
+            let msg = format!("{}: result: {:?}", msg, result);
+
+            assert_result!(d.result, result, msg);
+        }
+    }
+
+    #[test]
+    fn test_get_trace_type() {
+        #[derive(Debug)]
+        struct TestData<'a> {
+            param: &'a str,
+            result: Result<tracer::TraceType>,
+        }
+
+        let tests = &[
+            TestData {
+                param: "",
+                result: Err(anyhow!(ERR_INVALID_TRACE_TYPE_PARAM)),
+            },
+            TestData {
+                param: "agent.tracer",
+                result: Err(anyhow!(ERR_INVALID_TRACE_TYPE_KEY)),
+            },
+            TestData {
+                param: "agent.trac",
+                result: Err(anyhow!(ERR_INVALID_TRACE_TYPE_KEY)),
+            },
+            TestData {
+                param: "agent.trace=",
+                result: Err(anyhow!(ERR_INVALID_TRACE_TYPE)),
+            },
+            TestData {
+                param: "agent.trace==",
+                result: Err(anyhow!(ERR_INVALID_TRACE_TYPE)),
+            },
+            TestData {
+                param: "agent.trace=foo",
+                result: Err(anyhow!(ERR_INVALID_TRACE_TYPE)),
+            },
+            TestData {
+                param: "agent.trace",
+                result: Ok(tracer::TraceType::Isolated),
+            },
+            TestData {
+                param: "agent.trace=isolated",
+                result: Ok(tracer::TraceType::Isolated),
+            },
+            TestData {
+                param: "agent.trace=disabled",
+                result: Ok(tracer::TraceType::Disabled),
+            },
+        ];
+
+        for (i, d) in tests.iter().enumerate() {
+            let msg = format!("test[{}]: {:?}", i, d);
+
+            let result = get_trace_type(d.param);
 
             let msg = format!("{}: result: {:?}", msg, result);
 

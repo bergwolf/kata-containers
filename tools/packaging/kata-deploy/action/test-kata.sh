@@ -98,6 +98,7 @@ function test_kata() {
     [[ -z "$PKG_SHA" ]] && die "no PKG_SHA provided"
 
     YAMLPATH="./tools/packaging/kata-deploy/"
+    VERSION=$(cat ./VERSION)
 
     # This action could be called in two contexts:
     #  1. Packaging workflows: testing in packaging repository, where we assume yaml/packaging
@@ -114,14 +115,13 @@ function test_kata() {
     kubectl apply -f "$YAMLPATH/kata-rbac/base/kata-rbac.yaml"
 
     # apply runtime classes:
-    kubectl apply -f "$YAMLPATH/k8s-1.14/kata-clh-runtimeClass.yaml"
-    kubectl apply -f "$YAMLPATH/k8s-1.14/kata-qemu-runtimeClass.yaml"
+    kubectl apply -f "$YAMLPATH/runtimeclasses/kata-runtimeClasses.yaml"
 
     kubectl get runtimeclasses
 
     # update deployment daemonset to utilize the container under test:
-    sed -i "s#katadocker/kata-deploy#katadocker/kata-deploy-ci:${PKG_SHA}#g" $YAMLPATH/kata-deploy/base/kata-deploy.yaml
-    sed -i "s#katadocker/kata-deploy#katadocker/kata-deploy-ci:${PKG_SHA}#g" $YAMLPATH/kata-cleanup/base/kata-cleanup.yaml
+    sed -i "s#katadocker/kata-deploy:${VERSION}#katadocker/kata-deploy-ci:${PKG_SHA}#g" $YAMLPATH/kata-deploy/base/kata-deploy.yaml
+    sed -i "s#katadocker/kata-deploy:${VERSION}#katadocker/kata-deploy-ci:${PKG_SHA}#g" $YAMLPATH/kata-cleanup/base/kata-cleanup.yaml
 
     cat $YAMLPATH/kata-deploy/base/kata-deploy.yaml
 

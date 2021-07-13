@@ -25,6 +25,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/containerd/cgroups"
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/katautils"
 	vc "github.com/kata-containers/kata-containers/src/runtime/virtcontainers"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/oci"
@@ -63,7 +64,6 @@ const (
 	moduleParamDir        = "parameters"
 	successMessageCapable = "System is capable of running " + project
 	successMessageCreate  = "System can currently create " + project
-	successMessageVersion = "Version consistency of " + project + " is verified"
 	failMessage           = "System is not capable of running " + project
 	kernelPropertyCorrect = "Kernel property value correct"
 
@@ -390,15 +390,8 @@ EXAMPLES:
 		if verbose {
 			kataLog.Logger.SetLevel(logrus.InfoLevel)
 		}
-		ctx, err := cliContextToContext(context)
-		if err != nil {
-			return err
-		}
 
-		span, _ := katautils.Trace(ctx, "check")
-		defer span.End()
-
-		if context.Bool("no-network-checks") == false && os.Getenv(noNetworkEnvVar) == "" {
+		if !context.Bool("no-network-checks") && os.Getenv(noNetworkEnvVar) == "" {
 			cmd := RelCmdCheck
 
 			if context.Bool("only-list-releases") {
@@ -408,8 +401,7 @@ EXAMPLES:
 			if os.Geteuid() == 0 {
 				kataLog.Warn("Not running network checks as super user")
 			} else {
-
-				err = HandleReleaseVersions(cmd, version, context.Bool("include-all-releases"))
+				err := HandleReleaseVersions(cmd, version, context.Bool("include-all-releases"))
 				if err != nil {
 					return err
 				}
@@ -425,7 +417,12 @@ EXAMPLES:
 			return errors.New("check: cannot determine runtime config")
 		}
 
-		err = setCPUtype(runtimeConfig.HypervisorType)
+		// check if cgroup can work use the same logic for creating containers
+		if _, err := vc.V1Constraints(); err != nil && err == cgroups.ErrMountPointNotExist && !runtimeConfig.SandboxCgroupOnly {
+			return fmt.Errorf("Cgroup v2 requires the following configuration: `sandbox_cgroup_only=true`.")
+		}
+
+		err := setCPUtype(runtimeConfig.HypervisorType)
 		if err != nil {
 			return err
 		}
@@ -438,7 +435,6 @@ EXAMPLES:
 		}
 
 		err = hostIsVMContainerCapable(details)
-
 		if err != nil {
 			return err
 		}

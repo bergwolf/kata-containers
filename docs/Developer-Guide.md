@@ -1,54 +1,55 @@
-* [Warning](#warning)
-* [Assumptions](#assumptions)
-* [Initial setup](#initial-setup)
-* [Requirements to build individual components](#requirements-to-build-individual-components)
-* [Build and install the Kata Containers runtime](#build-and-install-the-kata-containers-runtime)
-* [Check hardware requirements](#check-hardware-requirements)
-    * [Configure to use initrd or rootfs image](#configure-to-use-initrd-or-rootfs-image)
-    * [Enable full debug](#enable-full-debug)
-        * [debug logs and shimv2](#debug-logs-and-shimv2)
-            * [Enabling full `containerd` debug](#enabling-full-containerd-debug)
-            * [Enabling just `containerd shim` debug](#enabling-just-containerd-shim-debug)
-            * [Enabling `CRI-O` and `shimv2` debug](#enabling-cri-o-and-shimv2-debug)
-        * [journald rate limiting](#journald-rate-limiting)
-            * [`systemd-journald` suppressing messages](#systemd-journald-suppressing-messages)
-            * [Disabling `systemd-journald` rate limiting](#disabling-systemd-journald-rate-limiting)
-* [Create and install rootfs and initrd image](#create-and-install-rootfs-and-initrd-image)
-    * [Build a custom Kata agent - OPTIONAL](#build-a-custom-kata-agent---optional)
-    * [Get the osbuilder](#get-the-osbuilder)
-    * [Create a rootfs image](#create-a-rootfs-image)
-        * [Create a local rootfs](#create-a-local-rootfs)
-        * [Add a custom agent to the image - OPTIONAL](#add-a-custom-agent-to-the-image---optional)
-        * [Build a rootfs image](#build-a-rootfs-image)
-        * [Install the rootfs image](#install-the-rootfs-image)
-    * [Create an initrd image - OPTIONAL](#create-an-initrd-image---optional)
-        * [Create a local rootfs for initrd image](#create-a-local-rootfs-for-initrd-image)
-        * [Build an initrd image](#build-an-initrd-image)
-        * [Install the initrd image](#install-the-initrd-image)
-* [Install guest kernel images](#install-guest-kernel-images)
-* [Install a hypervisor](#install-a-hypervisor)
-    * [Build a custom QEMU](#build-a-custom-qemu)
-        * [Build a custom QEMU for aarch64/arm64 - REQUIRED](#build-a-custom-qemu-for-aarch64arm64---required)
-* [Run Kata Containers with Containerd](#run-kata-containers-with-containerd)
-* [Run Kata Containers with Kubernetes](#run-kata-containers-with-kubernetes)
-* [Troubleshoot Kata Containers](#troubleshoot-kata-containers)
-* [Appendices](#appendices)
-    * [Checking Docker default runtime](#checking-docker-default-runtime)
-    * [Set up a debug console](#set-up-a-debug-console)
-      * [Simple debug console setup](#simple-debug-console-setup)
-          * [Enable agent debug console](#enable-agent-debug-console)
-          * [Connect to debug console](#connect-to-debug-console)
-      * [Traditional debug console setup](#traditional-debug-console-setup)
-          * [Create a custom image containing a shell](#create-a-custom-image-containing-a-shell)
-          * [Build the debug image](#build-the-debug-image)
-          * [Configure runtime for custom debug image](#configure-runtime-for-custom-debug-image)
-          * [Connect to the virtual machine using the debug console](#connect-to-the-virtual-machine-using-the-debug-console)
-              * [Enabling debug console for QEMU](#enabling-debug-console-for-qemu)
-              * [Enabling debug console for cloud-hypervisor / firecracker](#enabling-debug-console-for-cloud-hypervisor--firecracker)
-          * [Create a container](#create-a-container)
-          * [Connect to the virtual machine using the debug console](#connect-to-the-virtual-machine-using-the-debug-console)
-    * [Obtain details of the image](#obtain-details-of-the-image)
-    * [Capturing kernel boot logs](#capturing-kernel-boot-logs)
+- [Warning](#warning)
+- [Assumptions](#assumptions)
+- [Initial setup](#initial-setup)
+- [Requirements to build individual components](#requirements-to-build-individual-components)
+- [Build and install the Kata Containers runtime](#build-and-install-the-kata-containers-runtime)
+- [Check hardware requirements](#check-hardware-requirements)
+  - [Configure to use initrd or rootfs image](#configure-to-use-initrd-or-rootfs-image)
+  - [Enable full debug](#enable-full-debug)
+    - [debug logs and shimv2](#debug-logs-and-shimv2)
+      - [Enabling full `containerd` debug](#enabling-full-containerd-debug)
+      - [Enabling just `containerd shim` debug](#enabling-just-containerd-shim-debug)
+      - [Enabling `CRI-O` and `shimv2` debug](#enabling-cri-o-and-shimv2-debug)
+    - [journald rate limiting](#journald-rate-limiting)
+      - [`systemd-journald` suppressing messages](#systemd-journald-suppressing-messages)
+      - [Disabling `systemd-journald` rate limiting](#disabling-systemd-journald-rate-limiting)
+- [Create and install rootfs and initrd image](#create-and-install-rootfs-and-initrd-image)
+  - [Build a custom Kata agent - OPTIONAL](#build-a-custom-kata-agent---optional)
+  - [Get the osbuilder](#get-the-osbuilder)
+  - [Create a rootfs image](#create-a-rootfs-image)
+    - [Create a local rootfs](#create-a-local-rootfs)
+    - [Add a custom agent to the image - OPTIONAL](#add-a-custom-agent-to-the-image---optional)
+    - [Build a rootfs image](#build-a-rootfs-image)
+    - [Install the rootfs image](#install-the-rootfs-image)
+  - [Create an initrd image - OPTIONAL](#create-an-initrd-image---optional)
+    - [Create a local rootfs for initrd image](#create-a-local-rootfs-for-initrd-image)
+    - [Build an initrd image](#build-an-initrd-image)
+    - [Install the initrd image](#install-the-initrd-image)
+- [Install guest kernel images](#install-guest-kernel-images)
+- [Install a hypervisor](#install-a-hypervisor)
+  - [Build a custom QEMU](#build-a-custom-qemu)
+    - [Build a custom QEMU for aarch64/arm64 - REQUIRED](#build-a-custom-qemu-for-aarch64arm64---required)
+- [Run Kata Containers with Containerd](#run-kata-containers-with-containerd)
+- [Run Kata Containers with Kubernetes](#run-kata-containers-with-kubernetes)
+- [Troubleshoot Kata Containers](#troubleshoot-kata-containers)
+- [Appendices](#appendices)
+  - [Checking Docker default runtime](#checking-docker-default-runtime)
+  - [Set up a debug console](#set-up-a-debug-console)
+    - [Simple debug console setup](#simple-debug-console-setup)
+      - [Enable agent debug console](#enable-agent-debug-console)
+      - [Start `kata-monitor` - ONLY NEEDED FOR 2.0.x](#start-kata-monitor---only-needed-for-20x)
+      - [Connect to debug console](#connect-to-debug-console)
+    - [Traditional debug console setup](#traditional-debug-console-setup)
+      - [Create a custom image containing a shell](#create-a-custom-image-containing-a-shell)
+      - [Build the debug image](#build-the-debug-image)
+      - [Configure runtime for custom debug image](#configure-runtime-for-custom-debug-image)
+      - [Create a container](#create-a-container)
+      - [Connect to the virtual machine using the debug console](#connect-to-the-virtual-machine-using-the-debug-console)
+        - [Enabling debug console for QEMU](#enabling-debug-console-for-qemu)
+        - [Enabling debug console for cloud-hypervisor / firecracker](#enabling-debug-console-for-cloud-hypervisor--firecracker)
+        - [Connecting to the debug console](#connecting-to-the-debug-console)
+  - [Obtain details of the image](#obtain-details-of-the-image)
+  - [Capturing kernel boot logs](#capturing-kernel-boot-logs)
 
 # Warning
 
@@ -304,7 +305,7 @@ You MUST choose one of `alpine`, `centos`, `clearlinux`, `debian`, `euleros`, `f
 > - You should only do this step if you are testing with the latest version of the agent.
 
 ```
-$ sudo install -o root -g root -m 0550 -t ${ROOTFS_DIR}/bin ../../../src/agent/target/x86_64-unknown-linux-musl/release/kata-agent
+$ sudo install -o root -g root -m 0550 -t ${ROOTFS_DIR}/usr/bin ../../../src/agent/target/x86_64-unknown-linux-musl/release/kata-agent
 $ sudo install -o root -g root -m 0440 ../../../src/agent/kata-agent.service ${ROOTFS_DIR}/usr/lib/systemd/system/
 $ sudo install -o root -g root -m 0440 ../../../src/agent/kata-containers.target ${ROOTFS_DIR}/usr/lib/systemd/system/
 ```
@@ -353,12 +354,13 @@ You MUST choose one of `alpine`, `centos`, `clearlinux`, `euleros`, and `fedora`
 >
 > - Check the [compatibility matrix](../tools/osbuilder/README.md#platform-distro-compatibility-matrix) before creating rootfs.
 
-Optionally, add your custom agent binary to the rootfs with the following, `LIBC` default is `musl`, if `ARCH` is `ppc64le`, should set the `LIBC=gnu` and `ARCH=powerpc64le`:
+Optionally, add your custom agent binary to the rootfs with the following commands. The default `$LIBC` used
+is `musl`, but on ppc64le and s390x, `gnu` should be used. Also, Rust refers to ppc64le as `powerpc64le`:
 ```
-$ export ARCH=$(shell uname -m)
-$ [ ${ARCH} == "ppc64le" ] && export LIBC=gnu || export LIBC=musl
+$ export ARCH=$(uname -m)
+$ [ ${ARCH} == "ppc64le" ] || [ ${ARCH} == "s390x" ] && export LIBC=gnu || export LIBC=musl
 $ [ ${ARCH} == "ppc64le" ] && export ARCH=powerpc64le
-$ sudo install -o root -g root -m 0550 -T ../../../src/agent/target/$(ARCH)-unknown-linux-$(LIBC)/release/kata-agent ${ROOTFS_DIR}/sbin/init
+$ sudo install -o root -g root -m 0550 -T ../../../src/agent/target/${ARCH}-unknown-linux-${LIBC}/release/kata-agent ${ROOTFS_DIR}/sbin/init
 ```
 
 ### Build an initrd image
@@ -384,30 +386,55 @@ You can build and install the guest kernel image as shown [here](../tools/packag
 
 # Install a hypervisor
 
-When setting up Kata using a [packaged installation method](install/README.md#installing-on-a-linux-system), the `qemu-lite` hypervisor is installed automatically. For other installation methods, you will need to manually install a suitable hypervisor.
+When setting up Kata using a [packaged installation method](install/README.md#installing-on-a-linux-system), the
+`QEMU` VMM is installed automatically. Cloud-Hypervisor and Firecracker VMMs are available from the [release tarballs](https://github.com/kata-containers/kata-containers/releases), as well as through [`kata-deploy`](../tools/packaging/kata-deploy/README.md).
+You may choose to manually build your VMM/hypervisor.
 
 ## Build a custom QEMU
 
-Your QEMU directory need to be prepared with source code. Alternatively, you can use the [Kata containers QEMU](https://github.com/kata-containers/qemu/tree/master) and checkout the recommended branch:
+Kata Containers makes use of upstream QEMU branch. The exact version
+and repository utilized can be found by looking at the [versions file](../versions.yaml).
 
+Find the correct version of QEMU from the versions file:
 ```
-$ go get -d github.com/kata-containers/qemu
-$ qemu_branch=$(grep qemu-lite- ${GOPATH}/src/github.com/kata-containers/kata-containers/versions.yaml | cut -d '"' -f2)
-$ cd ${GOPATH}/src/github.com/kata-containers/qemu
-$ git checkout -b $qemu_branch remotes/origin/$qemu_branch
-$ your_qemu_directory=${GOPATH}/src/github.com/kata-containers/qemu
+$ source ${GOPATH}/src/github.com/kata-containers/kata-containers/tools/packaging/scripts/lib.sh
+$ qemu_version=$(get_from_kata_deps "assets.hypervisor.qemu.version")
+$ echo ${qemu_version}
+```
+Get source from the matching branch of QEMU:
+```
+$ go get -d github.com/qemu/qemu
+$ cd ${GOPATH}/src/github.com/qemu/qemu
+$ git checkout ${qemu_version}
+$ your_qemu_directory=${GOPATH}/src/github.com/qemu/qemu
 ```
 
-To build a version of QEMU using the same options as the default `qemu-lite` version , you could use the `configure-hypervisor.sh` script:
-
+There are scripts to manage the build and packaging of QEMU. For the examples below, set your
+environment as:
 ```
-$ go get -d github.com/kata-containers/kata-containers/tools/packaging
+$ go get -d github.com/kata-containers/kata-containers
+$ packaging_dir="${GOPATH}/src/github.com/kata-containers/kata-containers/tools/packaging"
+```
+
+Kata often utilizes patches for not-yet-upstream and/or backported fixes for components,
+including QEMU. These can be found in the [packaging/QEMU directory](../tools/packaging/qemu/patches),
+and it's *recommended* that you apply them. For example, suppose that you are going to build QEMU
+version 5.2.0, do:
+```
 $ cd $your_qemu_directory
-$ ${GOPATH}/src/github.com/kata-containers/kata-containers/tools/packaging/scripts/configure-hypervisor.sh kata-qemu > kata.cfg
+$ $packaging_dir/scripts/apply_patches.sh $packaging_dir/qemu/patches/5.2.x/
+```
+
+To build utilizing the same options as Kata, you should make use of the `configure-hypervisor.sh` script. For example:
+```
+$ cd $your_qemu_directory
+$ $packaging_dir/scripts/configure-hypervisor.sh kata-qemu > kata.cfg
 $ eval ./configure "$(cat kata.cfg)"
 $ make -j $(nproc)
 $ sudo -E make install
 ```
+
+See the [static-build script for QEMU](../tools/packaging/static-build/qemu/build-static-qemu.sh) for a reference on how to get, setup, configure and build QEMU for Kata.
 
 ### Build a custom QEMU for aarch64/arm64 - REQUIRED
 > **Note:**
@@ -475,6 +502,16 @@ debug_console_enabled = true
 ```
 
 This will pass `agent.debug_console agent.debug_console_vport=1026` to agent as kernel parameters, and sandboxes created using this parameters will start a shell in guest if new connection is accept from VSOCK.
+
+#### Start `kata-monitor` - ONLY NEEDED FOR 2.0.x
+
+For Kata Containers `2.0.x` releases, the `kata-runtime exec` command depends on the`kata-monitor` running, in order to get the sandbox's `vsock` address to connect to. Thus, first start the `kata-monitor` process.
+
+```
+$ sudo kata-monitor
+```
+
+`kata-monitor` will serve at `localhost:8090` by default.
 
 #### Connect to debug console
 
@@ -613,11 +650,14 @@ sudo sed -i -e 's/^kernel_params = "\(.*\)"/kernel_params = "\1 agent.debug_cons
 > **Note** Ports 1024 and 1025 are reserved for communication with the agent
 > and gathering of agent logs respectively. 
 
-Next, connect to the debug console. The VSOCKS paths vary slightly between
-cloud-hypervisor and firecracker.
+##### Connecting to the debug console
+
+Next, connect to the debug console. The VSOCKS paths vary slightly between each
+VMM solution.
+
 In case of cloud-hypervisor, connect to the `vsock` as shown:
 ```
-$ sudo su -c 'cd /var/run/vc/vm/{sandbox_id}/root/ && socat stdin unix-connect:clh.sock'
+$ sudo su -c 'cd /var/run/vc/vm/${sandbox_id}/root/ && socat stdin unix-connect:clh.sock'
 CONNECT 1026
 ```
 
@@ -625,11 +665,17 @@ CONNECT 1026
 
 For firecracker, connect to the `hvsock` as shown:
 ```
-$ sudo su -c 'cd /var/run/vc/firecracker/{sandbox_id}/root/ && socat stdin unix-connect:kata.hvsock'
+$ sudo su -c 'cd /var/run/vc/firecracker/${sandbox_id}/root/ && socat stdin unix-connect:kata.hvsock'
 CONNECT 1026
 ```
 
 **Note**: You need to press the `RETURN` key to see the shell prompt.
+
+
+For QEMU, connect to the `vsock` as shown:
+```
+$ sudo su -c 'cd /var/run/vc/vm/${sandbox_id} && socat "stdin,raw,echo=0,escape=0x11" "unix-connect:console.sock"'
+```
 
 To disconnect from the virtual machine, type `CONTROL+q` (hold down the
 `CONTROL` key and press `q`).

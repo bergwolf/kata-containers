@@ -1,7 +1,4 @@
-[![Build Status](https://travis-ci.org/kata-containers/kata-containers.svg?branch=master)](https://travis-ci.org/kata-containers/kata-containers)
-[![Build Status](http://jenkins.katacontainers.io/job/kata-containers-runtime-ubuntu-18-04-master/badge/icon)](http://jenkins.katacontainers.io/job/kata-containers-runtime-ubuntu-18-04-master/)
 [![Go Report Card](https://goreportcard.com/badge/github.com/kata-containers/kata-containers)](https://goreportcard.com/report/github.com/kata-containers/kata-containers)
-[![GoDoc](https://godoc.org/github.com/kata-containers/runtime?status.svg)](https://godoc.org/github.com/kata-containers/runtime)
 
 # Runtime
 
@@ -84,7 +81,7 @@ $ kata-runtime check
 
 [![Get it from the Snap Store](https://snapcraft.io/static/images/badges/en/snap-store-black.svg)](https://snapcraft.io/kata-containers)
 
-See the [installation guides](https://github.com/kata-containers/documentation/tree/master/install/README.md)
+See the [installation guides](https://github.com/kata-containers/kata-containers/blob/main/docs/install/README.md)
 available for various operating systems.
 
 ## Quick start for developers

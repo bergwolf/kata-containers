@@ -19,20 +19,25 @@ import (
 	"time"
 
 	"github.com/containernetworking/plugins/pkg/ns"
-	"github.com/containernetworking/plugins/pkg/testutils"
 	"github.com/sirupsen/logrus"
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
-	"go.opentelemetry.io/otel"
-	otelLabel "go.opentelemetry.io/otel/label"
 	otelTrace "go.opentelemetry.io/otel/trace"
 	"golang.org/x/sys/unix"
 
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/katautils/katatrace"
 	pbTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/agent/protocols"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/rootless"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/uuid"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/utils"
 )
+
+// networkTracingTags defines tags for the trace span
+var networkTracingTags = map[string]string{
+	"source":    "runtime",
+	"package":   "virtcontainers",
+	"subsystem": "network",
+}
 
 // NetInterworkingModel defines the network model connecting
 // the network interface to the virtual machine.
@@ -58,7 +63,7 @@ const (
 	NetXConnectInvalidModel
 )
 
-//IsValid checks if a model is valid
+// IsValid checks if a model is valid
 func (n NetInterworkingModel) IsValid() bool {
 	return 0 <= int(n) && int(n) < int(NetXConnectInvalidModel)
 }
@@ -72,6 +77,21 @@ const (
 
 	noneNetModelStr = "none"
 )
+
+//GetModel returns the string value of a NetInterworkingModel
+func (n *NetInterworkingModel) GetModel() string {
+	switch *n {
+	case DefaultNetInterworkingModel:
+		return defaultNetModelStr
+	case NetXConnectMacVtapModel:
+		return macvtapNetModelStr
+	case NetXConnectTCFilterModel:
+		return tcFilterNetModelStr
+	case NetXConnectNoneModel:
+		return noneNetModelStr
+	}
+	return "unknown"
+}
 
 //SetModel change the model string value
 func (n *NetInterworkingModel) SetModel(modelName string) error {
@@ -407,6 +427,11 @@ func getLinkByName(netHandle *netlink.Handle, name string, expectedLink netlink.
 
 // The endpoint type should dictate how the connection needs to happen.
 func xConnectVMNetwork(ctx context.Context, endpoint Endpoint, h hypervisor) error {
+	var err error
+
+	span, ctx := networkTrace(ctx, "xConnectVMNetwork", endpoint)
+	defer closeSpan(span, err)
+
 	netPair := endpoint.NetworkPair()
 
 	queues := 0
@@ -428,16 +453,24 @@ func xConnectVMNetwork(ctx context.Context, endpoint Endpoint, h hypervisor) err
 
 	switch netPair.NetInterworkingModel {
 	case NetXConnectMacVtapModel:
-		return tapNetworkPair(endpoint, queues, disableVhostNet)
+		networkLogger().Info("connect macvtap to VM network")
+		err = tapNetworkPair(ctx, endpoint, queues, disableVhostNet)
 	case NetXConnectTCFilterModel:
-		return setupTCFiltering(endpoint, queues, disableVhostNet)
+		networkLogger().Info("connect TCFilter to VM network")
+		err = setupTCFiltering(ctx, endpoint, queues, disableVhostNet)
 	default:
-		return fmt.Errorf("Invalid internetworking model")
+		err = fmt.Errorf("Invalid internetworking model")
 	}
+	return err
 }
 
 // The endpoint type should dictate how the disconnection needs to happen.
-func xDisconnectVMNetwork(endpoint Endpoint) error {
+func xDisconnectVMNetwork(ctx context.Context, endpoint Endpoint) error {
+	var err error
+
+	span, ctx := networkTrace(ctx, "xDisconnectVMNetwork", endpoint)
+	defer closeSpan(span, err)
+
 	netPair := endpoint.NetworkPair()
 
 	if netPair.NetInterworkingModel == NetXConnectDefaultModel {
@@ -446,12 +479,13 @@ func xDisconnectVMNetwork(endpoint Endpoint) error {
 
 	switch netPair.NetInterworkingModel {
 	case NetXConnectMacVtapModel:
-		return untapNetworkPair(endpoint)
+		err = untapNetworkPair(ctx, endpoint)
 	case NetXConnectTCFilterModel:
-		return removeTCFiltering(endpoint)
+		err = removeTCFiltering(ctx, endpoint)
 	default:
-		return fmt.Errorf("Invalid internetworking model")
+		err = fmt.Errorf("Invalid internetworking model")
 	}
+	return err
 }
 
 func createMacvtapFds(linkIndex int, queues int) ([]*os.File, error) {
@@ -533,7 +567,10 @@ func setIPs(link netlink.Link, addrs []netlink.Addr) error {
 	return nil
 }
 
-func tapNetworkPair(endpoint Endpoint, queues int, disableVhostNet bool) error {
+func tapNetworkPair(ctx context.Context, endpoint Endpoint, queues int, disableVhostNet bool) error {
+	span, _ := networkTrace(ctx, "tapNetworkPair", endpoint)
+	defer span.End()
+
 	netHandle, err := netlink.NewHandle()
 	if err != nil {
 		return err
@@ -627,7 +664,10 @@ func tapNetworkPair(endpoint Endpoint, queues int, disableVhostNet bool) error {
 	return nil
 }
 
-func setupTCFiltering(endpoint Endpoint, queues int, disableVhostNet bool) error {
+func setupTCFiltering(ctx context.Context, endpoint Endpoint, queues int, disableVhostNet bool) error {
+	span, _ := networkTrace(ctx, "setupTCFiltering", endpoint)
+	defer span.End()
+
 	netHandle, err := netlink.NewHandle()
 	if err != nil {
 		return err
@@ -696,7 +736,7 @@ func setupTCFiltering(endpoint Endpoint, queues int, disableVhostNet bool) error
 	return nil
 }
 
-// addQdiscIngress creates a new qdisc for nwtwork interface with the specified network index
+// addQdiscIngress creates a new qdisc for network interface with the specified network index
 // on "ingress". qdiscs normally don't work on ingress so this is really a special qdisc
 // that you can consider an "alternate root" for inbound packets.
 // Handle for ingress qdisc defaults to "ffff:"
@@ -799,7 +839,10 @@ func removeQdiscIngress(link netlink.Link) error {
 	return nil
 }
 
-func untapNetworkPair(endpoint Endpoint) error {
+func untapNetworkPair(ctx context.Context, endpoint Endpoint) error {
+	span, _ := networkTrace(ctx, "untapNetworkPair", endpoint)
+	defer span.End()
+
 	netHandle, err := netlink.NewHandle()
 	if err != nil {
 		return err
@@ -840,7 +883,10 @@ func untapNetworkPair(endpoint Endpoint) error {
 	return err
 }
 
-func removeTCFiltering(endpoint Endpoint) error {
+func removeTCFiltering(ctx context.Context, endpoint Endpoint) error {
+	span, _ := networkTrace(ctx, "removeTCFiltering", endpoint)
+	defer span.End()
+
 	netHandle, err := netlink.NewHandle()
 	if err != nil {
 		return err
@@ -880,15 +926,6 @@ func removeTCFiltering(endpoint Endpoint) error {
 	}
 
 	return nil
-}
-
-func createNetNS() (string, error) {
-	n, err := testutils.NewNS()
-	if err != nil {
-		return "", err
-	}
-
-	return n.Path(), nil
 }
 
 // doNetNS is free from any call to a go routine, and it calls
@@ -945,18 +982,18 @@ func deleteNetNS(netNSPath string) error {
 	return nil
 }
 
-func generateVCNetworkStructures(networkNS NetworkNamespace) ([]*pbTypes.Interface, []*pbTypes.Route, []*pbTypes.ARPNeighbor, error) {
-
+func generateVCNetworkStructures(ctx context.Context, networkNS NetworkNamespace) ([]*pbTypes.Interface, []*pbTypes.Route, []*pbTypes.ARPNeighbor, error) {
 	if networkNS.NetNsPath == "" {
 		return nil, nil, nil, nil
 	}
+	span, _ := networkTrace(ctx, "generateVCNetworkStructures", nil)
+	defer span.End()
 
 	var routes []*pbTypes.Route
 	var ifaces []*pbTypes.Interface
 	var neighs []*pbTypes.ARPNeighbor
 
 	for _, endpoint := range networkNS.Endpoints {
-
 		var ipAddresses []*pbTypes.IPAddress
 		for _, addr := range endpoint.Properties().Addrs {
 			// Skip localhost interface
@@ -1041,6 +1078,7 @@ func generateVCNetworkStructures(networkNS NetworkNamespace) ([]*pbTypes.Interfa
 			neighs = append(neighs, &n)
 		}
 	}
+
 	return ifaces, routes, neighs, nil
 }
 
@@ -1238,8 +1276,10 @@ func createEndpoint(netInfo NetworkInfo, idx int, model NetInterworkingModel, li
 				}
 			}
 		} else if netInfo.Iface.Type == "veth" {
+			networkLogger().Info("veth interface found")
 			endpoint, err = createVethNetworkEndpoint(idx, netInfo.Iface.Name, model)
 		} else if netInfo.Iface.Type == "ipvlan" {
+			networkLogger().Info("ipvlan interface found")
 			endpoint, err = createIPVlanNetworkEndpoint(idx, netInfo.Iface.Name)
 		} else {
 			return nil, fmt.Errorf("Unsupported network interface: %s", netInfo.Iface.Type)
@@ -1253,12 +1293,30 @@ func createEndpoint(netInfo NetworkInfo, idx int, model NetInterworkingModel, li
 type Network struct {
 }
 
-func (n *Network) trace(ctx context.Context, name string) (otelTrace.Span, context.Context) {
-	tracer := otel.Tracer("kata")
-	ctx, span := tracer.Start(ctx, name)
-	span.SetAttributes([]otelLabel.KeyValue{otelLabel.Key("subsystem").String("network"), otelLabel.Key("type").String("default")}...)
+var networkTrace = getNetworkTrace("")
 
-	return span, ctx
+func (n *Network) trace(ctx context.Context, name string) (otelTrace.Span, context.Context) {
+	return networkTrace(ctx, name, nil)
+}
+
+func getNetworkTrace(networkType EndpointType) func(ctx context.Context, name string, endpoint interface{}) (otelTrace.Span, context.Context) {
+	return func(ctx context.Context, name string, endpoint interface{}) (otelTrace.Span, context.Context) {
+		span, ctx := katatrace.Trace(ctx, networkLogger(), name, networkTracingTags)
+		if networkType != "" {
+			katatrace.AddTag(span, "type", string(networkType))
+		}
+		if endpoint != nil {
+			katatrace.AddTag(span, "endpoint", endpoint)
+		}
+		return span, ctx
+	}
+}
+
+func closeSpan(span otelTrace.Span, err error) {
+	if err != nil {
+		katatrace.AddTag(span, "error", err)
+	}
+	span.End()
 }
 
 // Run runs a callback in the specified network namespace.
@@ -1274,12 +1332,15 @@ func (n *Network) Run(ctx context.Context, networkNSPath string, cb func() error
 // Add adds all needed interfaces inside the network namespace.
 func (n *Network) Add(ctx context.Context, config *NetworkConfig, s *Sandbox, hotplug bool) ([]Endpoint, error) {
 	span, ctx := n.trace(ctx, "Add")
+	katatrace.AddTag(span, "type", config.InterworkingModel.GetModel())
 	defer span.End()
 
 	endpoints, err := createEndpointsFromScan(config.NetNSPath, config)
 	if err != nil {
 		return endpoints, err
 	}
+	katatrace.AddTag(span, "endpoints", endpoints)
+	katatrace.AddTag(span, "hotplug", hotplug)
 
 	err = doNetNS(config.NetNSPath, func(_ ns.NetNS) error {
 		for _, endpoint := range endpoints {
@@ -1309,9 +1370,7 @@ func (n *Network) Add(ctx context.Context, config *NetworkConfig, s *Sandbox, ho
 						return err
 					}
 				}
-
 			}
-
 		}
 
 		return nil
@@ -1543,7 +1602,7 @@ func addIFBRedirecting(sourceIndex int, ifbIndex int) error {
 	return nil
 }
 
-// func addTxRateLmiter implements tx rate limiter to control network I/O outbound traffic
+// addTxRateLimiter implements tx rate limiter to control network I/O outbound traffic
 // on VM level for hypervisors which don't implement rate limiter in itself, like qemu, etc.
 // We adopt different actions, based on different inter-networking models.
 // For tcfilters as inter-networking model, we simply apply htb qdisc discipline to the virtual netpair.

@@ -29,25 +29,25 @@ const _ = proto.GoGoProtoPackageIsVersion3 // please upgrade the proto package
 
 type Spec struct {
 	// Version of the Open Container Initiative Runtime Specification with which the bundle complies.
-	Version string `protobuf:"bytes,1,opt,name=Version,proto3" json:"Version,omitempty"`
+	Version string `protobuf:"bytes,1,opt,name=Version,json=version,proto3" json:"Version,omitempty"`
 	// Process configures the container process.
-	Process *Process `protobuf:"bytes,2,opt,name=Process,proto3" json:"Process,omitempty"`
+	Process *Process `protobuf:"bytes,2,opt,name=Process,json=process,proto3" json:"Process,omitempty"`
 	// Root configures the container's root filesystem.
-	Root *Root `protobuf:"bytes,3,opt,name=Root,proto3" json:"Root,omitempty"`
+	Root *Root `protobuf:"bytes,3,opt,name=Root,json=root,proto3" json:"Root,omitempty"`
 	// Hostname configures the container's hostname.
-	Hostname string `protobuf:"bytes,4,opt,name=Hostname,proto3" json:"Hostname,omitempty"`
+	Hostname string `protobuf:"bytes,4,opt,name=Hostname,json=hostname,proto3" json:"Hostname,omitempty"`
 	// Mounts configures additional mounts (on top of Root).
-	Mounts []Mount `protobuf:"bytes,5,rep,name=Mounts,proto3" json:"Mounts"`
+	Mounts []Mount `protobuf:"bytes,5,rep,name=Mounts,json=mounts,proto3" json:"Mounts"`
 	// Hooks configures callbacks for container lifecycle events.
-	Hooks *Hooks `protobuf:"bytes,6,opt,name=Hooks,proto3" json:"Hooks,omitempty"`
+	Hooks *Hooks `protobuf:"bytes,6,opt,name=Hooks,json=hooks,proto3" json:"Hooks,omitempty"`
 	// Annotations contains arbitrary metadata for the container.
-	Annotations map[string]string `protobuf:"bytes,7,rep,name=Annotations,proto3" json:"Annotations,omitempty" protobuf_key:"bytes,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
+	Annotations map[string]string `protobuf:"bytes,7,rep,name=Annotations,json=annotations,proto3" json:"Annotations,omitempty" protobuf_key:"bytes,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
 	// Linux is platform-specific configuration for Linux based containers.
-	Linux *Linux `protobuf:"bytes,8,opt,name=Linux,proto3" json:"Linux,omitempty"`
+	Linux *Linux `protobuf:"bytes,8,opt,name=Linux,json=linux,proto3" json:"Linux,omitempty"`
 	// Solaris is platform-specific configuration for Solaris based containers.
-	Solaris *Solaris `protobuf:"bytes,9,opt,name=Solaris,proto3" json:"Solaris,omitempty"`
+	Solaris *Solaris `protobuf:"bytes,9,opt,name=Solaris,json=solaris,proto3" json:"Solaris,omitempty"`
 	// Windows is platform-specific configuration for Windows based containers.
-	Windows              *Windows `protobuf:"bytes,10,opt,name=Windows,proto3" json:"Windows,omitempty"`
+	Windows              *Windows `protobuf:"bytes,10,opt,name=Windows,json=windows,proto3" json:"Windows,omitempty"`
 	XXX_NoUnkeyedLiteral struct{} `json:"-"`
 	XXX_unrecognized     []byte   `json:"-"`
 	XXX_sizecache        int32    `json:"-"`
@@ -87,30 +87,30 @@ var xxx_messageInfo_Spec proto.InternalMessageInfo
 
 type Process struct {
 	// Terminal creates an interactive terminal for the container.
-	Terminal bool `protobuf:"varint,1,opt,name=Terminal,proto3" json:"Terminal,omitempty"`
+	Terminal bool `protobuf:"varint,1,opt,name=Terminal,json=terminal,proto3" json:"Terminal,omitempty"`
 	// ConsoleSize specifies the size of the console.
-	ConsoleSize *Box `protobuf:"bytes,2,opt,name=ConsoleSize,proto3" json:"ConsoleSize,omitempty"`
+	ConsoleSize *Box `protobuf:"bytes,2,opt,name=ConsoleSize,json=consoleSize,proto3" json:"ConsoleSize,omitempty"`
 	// User specifies user information for the process.
-	User User `protobuf:"bytes,3,opt,name=User,proto3" json:"User"`
+	User User `protobuf:"bytes,3,opt,name=User,json=user,proto3" json:"User"`
 	// Args specifies the binary and arguments for the application to execute.
-	Args []string `protobuf:"bytes,4,rep,name=Args,proto3" json:"Args,omitempty"`
+	Args []string `protobuf:"bytes,4,rep,name=Args,json=args,proto3" json:"Args,omitempty"`
 	// Env populates the process environment for the process.
-	Env []string `protobuf:"bytes,5,rep,name=Env,proto3" json:"Env,omitempty"`
+	Env []string `protobuf:"bytes,5,rep,name=Env,json=env,proto3" json:"Env,omitempty"`
 	// Cwd is the current working directory for the process and must be
 	// relative to the container's root.
-	Cwd string `protobuf:"bytes,6,opt,name=Cwd,proto3" json:"Cwd,omitempty"`
+	Cwd string `protobuf:"bytes,6,opt,name=Cwd,json=cwd,proto3" json:"Cwd,omitempty"`
 	// Capabilities are Linux capabilities that are kept for the process.
-	Capabilities *LinuxCapabilities `protobuf:"bytes,7,opt,name=Capabilities,proto3" json:"Capabilities,omitempty"`
+	Capabilities *LinuxCapabilities `protobuf:"bytes,7,opt,name=Capabilities,json=capabilities,proto3" json:"Capabilities,omitempty"`
 	// Rlimits specifies rlimit options to apply to the process.
-	Rlimits []POSIXRlimit `protobuf:"bytes,8,rep,name=Rlimits,proto3" json:"Rlimits"`
+	Rlimits []POSIXRlimit `protobuf:"bytes,8,rep,name=Rlimits,json=rlimits,proto3" json:"Rlimits"`
 	// NoNewPrivileges controls whether additional privileges could be gained by processes in the container.
-	NoNewPrivileges bool `protobuf:"varint,9,opt,name=NoNewPrivileges,proto3" json:"NoNewPrivileges,omitempty"`
+	NoNewPrivileges bool `protobuf:"varint,9,opt,name=NoNewPrivileges,json=noNewPrivileges,proto3" json:"NoNewPrivileges,omitempty"`
 	// ApparmorProfile specifies the apparmor profile for the container.
-	ApparmorProfile string `protobuf:"bytes,10,opt,name=ApparmorProfile,proto3" json:"ApparmorProfile,omitempty"`
+	ApparmorProfile string `protobuf:"bytes,10,opt,name=ApparmorProfile,json=apparmorProfile,proto3" json:"ApparmorProfile,omitempty"`
 	// Specify an oom_score_adj for the container.
-	OOMScoreAdj int64 `protobuf:"varint,11,opt,name=OOMScoreAdj,proto3" json:"OOMScoreAdj,omitempty"`
+	OOMScoreAdj int64 `protobuf:"varint,11,opt,name=OOMScoreAdj,json=oOMScoreAdj,proto3" json:"OOMScoreAdj,omitempty"`
 	// SelinuxLabel specifies the selinux context that the container process is run as.
-	SelinuxLabel         string   `protobuf:"bytes,12,opt,name=SelinuxLabel,proto3" json:"SelinuxLabel,omitempty"`
+	SelinuxLabel         string   `protobuf:"bytes,12,opt,name=SelinuxLabel,json=selinuxLabel,proto3" json:"SelinuxLabel,omitempty"`
 	XXX_NoUnkeyedLiteral struct{} `json:"-"`
 	XXX_unrecognized     []byte   `json:"-"`
 	XXX_sizecache        int32    `json:"-"`
@@ -150,9 +150,9 @@ var xxx_messageInfo_Process proto.InternalMessageInfo
 
 type Box struct {
 	// Height is the vertical dimension of a box.
-	Height uint32 `protobuf:"varint,1,opt,name=Height,proto3" json:"Height,omitempty"`
+	Height uint32 `protobuf:"varint,1,opt,name=Height,json=height,proto3" json:"Height,omitempty"`
 	// Width is the horizontal dimension of a box.
-	Width                uint32   `protobuf:"varint,2,opt,name=Width,proto3" json:"Width,omitempty"`
+	Width                uint32   `protobuf:"varint,2,opt,name=Width,json=width,proto3" json:"Width,omitempty"`
 	XXX_NoUnkeyedLiteral struct{} `json:"-"`
 	XXX_unrecognized     []byte   `json:"-"`
 	XXX_sizecache        int32    `json:"-"`
@@ -192,13 +192,13 @@ var xxx_messageInfo_Box proto.InternalMessageInfo
 
 type User struct {
 	// UID is the user id.
-	UID uint32 `protobuf:"varint,1,opt,name=UID,proto3" json:"UID,omitempty"`
+	UID uint32 `protobuf:"varint,1,opt,name=UID,json=uID,proto3" json:"UID,omitempty"`
 	// GID is the group id.
-	GID uint32 `protobuf:"varint,2,opt,name=GID,proto3" json:"GID,omitempty"`
+	GID uint32 `protobuf:"varint,2,opt,name=GID,json=gID,proto3" json:"GID,omitempty"`
 	// AdditionalGids are additional group ids set for the container's process.
-	AdditionalGids []uint32 `protobuf:"varint,3,rep,packed,name=AdditionalGids,proto3" json:"AdditionalGids,omitempty"`
+	AdditionalGids []uint32 `protobuf:"varint,3,rep,packed,name=AdditionalGids,json=additionalGids,proto3" json:"AdditionalGids,omitempty"`
 	// Username is the user name.
-	Username             string   `protobuf:"bytes,4,opt,name=Username,proto3" json:"Username,omitempty"`
+	Username             string   `protobuf:"bytes,4,opt,name=Username,json=username,proto3" json:"Username,omitempty"`
 	XXX_NoUnkeyedLiteral struct{} `json:"-"`
 	XXX_unrecognized     []byte   `json:"-"`
 	XXX_sizecache        int32    `json:"-"`
@@ -238,15 +238,15 @@ var xxx_messageInfo_User proto.InternalMessageInfo
 
 type LinuxCapabilities struct {
 	// Bounding is the set of capabilities checked by the kernel.
-	Bounding []string `protobuf:"bytes,1,rep,name=Bounding,proto3" json:"Bounding,omitempty"`
+	Bounding []string `protobuf:"bytes,1,rep,name=Bounding,json=bounding,proto3" json:"Bounding,omitempty"`
 	// Effective is the set of capabilities checked by the kernel.
-	Effective []string `protobuf:"bytes,2,rep,name=Effective,proto3" json:"Effective,omitempty"`
+	Effective []string `protobuf:"bytes,2,rep,name=Effective,json=effective,proto3" json:"Effective,omitempty"`
 	// Inheritable is the capabilities preserved across execve.
-	Inheritable []string `protobuf:"bytes,3,rep,name=Inheritable,proto3" json:"Inheritable,omitempty"`
+	Inheritable []string `protobuf:"bytes,3,rep,name=Inheritable,json=inheritable,proto3" json:"Inheritable,omitempty"`
 	// Permitted is the limiting superset for effective capabilities.
-	Permitted []string `protobuf:"bytes,4,rep,name=Permitted,proto3" json:"Permitted,omitempty"`
+	Permitted []string `protobuf:"bytes,4,rep,name=Permitted,json=permitted,proto3" json:"Permitted,omitempty"`
 	// Ambient is the ambient set of capabilities that are kept.
-	Ambient              []string `protobuf:"bytes,5,rep,name=Ambient,proto3" json:"Ambient,omitempty"`
+	Ambient              []string `protobuf:"bytes,5,rep,name=Ambient,json=ambient,proto3" json:"Ambient,omitempty"`
 	XXX_NoUnkeyedLiteral struct{} `json:"-"`
 	XXX_unrecognized     []byte   `json:"-"`
 	XXX_sizecache        int32    `json:"-"`
@@ -286,11 +286,11 @@ var xxx_messageInfo_LinuxCapabilities proto.InternalMessageInfo
 
 type POSIXRlimit struct {
 	// Type of the rlimit to set
-	Type string `protobuf:"bytes,1,opt,name=Type,proto3" json:"Type,omitempty"`
+	Type string `protobuf:"bytes,1,opt,name=Type,json=type,proto3" json:"Type,omitempty"`
 	// Hard is the hard limit for the specified type
-	Hard uint64 `protobuf:"varint,2,opt,name=Hard,proto3" json:"Hard,omitempty"`
+	Hard uint64 `protobuf:"varint,2,opt,name=Hard,json=hard,proto3" json:"Hard,omitempty"`
 	// Soft is the soft limit for the specified type
-	Soft                 uint64   `protobuf:"varint,3,opt,name=Soft,proto3" json:"Soft,omitempty"`
+	Soft                 uint64   `protobuf:"varint,3,opt,name=Soft,json=soft,proto3" json:"Soft,omitempty"`
 	XXX_NoUnkeyedLiteral struct{} `json:"-"`
 	XXX_unrecognized     []byte   `json:"-"`
 	XXX_sizecache        int32    `json:"-"`
@@ -377,9 +377,9 @@ var xxx_messageInfo_Mount proto.InternalMessageInfo
 
 type Root struct {
 	// Path is the absolute path to the container's root filesystem.
-	Path string `protobuf:"bytes,1,opt,name=Path,proto3" json:"Path,omitempty"`
+	Path string `protobuf:"bytes,1,opt,name=Path,json=path,proto3" json:"Path,omitempty"`
 	// Readonly makes the root filesystem for the container readonly before the process is executed.
-	Readonly             bool     `protobuf:"varint,2,opt,name=Readonly,proto3" json:"Readonly,omitempty"`
+	Readonly             bool     `protobuf:"varint,2,opt,name=Readonly,json=readonly,proto3" json:"Readonly,omitempty"`
 	XXX_NoUnkeyedLiteral struct{} `json:"-"`
 	XXX_unrecognized     []byte   `json:"-"`
 	XXX_sizecache        int32    `json:"-"`
@@ -419,11 +419,11 @@ var xxx_messageInfo_Root proto.InternalMessageInfo
 
 type Hooks struct {
 	// Prestart is a list of hooks to be run before the container process is executed.
-	Prestart []Hook `protobuf:"bytes,1,rep,name=Prestart,proto3" json:"Prestart"`
+	Prestart []Hook `protobuf:"bytes,1,rep,name=Prestart,json=prestart,proto3" json:"Prestart"`
 	// Poststart is a list of hooks to be run after the container process is started.
-	Poststart []Hook `protobuf:"bytes,2,rep,name=Poststart,proto3" json:"Poststart"`
+	Poststart []Hook `protobuf:"bytes,2,rep,name=Poststart,json=poststart,proto3" json:"Poststart"`
 	// Poststop is a list of hooks to be run after the container process exits.
-	Poststop             []Hook   `protobuf:"bytes,3,rep,name=Poststop,proto3" json:"Poststop"`
+	Poststop             []Hook   `protobuf:"bytes,3,rep,name=Poststop,json=poststop,proto3" json:"Poststop"`
 	XXX_NoUnkeyedLiteral struct{} `json:"-"`
 	XXX_unrecognized     []byte   `json:"-"`
 	XXX_sizecache        int32    `json:"-"`
@@ -462,10 +462,10 @@ func (m *Hooks) XXX_DiscardUnknown() {
 var xxx_messageInfo_Hooks proto.InternalMessageInfo
 
 type Hook struct {
-	Path                 string   `protobuf:"bytes,1,opt,name=Path,proto3" json:"Path,omitempty"`
-	Args                 []string `protobuf:"bytes,2,rep,name=Args,proto3" json:"Args,omitempty"`
-	Env                  []string `protobuf:"bytes,3,rep,name=Env,proto3" json:"Env,omitempty"`
-	Timeout              int64    `protobuf:"varint,4,opt,name=Timeout,proto3" json:"Timeout,omitempty"`
+	Path                 string   `protobuf:"bytes,1,opt,name=Path,json=path,proto3" json:"Path,omitempty"`
+	Args                 []string `protobuf:"bytes,2,rep,name=Args,json=args,proto3" json:"Args,omitempty"`
+	Env                  []string `protobuf:"bytes,3,rep,name=Env,json=env,proto3" json:"Env,omitempty"`
+	Timeout              int64    `protobuf:"varint,4,opt,name=Timeout,json=timeout,proto3" json:"Timeout,omitempty"`
 	XXX_NoUnkeyedLiteral struct{} `json:"-"`
 	XXX_unrecognized     []byte   `json:"-"`
 	XXX_sizecache        int32    `json:"-"`
@@ -505,35 +505,35 @@ var xxx_messageInfo_Hook proto.InternalMessageInfo
 
 type Linux struct {
 	// UIDMapping specifies user mappings for supporting user namespaces.
-	UIDMappings []LinuxIDMapping `protobuf:"bytes,1,rep,name=UIDMappings,proto3" json:"UIDMappings"`
+	UIDMappings []LinuxIDMapping `protobuf:"bytes,1,rep,name=UIDMappings,json=uIDMappings,proto3" json:"UIDMappings"`
 	// GIDMapping specifies group mappings for supporting user namespaces.
-	GIDMappings []LinuxIDMapping `protobuf:"bytes,2,rep,name=GIDMappings,proto3" json:"GIDMappings"`
+	GIDMappings []LinuxIDMapping `protobuf:"bytes,2,rep,name=GIDMappings,json=gIDMappings,proto3" json:"GIDMappings"`
 	// Sysctl are a set of key value pairs that are set for the container on start
-	Sysctl map[string]string `protobuf:"bytes,3,rep,name=Sysctl,proto3" json:"Sysctl,omitempty" protobuf_key:"bytes,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
+	Sysctl map[string]string `protobuf:"bytes,3,rep,name=Sysctl,json=sysctl,proto3" json:"Sysctl,omitempty" protobuf_key:"bytes,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
 	// Resources contain cgroup information for handling resource constraints
 	// for the container
-	Resources *LinuxResources `protobuf:"bytes,4,opt,name=Resources,proto3" json:"Resources,omitempty"`
+	Resources *LinuxResources `protobuf:"bytes,4,opt,name=Resources,json=resources,proto3" json:"Resources,omitempty"`
 	// CgroupsPath specifies the path to cgroups that are created and/or joined by the container.
 	// The path is expected to be relative to the cgroups mountpoint.
 	// If resources are specified, the cgroups at CgroupsPath will be updated based on resources.
-	CgroupsPath string `protobuf:"bytes,5,opt,name=CgroupsPath,proto3" json:"CgroupsPath,omitempty"`
+	CgroupsPath string `protobuf:"bytes,5,opt,name=CgroupsPath,json=cgroupsPath,proto3" json:"CgroupsPath,omitempty"`
 	// Namespaces contains the namespaces that are created and/or joined by the container
-	Namespaces []LinuxNamespace `protobuf:"bytes,6,rep,name=Namespaces,proto3" json:"Namespaces"`
+	Namespaces []LinuxNamespace `protobuf:"bytes,6,rep,name=Namespaces,json=namespaces,proto3" json:"Namespaces"`
 	// Devices are a list of device nodes that are created for the container
-	Devices []LinuxDevice `protobuf:"bytes,7,rep,name=Devices,proto3" json:"Devices"`
+	Devices []LinuxDevice `protobuf:"bytes,7,rep,name=Devices,json=devices,proto3" json:"Devices"`
 	// Seccomp specifies the seccomp security settings for the container.
-	Seccomp *LinuxSeccomp `protobuf:"bytes,8,opt,name=Seccomp,proto3" json:"Seccomp,omitempty"`
+	Seccomp *LinuxSeccomp `protobuf:"bytes,8,opt,name=Seccomp,json=seccomp,proto3" json:"Seccomp,omitempty"`
 	// RootfsPropagation is the rootfs mount propagation mode for the container.
-	RootfsPropagation string `protobuf:"bytes,9,opt,name=RootfsPropagation,proto3" json:"RootfsPropagation,omitempty"`
+	RootfsPropagation string `protobuf:"bytes,9,opt,name=RootfsPropagation,json=rootfsPropagation,proto3" json:"RootfsPropagation,omitempty"`
 	// MaskedPaths masks over the provided paths inside the container.
-	MaskedPaths []string `protobuf:"bytes,10,rep,name=MaskedPaths,proto3" json:"MaskedPaths,omitempty"`
+	MaskedPaths []string `protobuf:"bytes,10,rep,name=MaskedPaths,json=maskedPaths,proto3" json:"MaskedPaths,omitempty"`
 	// ReadonlyPaths sets the provided paths as RO inside the container.
-	ReadonlyPaths []string `protobuf:"bytes,11,rep,name=ReadonlyPaths,proto3" json:"ReadonlyPaths,omitempty"`
+	ReadonlyPaths []string `protobuf:"bytes,11,rep,name=ReadonlyPaths,json=readonlyPaths,proto3" json:"ReadonlyPaths,omitempty"`
 	// MountLabel specifies the selinux context for the mounts in the container.
-	MountLabel string `protobuf:"bytes,12,opt,name=MountLabel,proto3" json:"MountLabel,omitempty"`
+	MountLabel string `protobuf:"bytes,12,opt,name=MountLabel,json=mountLabel,proto3" json:"MountLabel,omitempty"`
 	// IntelRdt contains Intel Resource Director Technology (RDT) information
 	// for handling resource constraints (e.g., L3 cache) for the container
-	IntelRdt             *LinuxIntelRdt `protobuf:"bytes,13,opt,name=IntelRdt,proto3" json:"IntelRdt,omitempty"`
+	IntelRdt             *LinuxIntelRdt `protobuf:"bytes,13,opt,name=IntelRdt,json=intelRdt,proto3" json:"IntelRdt,omitempty"`
 	XXX_NoUnkeyedLiteral struct{}       `json:"-"`
 	XXX_unrecognized     []byte         `json:"-"`
 	XXX_sizecache        int32          `json:"-"`
@@ -653,11 +653,11 @@ var xxx_messageInfo_Solaris proto.InternalMessageInfo
 
 type LinuxIDMapping struct {
 	// HostID is the starting UID/GID on the host to be mapped to 'ContainerID'
-	HostID uint32 `protobuf:"varint,1,opt,name=HostID,proto3" json:"HostID,omitempty"`
+	HostID uint32 `protobuf:"varint,1,opt,name=HostID,json=hostID,proto3" json:"HostID,omitempty"`
 	// ContainerID is the starting UID/GID in the container
-	ContainerID uint32 `protobuf:"varint,2,opt,name=ContainerID,proto3" json:"ContainerID,omitempty"`
+	ContainerID uint32 `protobuf:"varint,2,opt,name=ContainerID,json=containerID,proto3" json:"ContainerID,omitempty"`
 	// Size is the number of IDs to be mapped
-	Size_                uint32   `protobuf:"varint,3,opt,name=Size,proto3" json:"Size,omitempty"`
+	Size_                uint32   `protobuf:"varint,3,opt,name=Size,json=size,proto3" json:"Size,omitempty"`
 	XXX_NoUnkeyedLiteral struct{} `json:"-"`
 	XXX_unrecognized     []byte   `json:"-"`
 	XXX_sizecache        int32    `json:"-"`
@@ -697,10 +697,10 @@ var xxx_messageInfo_LinuxIDMapping proto.InternalMessageInfo
 
 type LinuxNamespace struct {
 	// Type is the type of namespace
-	Type string `protobuf:"bytes,1,opt,name=Type,proto3" json:"Type,omitempty"`
+	Type string `protobuf:"bytes,1,opt,name=Type,json=type,proto3" json:"Type,omitempty"`
 	// Path is a path to an existing namespace persisted on disk that can be joined
 	// and is of the same type
-	Path                 string   `protobuf:"bytes,2,opt,name=Path,proto3" json:"Path,omitempty"`
+	Path                 string   `protobuf:"bytes,2,opt,name=Path,json=path,proto3" json:"Path,omitempty"`
 	XXX_NoUnkeyedLiteral struct{} `json:"-"`
 	XXX_unrecognized     []byte   `json:"-"`
 	XXX_sizecache        int32    `json:"-"`
@@ -740,19 +740,19 @@ var xxx_messageInfo_LinuxNamespace proto.InternalMessageInfo
 
 type LinuxDevice struct {
 	// Path to the device.
-	Path string `protobuf:"bytes,1,opt,name=Path,proto3" json:"Path,omitempty"`
+	Path string `protobuf:"bytes,1,opt,name=Path,json=path,proto3" json:"Path,omitempty"`
 	// Device type, block, char, etc.
-	Type string `protobuf:"bytes,2,opt,name=Type,proto3" json:"Type,omitempty"`
+	Type string `protobuf:"bytes,2,opt,name=Type,json=type,proto3" json:"Type,omitempty"`
 	// Major is the device's major number.
-	Major int64 `protobuf:"varint,3,opt,name=Major,proto3" json:"Major,omitempty"`
+	Major int64 `protobuf:"varint,3,opt,name=Major,json=major,proto3" json:"Major,omitempty"`
 	// Minor is the device's minor number.
-	Minor int64 `protobuf:"varint,4,opt,name=Minor,proto3" json:"Minor,omitempty"`
+	Minor int64 `protobuf:"varint,4,opt,name=Minor,json=minor,proto3" json:"Minor,omitempty"`
 	// FileMode permission bits for the device.
-	FileMode uint32 `protobuf:"varint,5,opt,name=FileMode,proto3" json:"FileMode,omitempty"`
+	FileMode uint32 `protobuf:"varint,5,opt,name=FileMode,json=fileMode,proto3" json:"FileMode,omitempty"`
 	// UID of the device.
-	UID uint32 `protobuf:"varint,6,opt,name=UID,proto3" json:"UID,omitempty"`
+	UID uint32 `protobuf:"varint,6,opt,name=UID,json=uID,proto3" json:"UID,omitempty"`
 	// Gid of the device.
-	GID                  uint32   `protobuf:"varint,7,opt,name=GID,proto3" json:"GID,omitempty"`
+	GID                  uint32   `protobuf:"varint,7,opt,name=GID,json=gID,proto3" json:"GID,omitempty"`
 	XXX_NoUnkeyedLiteral struct{} `json:"-"`
 	XXX_unrecognized     []byte   `json:"-"`
 	XXX_sizecache        int32    `json:"-"`
@@ -792,19 +792,19 @@ var xxx_messageInfo_LinuxDevice proto.InternalMessageInfo
 
 type LinuxResources struct {
 	// Devices configures the device whitelist.
-	Devices []LinuxDeviceCgroup `protobuf:"bytes,1,rep,name=Devices,proto3" json:"Devices"`
+	Devices []LinuxDeviceCgroup `protobuf:"bytes,1,rep,name=Devices,json=devices,proto3" json:"Devices"`
 	// Memory restriction configuration
-	Memory *LinuxMemory `protobuf:"bytes,2,opt,name=Memory,proto3" json:"Memory,omitempty"`
+	Memory *LinuxMemory `protobuf:"bytes,2,opt,name=Memory,json=memory,proto3" json:"Memory,omitempty"`
 	// CPU resource restriction configuration
-	CPU *LinuxCPU `protobuf:"bytes,3,opt,name=CPU,proto3" json:"CPU,omitempty"`
+	CPU *LinuxCPU `protobuf:"bytes,3,opt,name=CPU,json=cPU,proto3" json:"CPU,omitempty"`
 	// Task resource restriction configuration.
-	Pids *LinuxPids `protobuf:"bytes,4,opt,name=Pids,proto3" json:"Pids,omitempty"`
+	Pids *LinuxPids `protobuf:"bytes,4,opt,name=Pids,json=pids,proto3" json:"Pids,omitempty"`
 	// BlockIO restriction configuration
-	BlockIO *LinuxBlockIO `protobuf:"bytes,5,opt,name=BlockIO,proto3" json:"BlockIO,omitempty"`
+	BlockIO *LinuxBlockIO `protobuf:"bytes,5,opt,name=BlockIO,json=blockIO,proto3" json:"BlockIO,omitempty"`
 	// Hugetlb limit (in bytes)
-	HugepageLimits []LinuxHugepageLimit `protobuf:"bytes,6,rep,name=HugepageLimits,proto3" json:"HugepageLimits"`
+	HugepageLimits []LinuxHugepageLimit `protobuf:"bytes,6,rep,name=HugepageLimits,json=hugepageLimits,proto3" json:"HugepageLimits"`
 	// Network restriction configuration
-	Network              *LinuxNetwork `protobuf:"bytes,7,opt,name=Network,proto3" json:"Network,omitempty"`
+	Network              *LinuxNetwork `protobuf:"bytes,7,opt,name=Network,json=network,proto3" json:"Network,omitempty"`
 	XXX_NoUnkeyedLiteral struct{}      `json:"-"`
 	XXX_unrecognized     []byte        `json:"-"`
 	XXX_sizecache        int32         `json:"-"`
@@ -844,19 +844,19 @@ var xxx_messageInfo_LinuxResources proto.InternalMessageInfo
 
 type LinuxMemory struct {
 	// Memory limit (in bytes).
-	Limit int64 `protobuf:"varint,1,opt,name=Limit,proto3" json:"Limit,omitempty"`
+	Limit int64 `protobuf:"varint,1,opt,name=Limit,json=limit,proto3" json:"Limit,omitempty"`
 	// Memory reservation or soft_limit (in bytes).
-	Reservation int64 `protobuf:"varint,2,opt,name=Reservation,proto3" json:"Reservation,omitempty"`
+	Reservation int64 `protobuf:"varint,2,opt,name=Reservation,json=reservation,proto3" json:"Reservation,omitempty"`
 	// Total memory limit (memory + swap).
-	Swap int64 `protobuf:"varint,3,opt,name=Swap,proto3" json:"Swap,omitempty"`
+	Swap int64 `protobuf:"varint,3,opt,name=Swap,json=swap,proto3" json:"Swap,omitempty"`
 	// Kernel memory limit (in bytes).
-	Kernel int64 `protobuf:"varint,4,opt,name=Kernel,proto3" json:"Kernel,omitempty"`
+	Kernel int64 `protobuf:"varint,4,opt,name=Kernel,json=kernel,proto3" json:"Kernel,omitempty"`
 	// Kernel memory limit for tcp (in bytes)
-	KernelTCP int64 `protobuf:"varint,5,opt,name=KernelTCP,proto3" json:"KernelTCP,omitempty"`
+	KernelTCP int64 `protobuf:"varint,5,opt,name=KernelTCP,json=kernelTCP,proto3" json:"KernelTCP,omitempty"`
 	// How aggressive the kernel will swap memory pages.
-	Swappiness uint64 `protobuf:"varint,6,opt,name=Swappiness,proto3" json:"Swappiness,omitempty"`
+	Swappiness uint64 `protobuf:"varint,6,opt,name=Swappiness,json=swappiness,proto3" json:"Swappiness,omitempty"`
 	// DisableOOMKiller disables the OOM killer for out of memory conditions
-	DisableOOMKiller     bool     `protobuf:"varint,7,opt,name=DisableOOMKiller,proto3" json:"DisableOOMKiller,omitempty"`
+	DisableOOMKiller     bool     `protobuf:"varint,7,opt,name=DisableOOMKiller,json=disableOOMKiller,proto3" json:"DisableOOMKiller,omitempty"`
 	XXX_NoUnkeyedLiteral struct{} `json:"-"`
 	XXX_unrecognized     []byte   `json:"-"`
 	XXX_sizecache        int32    `json:"-"`
@@ -896,19 +896,19 @@ var xxx_messageInfo_LinuxMemory proto.InternalMessageInfo
 
 type LinuxCPU struct {
 	// CPU shares (relative weight (ratio) vs. other cgroups with cpu shares).
-	Shares uint64 `protobuf:"varint,1,opt,name=Shares,proto3" json:"Shares,omitempty"`
+	Shares uint64 `protobuf:"varint,1,opt,name=Shares,json=shares,proto3" json:"Shares,omitempty"`
 	// CPU hardcap limit (in usecs). Allowed cpu time in a given period.
-	Quota int64 `protobuf:"varint,2,opt,name=Quota,proto3" json:"Quota,omitempty"`
+	Quota int64 `protobuf:"varint,2,opt,name=Quota,json=quota,proto3" json:"Quota,omitempty"`
 	// CPU period to be used for hardcapping (in usecs).
-	Period uint64 `protobuf:"varint,3,opt,name=Period,proto3" json:"Period,omitempty"`
+	Period uint64 `protobuf:"varint,3,opt,name=Period,json=period,proto3" json:"Period,omitempty"`
 	// How much time realtime scheduling may use (in usecs).
-	RealtimeRuntime int64 `protobuf:"varint,4,opt,name=RealtimeRuntime,proto3" json:"RealtimeRuntime,omitempty"`
+	RealtimeRuntime int64 `protobuf:"varint,4,opt,name=RealtimeRuntime,json=realtimeRuntime,proto3" json:"RealtimeRuntime,omitempty"`
 	// CPU period to be used for realtime scheduling (in usecs).
-	RealtimePeriod uint64 `protobuf:"varint,5,opt,name=RealtimePeriod,proto3" json:"RealtimePeriod,omitempty"`
+	RealtimePeriod uint64 `protobuf:"varint,5,opt,name=RealtimePeriod,json=realtimePeriod,proto3" json:"RealtimePeriod,omitempty"`
 	// CPUs to use within the cpuset. Default is to use any CPU available.
-	Cpus string `protobuf:"bytes,6,opt,name=Cpus,proto3" json:"Cpus,omitempty"`
+	Cpus string `protobuf:"bytes,6,opt,name=Cpus,json=cpus,proto3" json:"Cpus,omitempty"`
 	// List of memory nodes in the cpuset. Default is to use any available memory node.
-	Mems                 string   `protobuf:"bytes,7,opt,name=Mems,proto3" json:"Mems,omitempty"`
+	Mems                 string   `protobuf:"bytes,7,opt,name=Mems,json=mems,proto3" json:"Mems,omitempty"`
 	XXX_NoUnkeyedLiteral struct{} `json:"-"`
 	XXX_unrecognized     []byte   `json:"-"`
 	XXX_sizecache        int32    `json:"-"`
@@ -948,13 +948,13 @@ var xxx_messageInfo_LinuxCPU proto.InternalMessageInfo
 
 type LinuxWeightDevice struct {
 	// Major is the device's major number.
-	Major int64 `protobuf:"varint,1,opt,name=Major,proto3" json:"Major,omitempty"`
+	Major int64 `protobuf:"varint,1,opt,name=Major,json=major,proto3" json:"Major,omitempty"`
 	// Minor is the device's minor number.
-	Minor int64 `protobuf:"varint,2,opt,name=Minor,proto3" json:"Minor,omitempty"`
+	Minor int64 `protobuf:"varint,2,opt,name=Minor,json=minor,proto3" json:"Minor,omitempty"`
 	// Weight is the bandwidth rate for the device.
-	Weight uint32 `protobuf:"varint,3,opt,name=Weight,proto3" json:"Weight,omitempty"`
+	Weight uint32 `protobuf:"varint,3,opt,name=Weight,json=weight,proto3" json:"Weight,omitempty"`
 	// LeafWeight is the bandwidth rate for the device while competing with the cgroup's child cgroups, CFQ scheduler only
-	LeafWeight           uint32   `protobuf:"varint,4,opt,name=LeafWeight,proto3" json:"LeafWeight,omitempty"`
+	LeafWeight           uint32   `protobuf:"varint,4,opt,name=LeafWeight,json=leafWeight,proto3" json:"LeafWeight,omitempty"`
 	XXX_NoUnkeyedLiteral struct{} `json:"-"`
 	XXX_unrecognized     []byte   `json:"-"`
 	XXX_sizecache        int32    `json:"-"`
@@ -994,11 +994,11 @@ var xxx_messageInfo_LinuxWeightDevice proto.InternalMessageInfo
 
 type LinuxThrottleDevice struct {
 	// Major is the device's major number.
-	Major int64 `protobuf:"varint,1,opt,name=Major,proto3" json:"Major,omitempty"`
+	Major int64 `protobuf:"varint,1,opt,name=Major,json=major,proto3" json:"Major,omitempty"`
 	// Minor is the device's minor number.
-	Minor int64 `protobuf:"varint,2,opt,name=Minor,proto3" json:"Minor,omitempty"`
+	Minor int64 `protobuf:"varint,2,opt,name=Minor,json=minor,proto3" json:"Minor,omitempty"`
 	// Rate is the IO rate limit per cgroup per device
-	Rate                 uint64   `protobuf:"varint,3,opt,name=Rate,proto3" json:"Rate,omitempty"`
+	Rate                 uint64   `protobuf:"varint,3,opt,name=Rate,json=rate,proto3" json:"Rate,omitempty"`
 	XXX_NoUnkeyedLiteral struct{} `json:"-"`
 	XXX_unrecognized     []byte   `json:"-"`
 	XXX_sizecache        int32    `json:"-"`
@@ -1038,19 +1038,19 @@ var xxx_messageInfo_LinuxThrottleDevice proto.InternalMessageInfo
 
 type LinuxBlockIO struct {
 	// Specifies per cgroup weight
-	Weight uint32 `protobuf:"varint,1,opt,name=Weight,proto3" json:"Weight,omitempty"`
+	Weight uint32 `protobuf:"varint,1,opt,name=Weight,json=weight,proto3" json:"Weight,omitempty"`
 	// Specifies tasks' weight in the given cgroup while competing with the cgroup's child cgroups, CFQ scheduler only
-	LeafWeight uint32 `protobuf:"varint,2,opt,name=LeafWeight,proto3" json:"LeafWeight,omitempty"`
+	LeafWeight uint32 `protobuf:"varint,2,opt,name=LeafWeight,json=leafWeight,proto3" json:"LeafWeight,omitempty"`
 	// Weight per cgroup per device, can override BlkioWeight
-	WeightDevice []LinuxWeightDevice `protobuf:"bytes,3,rep,name=WeightDevice,proto3" json:"WeightDevice"`
+	WeightDevice []LinuxWeightDevice `protobuf:"bytes,3,rep,name=WeightDevice,json=weightDevice,proto3" json:"WeightDevice"`
 	// IO read rate limit per cgroup per device, bytes per second
-	ThrottleReadBpsDevice []LinuxThrottleDevice `protobuf:"bytes,4,rep,name=ThrottleReadBpsDevice,proto3" json:"ThrottleReadBpsDevice"`
+	ThrottleReadBpsDevice []LinuxThrottleDevice `protobuf:"bytes,4,rep,name=ThrottleReadBpsDevice,json=throttleReadBpsDevice,proto3" json:"ThrottleReadBpsDevice"`
 	// IO write rate limit per cgroup per device, bytes per second
-	ThrottleWriteBpsDevice []LinuxThrottleDevice `protobuf:"bytes,5,rep,name=ThrottleWriteBpsDevice,proto3" json:"ThrottleWriteBpsDevice"`
+	ThrottleWriteBpsDevice []LinuxThrottleDevice `protobuf:"bytes,5,rep,name=ThrottleWriteBpsDevice,json=throttleWriteBpsDevice,proto3" json:"ThrottleWriteBpsDevice"`
 	// IO read rate limit per cgroup per device, IO per second
-	ThrottleReadIOPSDevice []LinuxThrottleDevice `protobuf:"bytes,6,rep,name=ThrottleReadIOPSDevice,proto3" json:"ThrottleReadIOPSDevice"`
+	ThrottleReadIOPSDevice []LinuxThrottleDevice `protobuf:"bytes,6,rep,name=ThrottleReadIOPSDevice,json=throttleReadIOPSDevice,proto3" json:"ThrottleReadIOPSDevice"`
 	// IO write rate limit per cgroup per device, IO per second
-	ThrottleWriteIOPSDevice []LinuxThrottleDevice `protobuf:"bytes,7,rep,name=ThrottleWriteIOPSDevice,proto3" json:"ThrottleWriteIOPSDevice"`
+	ThrottleWriteIOPSDevice []LinuxThrottleDevice `protobuf:"bytes,7,rep,name=ThrottleWriteIOPSDevice,json=throttleWriteIOPSDevice,proto3" json:"ThrottleWriteIOPSDevice"`
 	XXX_NoUnkeyedLiteral    struct{}              `json:"-"`
 	XXX_unrecognized        []byte                `json:"-"`
 	XXX_sizecache           int32                 `json:"-"`
@@ -1090,7 +1090,7 @@ var xxx_messageInfo_LinuxBlockIO proto.InternalMessageInfo
 
 type LinuxPids struct {
 	// Maximum number of PIDs. Default is "no limit".
-	Limit                int64    `protobuf:"varint,1,opt,name=Limit,proto3" json:"Limit,omitempty"`
+	Limit                int64    `protobuf:"varint,1,opt,name=Limit,json=limit,proto3" json:"Limit,omitempty"`
 	XXX_NoUnkeyedLiteral struct{} `json:"-"`
 	XXX_unrecognized     []byte   `json:"-"`
 	XXX_sizecache        int32    `json:"-"`
@@ -1130,15 +1130,15 @@ var xxx_messageInfo_LinuxPids proto.InternalMessageInfo
 
 type LinuxDeviceCgroup struct {
 	// Allow or deny
-	Allow bool `protobuf:"varint,1,opt,name=Allow,proto3" json:"Allow,omitempty"`
+	Allow bool `protobuf:"varint,1,opt,name=Allow,json=allow,proto3" json:"Allow,omitempty"`
 	// Device type, block, char, etc.
-	Type string `protobuf:"bytes,2,opt,name=Type,proto3" json:"Type,omitempty"`
+	Type string `protobuf:"bytes,2,opt,name=Type,json=type,proto3" json:"Type,omitempty"`
 	// Major is the device's major number.
-	Major int64 `protobuf:"varint,3,opt,name=Major,proto3" json:"Major,omitempty"`
+	Major int64 `protobuf:"varint,3,opt,name=Major,json=major,proto3" json:"Major,omitempty"`
 	// Minor is the device's minor number.
-	Minor int64 `protobuf:"varint,4,opt,name=Minor,proto3" json:"Minor,omitempty"`
+	Minor int64 `protobuf:"varint,4,opt,name=Minor,json=minor,proto3" json:"Minor,omitempty"`
 	// Cgroup access permissions format, rwm.
-	Access               string   `protobuf:"bytes,5,opt,name=Access,proto3" json:"Access,omitempty"`
+	Access               string   `protobuf:"bytes,5,opt,name=Access,json=access,proto3" json:"Access,omitempty"`
 	XXX_NoUnkeyedLiteral struct{} `json:"-"`
 	XXX_unrecognized     []byte   `json:"-"`
 	XXX_sizecache        int32    `json:"-"`
@@ -1178,9 +1178,9 @@ var xxx_messageInfo_LinuxDeviceCgroup proto.InternalMessageInfo
 
 type LinuxNetwork struct {
 	// Set class identifier for container's network packets
-	ClassID uint32 `protobuf:"varint,1,opt,name=ClassID,proto3" json:"ClassID,omitempty"`
+	ClassID uint32 `protobuf:"varint,1,opt,name=ClassID,json=classID,proto3" json:"ClassID,omitempty"`
 	// Set priority of network traffic for container
-	Priorities           []LinuxInterfacePriority `protobuf:"bytes,2,rep,name=Priorities,proto3" json:"Priorities"`
+	Priorities           []LinuxInterfacePriority `protobuf:"bytes,2,rep,name=Priorities,json=priorities,proto3" json:"Priorities"`
 	XXX_NoUnkeyedLiteral struct{}                 `json:"-"`
 	XXX_unrecognized     []byte                   `json:"-"`
 	XXX_sizecache        int32                    `json:"-"`
@@ -1220,9 +1220,9 @@ var xxx_messageInfo_LinuxNetwork proto.InternalMessageInfo
 
 type LinuxHugepageLimit struct {
 	// Pagesize is the hugepage size
-	Pagesize string `protobuf:"bytes,1,opt,name=Pagesize,proto3" json:"Pagesize,omitempty"`
+	Pagesize string `protobuf:"bytes,1,opt,name=Pagesize,json=pagesize,proto3" json:"Pagesize,omitempty"`
 	// Limit is the limit of "hugepagesize" hugetlb usage
-	Limit                uint64   `protobuf:"varint,2,opt,name=Limit,proto3" json:"Limit,omitempty"`
+	Limit                uint64   `protobuf:"varint,2,opt,name=Limit,json=limit,proto3" json:"Limit,omitempty"`
 	XXX_NoUnkeyedLiteral struct{} `json:"-"`
 	XXX_unrecognized     []byte   `json:"-"`
 	XXX_sizecache        int32    `json:"-"`
@@ -1262,9 +1262,9 @@ var xxx_messageInfo_LinuxHugepageLimit proto.InternalMessageInfo
 
 type LinuxInterfacePriority struct {
 	// Name is the name of the network interface
-	Name string `protobuf:"bytes,1,opt,name=Name,proto3" json:"Name,omitempty"`
+	Name string `protobuf:"bytes,1,opt,name=Name,json=name,proto3" json:"Name,omitempty"`
 	// Priority for the interface
-	Priority             uint32   `protobuf:"varint,2,opt,name=Priority,proto3" json:"Priority,omitempty"`
+	Priority             uint32   `protobuf:"varint,2,opt,name=Priority,json=priority,proto3" json:"Priority,omitempty"`
 	XXX_NoUnkeyedLiteral struct{} `json:"-"`
 	XXX_unrecognized     []byte   `json:"-"`
 	XXX_sizecache        int32    `json:"-"`
@@ -1303,9 +1303,10 @@ func (m *LinuxInterfacePriority) XXX_DiscardUnknown() {
 var xxx_messageInfo_LinuxInterfacePriority proto.InternalMessageInfo
 
 type LinuxSeccomp struct {
-	DefaultAction        string         `protobuf:"bytes,1,opt,name=DefaultAction,proto3" json:"DefaultAction,omitempty"`
-	Architectures        []string       `protobuf:"bytes,2,rep,name=Architectures,proto3" json:"Architectures,omitempty"`
-	Syscalls             []LinuxSyscall `protobuf:"bytes,3,rep,name=Syscalls,proto3" json:"Syscalls"`
+	DefaultAction        string         `protobuf:"bytes,1,opt,name=DefaultAction,json=defaultAction,proto3" json:"DefaultAction,omitempty"`
+	Architectures        []string       `protobuf:"bytes,2,rep,name=Architectures,json=architectures,proto3" json:"Architectures,omitempty"`
+	Flags                []string       `protobuf:"bytes,3,rep,name=Flags,json=flags,proto3" json:"Flags,omitempty"`
+	Syscalls             []LinuxSyscall `protobuf:"bytes,4,rep,name=Syscalls,json=syscalls,proto3" json:"Syscalls"`
 	XXX_NoUnkeyedLiteral struct{}       `json:"-"`
 	XXX_unrecognized     []byte         `json:"-"`
 	XXX_sizecache        int32          `json:"-"`
@@ -1344,10 +1345,10 @@ func (m *LinuxSeccomp) XXX_DiscardUnknown() {
 var xxx_messageInfo_LinuxSeccomp proto.InternalMessageInfo
 
 type LinuxSeccompArg struct {
-	Index                uint64   `protobuf:"varint,1,opt,name=Index,proto3" json:"Index,omitempty"`
-	Value                uint64   `protobuf:"varint,2,opt,name=Value,proto3" json:"Value,omitempty"`
-	ValueTwo             uint64   `protobuf:"varint,3,opt,name=ValueTwo,proto3" json:"ValueTwo,omitempty"`
-	Op                   string   `protobuf:"bytes,4,opt,name=Op,proto3" json:"Op,omitempty"`
+	Index                uint64   `protobuf:"varint,1,opt,name=Index,json=index,proto3" json:"Index,omitempty"`
+	Value                uint64   `protobuf:"varint,2,opt,name=Value,json=value,proto3" json:"Value,omitempty"`
+	ValueTwo             uint64   `protobuf:"varint,3,opt,name=ValueTwo,json=valueTwo,proto3" json:"ValueTwo,omitempty"`
+	Op                   string   `protobuf:"bytes,4,opt,name=Op,json=op,proto3" json:"Op,omitempty"`
 	XXX_NoUnkeyedLiteral struct{} `json:"-"`
 	XXX_unrecognized     []byte   `json:"-"`
 	XXX_sizecache        int32    `json:"-"`
@@ -1386,12 +1387,15 @@ func (m *LinuxSeccompArg) XXX_DiscardUnknown() {
 var xxx_messageInfo_LinuxSeccompArg proto.InternalMessageInfo
 
 type LinuxSyscall struct {
-	Names                []string          `protobuf:"bytes,1,rep,name=Names,proto3" json:"Names,omitempty"`
-	Action               string            `protobuf:"bytes,2,opt,name=Action,proto3" json:"Action,omitempty"`
-	Args                 []LinuxSeccompArg `protobuf:"bytes,3,rep,name=Args,proto3" json:"Args"`
-	XXX_NoUnkeyedLiteral struct{}          `json:"-"`
-	XXX_unrecognized     []byte            `json:"-"`
-	XXX_sizecache        int32             `json:"-"`
+	Names  []string `protobuf:"bytes,1,rep,name=Names,json=names,proto3" json:"Names,omitempty"`
+	Action string   `protobuf:"bytes,2,opt,name=Action,json=action,proto3" json:"Action,omitempty"`
+	// Types that are valid to be assigned to ErrnoRet:
+	//	*LinuxSyscall_Errnoret
+	ErrnoRet             isLinuxSyscall_ErrnoRet `protobuf_oneof:"ErrnoRet"`
+	Args                 []LinuxSeccompArg       `protobuf:"bytes,4,rep,name=Args,json=args,proto3" json:"Args"`
+	XXX_NoUnkeyedLiteral struct{}                `json:"-"`
+	XXX_unrecognized     []byte                  `json:"-"`
+	XXX_sizecache        int32                   `json:"-"`
 }
 
 func (m *LinuxSyscall) Reset()      { *m = LinuxSyscall{} }
@@ -1426,10 +1430,44 @@ func (m *LinuxSyscall) XXX_DiscardUnknown() {
 
 var xxx_messageInfo_LinuxSyscall proto.InternalMessageInfo
 
+type isLinuxSyscall_ErrnoRet interface {
+	isLinuxSyscall_ErrnoRet()
+	Equal(interface{}) bool
+	MarshalTo([]byte) (int, error)
+	Size() int
+}
+
+type LinuxSyscall_Errnoret struct {
+	Errnoret uint32 `protobuf:"varint,3,opt,name=errnoret,proto3,oneof" json:"errnoret,omitempty"`
+}
+
+func (*LinuxSyscall_Errnoret) isLinuxSyscall_ErrnoRet() {}
+
+func (m *LinuxSyscall) GetErrnoRet() isLinuxSyscall_ErrnoRet {
+	if m != nil {
+		return m.ErrnoRet
+	}
+	return nil
+}
+
+func (m *LinuxSyscall) GetErrnoret() uint32 {
+	if x, ok := m.GetErrnoRet().(*LinuxSyscall_Errnoret); ok {
+		return x.Errnoret
+	}
+	return 0
+}
+
+// XXX_OneofWrappers is for the internal use of the proto package.
+func (*LinuxSyscall) XXX_OneofWrappers() []interface{} {
+	return []interface{}{
+		(*LinuxSyscall_Errnoret)(nil),
+	}
+}
+
 type LinuxIntelRdt struct {
 	// The schema for L3 cache id and capacity bitmask (CBM)
 	// Format: "L3:<cache_id0>=<cbm0>;<cache_id1>=<cbm1>;..."
-	L3CacheSchema        string   `protobuf:"bytes,1,opt,name=L3CacheSchema,proto3" json:"L3CacheSchema,omitempty"`
+	L3CacheSchema        string   `protobuf:"bytes,1,opt,name=L3CacheSchema,json=l3CacheSchema,proto3" json:"L3CacheSchema,omitempty"`
 	XXX_NoUnkeyedLiteral struct{} `json:"-"`
 	XXX_unrecognized     []byte   `json:"-"`
 	XXX_sizecache        int32    `json:"-"`
@@ -1508,138 +1546,150 @@ func init() {
 }
 
 var fileDescriptor_e42fef2823778fc8 = []byte{
-	// 2081 bytes of a gzipped FileDescriptorProto
-	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xa4, 0x18, 0x4b, 0x73, 0x1b, 0x49,
-	0x79, 0x47, 0x23, 0xcb, 0x52, 0x2b, 0x76, 0x92, 0xde, 0xac, 0x77, 0x08, 0x5b, 0x5a, 0xef, 0x90,
-	0x02, 0x03, 0xc1, 0x2e, 0x12, 0x1e, 0xcb, 0xf2, 0xa8, 0x92, 0xed, 0x24, 0x56, 0xad, 0x1d, 0x89,
-	0x96, 0xbd, 0x86, 0x3d, 0x6c, 0x55, 0x7b, 0xd4, 0x96, 0x7a, 0x3d, 0x9a, 0x9e, 0xea, 0x69, 0xd9,
-	0x31, 0x27, 0xb8, 0x71, 0xa4, 0x8a, 0x5f, 0xc0, 0x09, 0xf8, 0x07, 0x14, 0x27, 0x6e, 0xa4, 0x38,
-	0x71, 0xa4, 0x8a, 0x2a, 0x20, 0xbe, 0x73, 0xe7, 0x48, 0x7d, 0xfd, 0x18, 0xb5, 0x24, 0x1b, 0x36,
-	0x70, 0x52, 0x7f, 0xcf, 0xee, 0xef, 0xfd, 0x8d, 0x50, 0x77, 0xc8, 0xd5, 0x68, 0x72, 0xb2, 0x99,
-	0x88, 0xf1, 0xd6, 0x19, 0x55, 0xf4, 0x6b, 0x89, 0xc8, 0x14, 0xe5, 0x19, 0x93, 0xc5, 0x02, 0x5c,
-	0xc8, 0x64, 0x8b, 0x0e, 0x59, 0xa6, 0xb6, 0x72, 0x29, 0x94, 0x48, 0x44, 0x5a, 0x98, 0x53, 0xb1,
-	0x25, 0x12, 0xbe, 0xa9, 0x8f, 0xb8, 0x3a, 0x94, 0x79, 0x72, 0x3f, 0x1e, 0x8a, 0xa1, 0x30, 0xc4,
-	0x93, 0xc9, 0xe9, 0x16, 0x40, 0x1a, 0xd0, 0x27, 0xc3, 0x19, 0xff, 0x31, 0x44, 0xd5, 0x7e, 0xce,
-	0x12, 0x1c, 0xa1, 0xe5, 0x8f, 0x98, 0x2c, 0xb8, 0xc8, 0xa2, 0x60, 0x3d, 0xd8, 0x68, 0x10, 0x07,
-	0xe2, 0x2f, 0xa1, 0xe5, 0x9e, 0x14, 0x09, 0x2b, 0x8a, 0xa8, 0xb2, 0x1e, 0x6c, 0x34, 0x1f, 0xad,
-	0x6c, 0x82, 0xfa, 0x4d, 0x8b, 0x24, 0x8e, 0x8a, 0x5b, 0xa8, 0x4a, 0x84, 0x50, 0x51, 0xa8, 0xb9,
-	0x90, 0xe1, 0x02, 0x0c, 0xd1, 0x78, 0x7c, 0x1f, 0xd5, 0xf7, 0x44, 0xa1, 0x32, 0x3a, 0x66, 0x51,
-	0x55, 0xdf, 0x51, 0xc2, 0xf8, 0xcb, 0xa8, 0x76, 0x20, 0x26, 0x99, 0x2a, 0xa2, 0xa5, 0xf5, 0x70,
-	0xa3, 0xf9, 0xa8, 0x69, 0xa4, 0x35, 0x6e, 0xbb, 0xfa, 0xf2, 0x6f, 0xef, 0xbe, 0x41, 0x2c, 0x03,
-	0x7e, 0x0f, 0x2d, 0xed, 0x09, 0x71, 0x56, 0x44, 0x35, 0x7d, 0x8f, 0xe5, 0xd4, 0x28, 0x62, 0x28,
-	0xf8, 0xfb, 0xa8, 0xd9, 0xce, 0x32, 0xa1, 0xa8, 0xe2, 0x22, 0x2b, 0xa2, 0x65, 0xad, 0xf2, 0xf3,
-	0x86, 0x11, 0xac, 0xdd, 0xf4, 0xa8, 0x4f, 0x32, 0x25, 0x2f, 0x89, 0xcf, 0x0f, 0x37, 0xec, 0xf3,
-	0x6c, 0xf2, 0x22, 0xaa, 0xfb, 0x37, 0x68, 0x14, 0x31, 0x14, 0x70, 0x4a, 0x5f, 0xa4, 0x54, 0xf2,
-	0x22, 0x6a, 0xf8, 0x4e, 0xb1, 0x48, 0xe2, 0xa8, 0xc0, 0x78, 0xcc, 0xb3, 0x81, 0xb8, 0x28, 0x22,
-	0xe4, 0x33, 0x5a, 0x24, 0x71, 0xd4, 0xfb, 0x3f, 0x40, 0x77, 0xe6, 0x5f, 0x85, 0xef, 0xa0, 0xf0,
-	0x8c, 0x5d, 0xda, 0x80, 0xc0, 0x11, 0xdf, 0x43, 0x4b, 0xe7, 0x34, 0x9d, 0x30, 0x1d, 0x8a, 0x06,
-	0x31, 0xc0, 0x07, 0x95, 0xf7, 0x83, 0xf8, 0xf7, 0x61, 0x19, 0x27, 0xf0, 0xf4, 0x21, 0x93, 0x63,
-	0x9e, 0xd1, 0x54, 0x0b, 0xd7, 0x49, 0x09, 0xe3, 0xaf, 0xa2, 0xe6, 0x8e, 0xc8, 0x0a, 0x91, 0xb2,
-	0x3e, 0xff, 0x09, 0xb3, 0x21, 0x6d, 0x98, 0x47, 0x6d, 0x8b, 0x17, 0xc4, 0xa7, 0xe2, 0x07, 0xa8,
-	0x7a, 0x54, 0x30, 0x39, 0x1b, 0x52, 0xc0, 0xd8, 0x98, 0x68, 0x2a, 0xc6, 0xa8, 0xda, 0x96, 0xc3,
-	0x22, 0xaa, 0xae, 0x87, 0x1b, 0x0d, 0xa2, 0xcf, 0xf0, 0xf4, 0x27, 0xd9, 0xb9, 0x8e, 0x66, 0x83,
-	0xc0, 0x11, 0x30, 0x3b, 0x17, 0x03, 0x1d, 0xb5, 0x06, 0x81, 0x23, 0xfe, 0x2e, 0xba, 0xb5, 0x43,
-	0x73, 0x7a, 0xc2, 0x53, 0xae, 0x38, 0x83, 0x38, 0xc1, 0x2d, 0x6f, 0x7b, 0xee, 0xf6, 0xc9, 0x64,
-	0x86, 0x19, 0x7f, 0x1d, 0x2d, 0x93, 0x94, 0x8f, 0xb9, 0x2a, 0xa2, 0xba, 0x8e, 0xef, 0x5d, 0x9b,
-	0x96, 0xdd, 0x7e, 0xe7, 0x47, 0x86, 0x62, 0x1f, 0xe9, 0xf8, 0xf0, 0x06, 0xba, 0xfd, 0x5c, 0x3c,
-	0x67, 0x17, 0x3d, 0xc9, 0xcf, 0x79, 0xca, 0x86, 0xcc, 0x04, 0xaf, 0x4e, 0xe6, 0xd1, 0xc0, 0xd9,
-	0xce, 0x73, 0x2a, 0xc7, 0x42, 0xf6, 0xa4, 0x38, 0xe5, 0x29, 0xd3, 0xd1, 0x6b, 0x90, 0x79, 0x34,
-	0x5e, 0x47, 0xcd, 0x6e, 0xf7, 0xa0, 0x9f, 0x08, 0xc9, 0xda, 0x83, 0x4f, 0xa3, 0xe6, 0x7a, 0xb0,
-	0x11, 0x12, 0x1f, 0x85, 0x63, 0x74, 0xab, 0xcf, 0x52, 0xb0, 0x66, 0x9f, 0x9e, 0xb0, 0x34, 0xba,
-	0xa5, 0x15, 0xcd, 0xe0, 0xe2, 0xc7, 0x28, 0xdc, 0x16, 0x2f, 0xf0, 0x1a, 0xaa, 0xed, 0x31, 0x3e,
-	0x1c, 0x29, 0x1d, 0xb5, 0x15, 0x62, 0x21, 0x88, 0xfa, 0x31, 0x1f, 0xa8, 0x91, 0x8e, 0xd6, 0x0a,
-	0x31, 0x40, 0x9c, 0x99, 0xe0, 0x80, 0x63, 0x8f, 0x3a, 0xbb, 0x56, 0x04, 0x8e, 0x80, 0x79, 0xd6,
-	0xd9, 0xb5, 0xdc, 0x70, 0xc4, 0x5f, 0x44, 0xab, 0xed, 0xc1, 0x80, 0x43, 0x6e, 0xd1, 0xf4, 0x19,
-	0x1f, 0x14, 0x51, 0xb8, 0x1e, 0x6e, 0xac, 0x90, 0x39, 0x2c, 0x64, 0x0e, 0xe8, 0xf4, 0x6b, 0xd4,
-	0xc1, 0xf1, 0xaf, 0x03, 0x74, 0x77, 0x21, 0x2a, 0x20, 0xb1, 0x2d, 0x26, 0xd9, 0x80, 0x67, 0xc3,
-	0x28, 0xd0, 0xd1, 0x2e, 0x61, 0xfc, 0x0e, 0x6a, 0x3c, 0x39, 0x3d, 0x65, 0x89, 0xe2, 0xe7, 0x90,
-	0x69, 0x40, 0x9c, 0x22, 0xc0, 0x75, 0x9d, 0x6c, 0xc4, 0x24, 0x57, 0xf4, 0x24, 0x65, 0xfa, 0x41,
-	0x0d, 0xe2, 0xa3, 0x40, 0xbe, 0x07, 0x79, 0xab, 0x14, 0x1b, 0xd8, 0xec, 0x9a, 0x22, 0xa0, 0x65,
-	0xb5, 0xc7, 0x27, 0x9c, 0x65, 0xca, 0xa6, 0x99, 0x03, 0xe3, 0x0e, 0x6a, 0x7a, 0x69, 0x00, 0xf9,
-	0x79, 0x78, 0x99, 0x33, 0x5b, 0x47, 0xfa, 0x0c, 0xb8, 0x3d, 0x2a, 0x07, 0xda, 0x47, 0x55, 0xa2,
-	0xcf, 0x80, 0xeb, 0x8b, 0x53, 0xd3, 0xc0, 0xaa, 0x44, 0x9f, 0x63, 0x81, 0x96, 0x74, 0xdf, 0x81,
-	0xd7, 0x0e, 0x58, 0xa1, 0x78, 0xa6, 0x0b, 0xd4, 0xea, 0xf2, 0x51, 0x10, 0xbd, 0x42, 0x4c, 0x64,
-	0xe2, 0x8a, 0xd3, 0x42, 0xa0, 0x56, 0xc1, 0xf5, 0xa1, 0xb9, 0x1e, 0xce, 0xf0, 0x76, 0x91, 0x9b,
-	0xee, 0x64, 0xec, 0x72, 0x60, 0xfc, 0x2d, 0xd3, 0x45, 0x41, 0xaa, 0x47, 0xd5, 0xc8, 0x3d, 0x1a,
-	0xce, 0xe0, 0x6b, 0xc2, 0xe8, 0x40, 0x64, 0xe9, 0xa5, 0xbe, 0xa3, 0x4e, 0x4a, 0x38, 0xfe, 0x65,
-	0x60, 0xfb, 0x22, 0x7e, 0x88, 0xea, 0x3d, 0xc9, 0x0a, 0x45, 0xa5, 0xd2, 0x11, 0x29, 0x0b, 0x17,
-	0xc8, 0xb6, 0x26, 0x4a, 0x0e, 0xbc, 0x89, 0x1a, 0x3d, 0x51, 0x28, 0xc3, 0x5e, 0xb9, 0x81, 0x7d,
-	0xca, 0xa2, 0xb5, 0x6b, 0x40, 0xe4, 0x3a, 0x64, 0xd7, 0x6b, 0xb7, 0x1c, 0xf1, 0xc7, 0xa8, 0x0a,
-	0xf8, 0x6b, 0xad, 0x71, 0x6d, 0xa3, 0xb2, 0xd8, 0x36, 0xc2, 0x69, 0xdb, 0x88, 0xd0, 0xf2, 0x21,
-	0x1f, 0x33, 0x31, 0x51, 0x3a, 0x21, 0x43, 0xe2, 0xc0, 0xf8, 0xb7, 0x4b, 0xb6, 0x4f, 0xe3, 0xef,
-	0xa1, 0xe6, 0x51, 0x67, 0xf7, 0x80, 0xe6, 0x39, 0xcf, 0x86, 0x85, 0x35, 0xfa, 0x9e, 0xd7, 0x47,
-	0x4a, 0xa2, 0x7d, 0xa0, 0xcf, 0x0e, 0xd2, 0xcf, 0x3c, 0xe9, 0xca, 0x7f, 0x97, 0xf6, 0xd8, 0xf1,
-	0x16, 0xaa, 0xf5, 0x2f, 0x8b, 0x44, 0xa5, 0xd6, 0x1b, 0x7e, 0xfb, 0xda, 0x34, 0x14, 0x33, 0x62,
-	0x2c, 0x1b, 0x7e, 0x84, 0x1a, 0x84, 0x99, 0xd4, 0x28, 0xb4, 0x49, 0xb3, 0x97, 0x95, 0x34, 0x32,
-	0x65, 0x83, 0xe4, 0xdb, 0x19, 0x4a, 0x31, 0xc9, 0x0b, 0xed, 0xc5, 0x25, 0x93, 0x7c, 0x1e, 0x0a,
-	0x7f, 0x80, 0xd0, 0x73, 0x3a, 0x66, 0x45, 0x4e, 0x41, 0x6d, 0x6d, 0xc1, 0x86, 0x92, 0x68, 0x6d,
-	0xf0, 0xb8, 0xa1, 0x95, 0xee, 0xb2, 0x73, 0x9e, 0x30, 0x37, 0x2a, 0xef, 0x7a, 0x82, 0x86, 0xe2,
-	0x5a, 0xa9, 0xe5, 0xc3, 0x0f, 0xd1, 0x72, 0x9f, 0x25, 0x89, 0x18, 0xe7, 0x76, 0x48, 0x62, 0x4f,
-	0xc4, 0x52, 0x88, 0x63, 0xc1, 0x0f, 0xd1, 0x5d, 0xc8, 0xe9, 0xd3, 0xa2, 0x27, 0x45, 0x4e, 0x87,
-	0xa6, 0x82, 0x1a, 0xda, 0x88, 0x45, 0x02, 0x18, 0x7b, 0x40, 0x8b, 0x33, 0x36, 0x00, 0xc3, 0x60,
-	0x6c, 0xea, 0xbe, 0xe0, 0xa1, 0xf0, 0x03, 0xb4, 0xe2, 0xf2, 0xde, 0xf0, 0x34, 0x35, 0xcf, 0x2c,
-	0x12, 0xb7, 0x10, 0xd2, 0xa5, 0xeb, 0xb7, 0x5d, 0x0f, 0x83, 0xb7, 0x50, 0xbd, 0x93, 0x29, 0x96,
-	0x92, 0x81, 0x8a, 0x56, 0xb4, 0x11, 0x6f, 0xfa, 0x41, 0xb7, 0x24, 0x52, 0x32, 0xdd, 0xff, 0x0e,
-	0x6a, 0x7a, 0x01, 0x7d, 0xad, 0xe9, 0xfc, 0x6e, 0xb9, 0x06, 0x00, 0xd3, 0x60, 0x32, 0x1e, 0x3b,
-	0x41, 0x03, 0x00, 0x83, 0x5b, 0x19, 0xae, 0x67, 0xf8, 0x04, 0xad, 0xce, 0x26, 0xa3, 0x9e, 0x16,
-	0xa2, 0x50, 0x65, 0xeb, 0xb7, 0x90, 0x4e, 0x16, 0xb7, 0x30, 0x96, 0x53, 0xc0, 0x47, 0xe9, 0x46,
-	0x07, 0xc3, 0x3f, 0xd4, 0x24, 0x7d, 0x8e, 0xdf, 0xb7, 0xfa, 0xcb, 0xbc, 0xb8, 0xa9, 0x6d, 0xea,
-	0x0c, 0xac, 0x4c, 0xeb, 0x38, 0xfe, 0x55, 0x80, 0x9a, 0x5e, 0xaa, 0xdc, 0x54, 0xeb, 0x5a, 0x57,
-	0xc5, 0xd3, 0x75, 0x0f, 0x2d, 0x1d, 0xd0, 0x4f, 0x85, 0xd9, 0x2e, 0x42, 0x62, 0x00, 0x8d, 0xe5,
-	0x99, 0x90, 0xb6, 0xda, 0x0d, 0x00, 0x9d, 0xef, 0x29, 0x4f, 0xd9, 0x81, 0x18, 0x30, 0x9d, 0xfd,
-	0x2b, 0xa4, 0x84, 0xdd, 0xfc, 0xab, 0x2d, 0xcc, 0xbf, 0xe5, 0x72, 0xfe, 0xc5, 0x7f, 0xaf, 0x58,
-	0xf3, 0xa6, 0x35, 0xf5, 0xed, 0x69, 0xd6, 0x07, 0x0b, 0x95, 0x6b, 0x28, 0xa6, 0xc0, 0xe6, 0x73,
-	0x1f, 0x76, 0x55, 0x36, 0x16, 0xf2, 0xd2, 0x2e, 0x4f, 0x7e, 0xb5, 0x18, 0x02, 0xb1, 0x0c, 0x78,
-	0x1d, 0x85, 0x3b, 0xbd, 0x23, 0xbb, 0x3e, 0xad, 0xfa, 0x8b, 0x4d, 0xef, 0x88, 0x00, 0x09, 0x7f,
-	0x01, 0x55, 0x7b, 0x30, 0x8e, 0x4d, 0x23, 0xb8, 0xed, 0xb1, 0x00, 0x9a, 0x68, 0x22, 0x54, 0xdb,
-	0x76, 0x2a, 0x92, 0xb3, 0x4e, 0x57, 0x1b, 0x3f, 0x5b, 0x6d, 0x96, 0x42, 0x1c, 0x0b, 0x7e, 0x8a,
-	0x56, 0xf7, 0x26, 0x43, 0x96, 0xd3, 0x21, 0xdb, 0x37, 0x0b, 0x92, 0x69, 0x07, 0x91, 0x27, 0x34,
-	0xc3, 0x60, 0x0d, 0x9c, 0x93, 0x82, 0x5b, 0x9f, 0x33, 0x75, 0x21, 0xe4, 0x99, 0xdd, 0xcc, 0xfc,
-	0x5b, 0x2d, 0x85, 0x38, 0x96, 0xf8, 0xaf, 0x2e, 0x0b, 0xac, 0xe9, 0xf7, 0xa0, 0x39, 0x8f, 0xb9,
-	0x59, 0x65, 0x42, 0x62, 0x00, 0xc8, 0x4d, 0xc2, 0x0a, 0x26, 0xcf, 0x4d, 0x0f, 0xa8, 0x98, 0x75,
-	0xc9, 0x43, 0xe9, 0xdc, 0xbc, 0xa0, 0xb9, 0x4d, 0x0a, 0x7d, 0x86, 0x4c, 0xff, 0x90, 0xc9, 0x8c,
-	0xa5, 0x36, 0x29, 0x2c, 0x04, 0xfb, 0x81, 0x39, 0x1d, 0xee, 0xf4, 0xb4, 0x67, 0x42, 0x32, 0x45,
-	0x40, 0xfd, 0x83, 0x74, 0xce, 0x33, 0xf8, 0x76, 0xa9, 0xe9, 0xa1, 0xee, 0x61, 0xf0, 0x57, 0xd0,
-	0x9d, 0x5d, 0x5e, 0xc0, 0xa2, 0xd1, 0xed, 0x1e, 0x7c, 0xc8, 0xd3, 0x94, 0x49, 0x6d, 0x68, 0x9d,
-	0x2c, 0xe0, 0xe3, 0x3f, 0x05, 0xa8, 0xee, 0x02, 0x07, 0xcf, 0xe9, 0x8f, 0xa8, 0xd4, 0x89, 0x03,
-	0x4a, 0x2d, 0x04, 0x26, 0xff, 0x70, 0x22, 0x14, 0xb5, 0x66, 0x19, 0x00, 0xb8, 0x7b, 0x4c, 0x72,
-	0x31, 0xb0, 0x7b, 0x85, 0x85, 0x60, 0xc7, 0x24, 0x8c, 0xa6, 0x8a, 0x8f, 0x19, 0x99, 0x64, 0xf0,
-	0x63, 0xad, 0x9b, 0x47, 0xc3, 0xf2, 0xe6, 0x50, 0x56, 0xd3, 0x92, 0xd6, 0x34, 0x87, 0x05, 0xd7,
-	0xed, 0xe4, 0x93, 0xc2, 0xae, 0xd8, 0xfa, 0x0c, 0xb8, 0x03, 0x36, 0x36, 0xbb, 0x75, 0x83, 0xe8,
-	0x73, 0x7c, 0x61, 0xf7, 0xb8, 0x63, 0xbd, 0x5d, 0xda, 0xaa, 0x2d, 0xab, 0x31, 0xb8, 0xb6, 0x1a,
-	0x2b, 0x7e, 0x35, 0xae, 0xa1, 0x9a, 0x91, 0xb5, 0x1d, 0xc4, 0x42, 0xe0, 0xf1, 0x7d, 0x46, 0x4f,
-	0x2d, 0xad, 0xaa, 0x69, 0x1e, 0x26, 0x3e, 0x42, 0x6f, 0xea, 0x8b, 0x0f, 0x47, 0x52, 0x28, 0x95,
-	0xb2, 0xff, 0xe1, 0x6a, 0x8c, 0xaa, 0x84, 0x2a, 0xe6, 0x76, 0x34, 0x38, 0xc7, 0xff, 0x0c, 0xd1,
-	0x2d, 0xbf, 0x14, 0xbc, 0xf7, 0x05, 0xff, 0xe1, 0x7d, 0x95, 0xf9, 0xf7, 0xe1, 0x36, 0xba, 0xe5,
-	0xfb, 0xe4, 0x9a, 0x89, 0xee, 0x93, 0x6d, 0xd9, 0xcc, 0x88, 0xe0, 0x23, 0xf4, 0x96, 0xb3, 0x0e,
-	0xa6, 0xd1, 0x76, 0x5e, 0x58, 0x5d, 0x55, 0xad, 0xeb, 0x73, 0x9e, 0xae, 0x59, 0x2f, 0x58, 0x6d,
-	0xd7, 0x4b, 0xe3, 0x63, 0xb4, 0xe6, 0x08, 0xc7, 0x92, 0x2b, 0x36, 0xd5, 0xbb, 0xf4, 0xd9, 0xf4,
-	0xde, 0x20, 0xee, 0x2b, 0x86, 0x1b, 0x3b, 0xdd, 0x5e, 0xdf, 0x2a, 0xae, 0xbd, 0xa6, 0xe2, 0x59,
-	0x71, 0xfc, 0x63, 0xf4, 0xf6, 0xcc, 0x95, 0x9e, 0xe6, 0xe5, 0xcf, 0xa6, 0xf9, 0x26, 0xf9, 0xf8,
-	0x3d, 0xd4, 0x28, 0x3b, 0xe4, 0xf5, 0x7d, 0x26, 0xfe, 0x99, 0xfb, 0x56, 0xf1, 0x1b, 0x39, 0xf0,
-	0xb6, 0xd3, 0x54, 0x5c, 0xd8, 0x8f, 0x62, 0x03, 0xfc, 0xdf, 0xb3, 0x69, 0x0d, 0xd5, 0xda, 0x89,
-	0xfe, 0x7f, 0xc4, 0xec, 0x65, 0x16, 0x8a, 0x53, 0x9b, 0x95, 0xb6, 0x43, 0xc2, 0x26, 0xbb, 0x93,
-	0xd2, 0xa2, 0x28, 0x07, 0xb6, 0x03, 0xf1, 0x36, 0x42, 0x3d, 0xc9, 0x85, 0x34, 0x9f, 0xc1, 0x66,
-	0x01, 0x7d, 0x67, 0x6e, 0x17, 0x91, 0xa7, 0x34, 0x61, 0x96, 0xeb, 0xd2, 0x2d, 0x71, 0x53, 0xa9,
-	0xf8, 0x29, 0xc2, 0x8b, 0x9d, 0x1d, 0xe6, 0x66, 0x8f, 0x0e, 0x59, 0x01, 0xd3, 0xde, 0xcc, 0xe3,
-	0x12, 0x9e, 0x7a, 0xce, 0x7c, 0x03, 0x59, 0xcf, 0xed, 0xa1, 0xb5, 0xeb, 0xef, 0x04, 0x3f, 0xc1,
-	0x72, 0xe0, 0xe6, 0x3a, 0x9c, 0xb5, 0x7e, 0x4b, 0xb7, 0xf5, 0x54, 0xc2, 0xf1, 0x2f, 0x02, 0xeb,
-	0x00, 0xb7, 0x06, 0x3e, 0x40, 0x2b, 0xbb, 0xec, 0x94, 0x4e, 0x52, 0xd5, 0x4e, 0xbc, 0x8f, 0xa8,
-	0x59, 0x24, 0x70, 0xb5, 0x65, 0x32, 0xe2, 0x8a, 0x25, 0x6a, 0x22, 0x99, 0xfb, 0x3e, 0x98, 0x45,
-	0xe2, 0x6f, 0xa0, 0x3a, 0xec, 0x62, 0x34, 0x4d, 0x0b, 0x5b, 0xa6, 0x33, 0x1b, 0xa8, 0x21, 0xb9,
-	0xcf, 0x11, 0xc7, 0x19, 0x73, 0x74, 0xdb, 0x7f, 0x51, 0x5b, 0x0e, 0xc1, 0x0b, 0x9d, 0x6c, 0xc0,
-	0x5e, 0xd8, 0x5e, 0x6e, 0x00, 0xc0, 0x7e, 0x54, 0x6e, 0x72, 0x55, 0x62, 0x00, 0xb0, 0x56, 0x1f,
-	0x0e, 0x2f, 0x84, 0x6d, 0x40, 0x25, 0x8c, 0x57, 0x51, 0xa5, 0x9b, 0xdb, 0x6f, 0xe6, 0x4a, 0x37,
-	0x8f, 0xc7, 0xce, 0x78, 0x73, 0x37, 0x68, 0xd4, 0xab, 0x95, 0xfd, 0x48, 0x36, 0x80, 0xc9, 0x9d,
-	0x72, 0x14, 0xea, 0xdc, 0xd1, 0x4e, 0xd8, 0xb2, 0xdf, 0x46, 0xc6, 0xb4, 0xb7, 0x16, 0x97, 0xeb,
-	0xb6, 0x74, 0x5f, 0x23, 0x9a, 0x31, 0xfe, 0x26, 0x5a, 0x99, 0x59, 0x5b, 0xc1, 0x8d, 0xfb, 0x8f,
-	0x77, 0x68, 0x32, 0x62, 0xfd, 0x64, 0xc4, 0xc6, 0xd4, 0x39, 0x7b, 0x06, 0xb9, 0xfd, 0xf3, 0xe0,
-	0xe5, 0xab, 0xd6, 0x1b, 0x7f, 0x79, 0xd5, 0x7a, 0xe3, 0x5f, 0xaf, 0x5a, 0xc1, 0x4f, 0xaf, 0x5a,
-	0xc1, 0x6f, 0xae, 0x5a, 0xc1, 0xef, 0xae, 0x5a, 0xc1, 0x1f, 0xae, 0x5a, 0xc1, 0xcb, 0xab, 0x56,
-	0xf0, 0xe7, 0xab, 0x56, 0xf0, 0x8f, 0xab, 0x56, 0xf0, 0xf1, 0x27, 0xaf, 0xf9, 0x2f, 0xa5, 0x34,
-	0xd3, 0x6b, 0xeb, 0x9c, 0x4b, 0xe5, 0x91, 0xf2, 0xb3, 0xe1, 0xc2, 0x1f, 0x98, 0x60, 0xdd, 0x49,
-	0x4d, 0xc3, 0x8f, 0xff, 0x1d, 0x00, 0x00, 0xff, 0xff, 0xc0, 0xbe, 0x25, 0xf5, 0x0e, 0x15, 0x00,
-	0x00,
+	// 2282 bytes of a gzipped FileDescriptorProto
+	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xa4, 0x58, 0xcd, 0x73, 0x23, 0x47,
+	0xd9, 0xdf, 0xd1, 0x8c, 0xa4, 0x51, 0xcb, 0x1f, 0xbb, 0x9d, 0xc4, 0xd1, 0xbb, 0x6f, 0x4a, 0x71,
+	0x86, 0x14, 0x18, 0x58, 0xec, 0x62, 0xc3, 0x47, 0x08, 0x1f, 0x55, 0xb2, 0xbd, 0x1b, 0xab, 0xb2,
+	0x5e, 0x8b, 0x96, 0x9d, 0x85, 0x1c, 0x52, 0xd5, 0x9e, 0x69, 0x49, 0x13, 0x8f, 0xa6, 0x87, 0xee,
+	0x96, 0xb5, 0xce, 0x09, 0x6e, 0xdc, 0x39, 0x70, 0xe6, 0xc2, 0xc7, 0x7f, 0x40, 0x71, 0xe2, 0xc6,
+	0x16, 0x27, 0x8e, 0x54, 0x51, 0x05, 0xac, 0xef, 0xdc, 0x39, 0x52, 0x4f, 0x77, 0xcf, 0xa8, 0x65,
+	0x7b, 0x21, 0x0b, 0x27, 0xcd, 0xf3, 0x7b, 0x9e, 0x7e, 0xba, 0xfb, 0xf9, 0x6e, 0xa1, 0xa3, 0x71,
+	0xaa, 0x26, 0xb3, 0xd3, 0xed, 0x98, 0x4f, 0x77, 0xce, 0xa8, 0xa2, 0x5f, 0x89, 0x79, 0xae, 0x68,
+	0x9a, 0x33, 0x21, 0xaf, 0xd1, 0x52, 0xc4, 0x3b, 0x74, 0xcc, 0x72, 0xb5, 0x53, 0x08, 0xae, 0x78,
+	0xcc, 0x33, 0x69, 0xbe, 0xe4, 0x0e, 0x8f, 0xd3, 0x6d, 0xfd, 0x89, 0x83, 0xb1, 0x28, 0xe2, 0xbb,
+	0xd1, 0x98, 0x8f, 0xb9, 0x61, 0x9e, 0xce, 0x46, 0x3b, 0x40, 0x69, 0x42, 0x7f, 0x19, 0xc9, 0xe8,
+	0x0f, 0x3e, 0x0a, 0x86, 0x05, 0x8b, 0x71, 0x07, 0x35, 0x3f, 0x64, 0x42, 0xa6, 0x3c, 0xef, 0x78,
+	0x9b, 0xde, 0x56, 0x8b, 0x34, 0xcf, 0x0d, 0x89, 0xbf, 0x80, 0x9a, 0x03, 0xc1, 0x63, 0x26, 0x65,
+	0xa7, 0xb6, 0xe9, 0x6d, 0xb5, 0xef, 0xaf, 0x6e, 0x83, 0xfa, 0x6d, 0x0b, 0x92, 0x66, 0x61, 0x3e,
+	0x70, 0x17, 0x05, 0x84, 0x73, 0xd5, 0xf1, 0xb5, 0x14, 0x32, 0x52, 0x80, 0x90, 0x40, 0x70, 0xae,
+	0xf0, 0x5d, 0x14, 0x1e, 0x70, 0xa9, 0x72, 0x3a, 0x65, 0x9d, 0x40, 0xef, 0x11, 0x4e, 0x2c, 0x8d,
+	0xbf, 0x88, 0x1a, 0x87, 0x7c, 0x96, 0x2b, 0xd9, 0xa9, 0x6f, 0xfa, 0x5b, 0xed, 0xfb, 0x6d, 0xb3,
+	0x5a, 0x63, 0xbb, 0xc1, 0xb3, 0xbf, 0xbe, 0x79, 0x8b, 0x34, 0xa6, 0x5a, 0x00, 0xbf, 0x85, 0xea,
+	0x07, 0x9c, 0x9f, 0xc9, 0x4e, 0x43, 0xef, 0x63, 0x25, 0x35, 0x44, 0xea, 0x13, 0xf8, 0xc1, 0xdf,
+	0x45, 0xed, 0x5e, 0x9e, 0x73, 0x45, 0x55, 0xca, 0x73, 0xd9, 0x69, 0x6a, 0x95, 0xff, 0x6f, 0x04,
+	0xe1, 0xb6, 0xdb, 0x0e, 0xf7, 0x41, 0xae, 0xc4, 0x05, 0x69, 0xd3, 0x05, 0x02, 0x3b, 0x3c, 0x4a,
+	0xf3, 0xd9, 0xd3, 0x4e, 0xe8, 0xee, 0xa0, 0x21, 0x52, 0xcf, 0xe0, 0x07, 0x8c, 0x32, 0xe4, 0x19,
+	0x15, 0xa9, 0xec, 0xb4, 0x5c, 0xa3, 0x58, 0x90, 0x34, 0xa5, 0xf9, 0x00, 0xc1, 0x27, 0x69, 0x9e,
+	0xf0, 0xb9, 0xec, 0x20, 0x57, 0xd0, 0x82, 0xa4, 0x39, 0x37, 0x1f, 0x77, 0xbf, 0x87, 0x6e, 0x5f,
+	0x3d, 0x15, 0xbe, 0x8d, 0xfc, 0x33, 0x76, 0x61, 0x1d, 0x02, 0x9f, 0xf8, 0x55, 0x54, 0x3f, 0xa7,
+	0xd9, 0x8c, 0x69, 0x57, 0xb4, 0x88, 0x21, 0xde, 0xab, 0xbd, 0xeb, 0x45, 0xbf, 0xf3, 0x2b, 0x3f,
+	0x81, 0xa5, 0x8f, 0x99, 0x98, 0xa6, 0x39, 0xcd, 0xf4, 0xe2, 0x90, 0x84, 0xca, 0xd2, 0xf8, 0xcb,
+	0xa8, 0xbd, 0xc7, 0x73, 0xc9, 0x33, 0x36, 0x4c, 0x3f, 0x65, 0xd6, 0xa5, 0x2d, 0x73, 0xa8, 0x5d,
+	0xfe, 0x94, 0xb4, 0xe3, 0x05, 0x17, 0xbf, 0x8d, 0x82, 0x13, 0xc9, 0xc4, 0xb2, 0x4b, 0x01, 0xb1,
+	0x3e, 0x09, 0x66, 0x92, 0x09, 0x8c, 0x51, 0xd0, 0x13, 0x63, 0xd9, 0x09, 0x36, 0xfd, 0xad, 0x16,
+	0x09, 0xa8, 0x18, 0x4b, 0x38, 0xfa, 0x83, 0xfc, 0x5c, 0x7b, 0xb3, 0x45, 0x7c, 0x96, 0x9f, 0x03,
+	0xb2, 0x37, 0x4f, 0xb4, 0xd7, 0x5a, 0xc4, 0x8f, 0xe7, 0x09, 0xfe, 0x36, 0x5a, 0xd9, 0xa3, 0x05,
+	0x3d, 0x4d, 0xb3, 0x54, 0xa5, 0x0c, 0xfc, 0x04, 0xbb, 0xbc, 0xee, 0x98, 0xdb, 0x65, 0x93, 0x95,
+	0xd8, 0xa1, 0xf0, 0x57, 0x51, 0x93, 0x64, 0xe9, 0x34, 0x55, 0xb2, 0x13, 0x6a, 0xff, 0xde, 0xb1,
+	0x61, 0x79, 0x34, 0xec, 0xff, 0xc0, 0x70, 0xec, 0x21, 0x9b, 0xc2, 0xc8, 0xe1, 0x2d, 0xb4, 0xfe,
+	0x98, 0x3f, 0x66, 0xf3, 0x81, 0x48, 0xcf, 0xd3, 0x8c, 0x8d, 0x99, 0x71, 0x5e, 0x48, 0xd6, 0xf3,
+	0x65, 0x18, 0x24, 0x7b, 0x45, 0x41, 0xc5, 0x94, 0x8b, 0x81, 0xe0, 0xa3, 0x34, 0x63, 0xda, 0x7b,
+	0x2d, 0xb2, 0x4e, 0x97, 0x61, 0xbc, 0x89, 0xda, 0x47, 0x47, 0x87, 0xc3, 0x98, 0x0b, 0xd6, 0x4b,
+	0x3e, 0xe9, 0xb4, 0x37, 0xbd, 0x2d, 0x9f, 0xb4, 0xf9, 0x02, 0xc2, 0x11, 0x5a, 0x19, 0x32, 0x1d,
+	0x35, 0x8f, 0xe8, 0x29, 0xcb, 0x3a, 0x2b, 0x5a, 0xd1, 0x8a, 0x74, 0xb0, 0xe8, 0x1d, 0xe4, 0xef,
+	0xf2, 0xa7, 0x78, 0x03, 0x35, 0x0e, 0x58, 0x3a, 0x9e, 0x28, 0xed, 0xb5, 0x55, 0xd2, 0x98, 0x68,
+	0x0a, 0xbc, 0xfe, 0x24, 0x4d, 0xd4, 0x44, 0x7b, 0x6b, 0x95, 0xd4, 0xe7, 0x40, 0x44, 0xb9, 0x71,
+	0x0e, 0x18, 0xf6, 0xa4, 0xbf, 0x6f, 0x97, 0xf8, 0xb3, 0xfe, 0x3e, 0x20, 0xef, 0xf7, 0xf7, 0xad,
+	0xb4, 0x3f, 0xee, 0xef, 0xe3, 0xcf, 0xa3, 0xb5, 0x5e, 0x92, 0xa4, 0x10, 0x5b, 0x34, 0x7b, 0x3f,
+	0x4d, 0x64, 0xc7, 0xdf, 0xf4, 0xb7, 0x56, 0xc9, 0x1a, 0x5d, 0x42, 0x21, 0x72, 0x40, 0xa7, 0x9b,
+	0xa3, 0x33, 0x4b, 0x47, 0xbf, 0xf2, 0xd0, 0x9d, 0x6b, 0x5e, 0x81, 0x15, 0xbb, 0x7c, 0x96, 0x27,
+	0x69, 0x3e, 0xee, 0x78, 0xda, 0xdb, 0xe1, 0xa9, 0xa5, 0xf1, 0x1b, 0xa8, 0xf5, 0x60, 0x34, 0x62,
+	0xb1, 0x4a, 0xcf, 0x21, 0xd2, 0x80, 0xd9, 0x62, 0x25, 0x00, 0xa6, 0xeb, 0xe7, 0x13, 0x26, 0x52,
+	0x45, 0x4f, 0x33, 0xa6, 0x0f, 0xd4, 0x22, 0xed, 0x74, 0x01, 0xc1, 0xfa, 0x01, 0xc4, 0xad, 0x52,
+	0x2c, 0xb1, 0xd1, 0xd5, 0x2a, 0x4a, 0x00, 0x4a, 0x56, 0x6f, 0x7a, 0x9a, 0xb2, 0x5c, 0xd9, 0x30,
+	0x6b, 0x52, 0x43, 0x46, 0x7d, 0xd4, 0x76, 0xc2, 0x00, 0xe2, 0xf3, 0xf8, 0xa2, 0x60, 0x36, 0x8f,
+	0x02, 0x75, 0x51, 0x30, 0xc0, 0x0e, 0xa8, 0x48, 0xb4, 0x8d, 0x02, 0x12, 0x4c, 0xa8, 0x48, 0x00,
+	0x1b, 0xf2, 0x91, 0x29, 0x60, 0x01, 0x09, 0x24, 0x1f, 0xa9, 0x88, 0xa3, 0xba, 0x2e, 0x42, 0x70,
+	0xda, 0x84, 0x49, 0x95, 0xe6, 0x3a, 0x41, 0xad, 0x2e, 0x17, 0x02, 0xef, 0x49, 0x3e, 0x13, 0x71,
+	0x99, 0x9c, 0x96, 0x02, 0xb5, 0xb0, 0xa5, 0x56, 0x5b, 0x6e, 0xdf, 0x41, 0x4d, 0x5e, 0x98, 0xea,
+	0x64, 0xee, 0x55, 0x92, 0xd1, 0x37, 0x4c, 0x15, 0x85, 0x55, 0x03, 0xaa, 0x26, 0xe5, 0xa1, 0x0b,
+	0xaa, 0x26, 0x60, 0x6b, 0xc2, 0x68, 0xc2, 0xf3, 0xec, 0x42, 0xef, 0x11, 0x92, 0x50, 0x58, 0x3a,
+	0xfa, 0x99, 0x67, 0xeb, 0x22, 0xbe, 0x87, 0xc2, 0x81, 0x60, 0x52, 0x51, 0xa1, 0xb4, 0x47, 0xaa,
+	0xc4, 0x05, 0xb6, 0xcd, 0x89, 0xb0, 0xb0, 0x12, 0x78, 0x1b, 0xb5, 0x06, 0x5c, 0x2a, 0x23, 0x5e,
+	0x7b, 0x81, 0x78, 0xab, 0x28, 0x45, 0xb4, 0x76, 0x4d, 0xf0, 0x42, 0xbb, 0xec, 0x66, 0xed, 0x56,
+	0x22, 0xfa, 0x08, 0x05, 0x80, 0xdf, 0x78, 0x9b, 0xb2, 0x6c, 0xd4, 0xae, 0x97, 0x0d, 0x7f, 0x51,
+	0x36, 0x3a, 0xa8, 0x79, 0x9c, 0x4e, 0x19, 0x9f, 0x29, 0x1d, 0x90, 0x3e, 0x69, 0x2a, 0x43, 0x46,
+	0xbf, 0xa9, 0xdb, 0x3a, 0x8d, 0xbf, 0x83, 0xda, 0x27, 0xfd, 0xfd, 0x43, 0x5a, 0x14, 0x69, 0x3e,
+	0x96, 0xf6, 0xd2, 0xaf, 0x3a, 0x75, 0xa4, 0x62, 0xda, 0x03, 0xb6, 0x67, 0x0b, 0x71, 0x58, 0xfd,
+	0xbe, 0xb3, 0xba, 0xf6, 0x9f, 0x57, 0x8f, 0x9d, 0xd5, 0x3b, 0xa8, 0x31, 0xbc, 0x90, 0xb1, 0xca,
+	0xac, 0x35, 0xdc, 0xf2, 0xb5, 0x6d, 0x38, 0xa6, 0xc5, 0x34, 0xa4, 0x26, 0xf0, 0x7d, 0xd4, 0x22,
+	0xcc, 0x84, 0x86, 0xd4, 0x57, 0x5a, 0xde, 0xac, 0xe2, 0x91, 0x96, 0x28, 0x3f, 0x21, 0xf8, 0xf6,
+	0xc6, 0x82, 0xcf, 0x0a, 0xa9, 0xad, 0x58, 0x37, 0xc1, 0x17, 0x2f, 0x20, 0xfc, 0x1e, 0x42, 0x8f,
+	0xe9, 0x94, 0xc9, 0x82, 0x82, 0xda, 0xc6, 0xb5, 0x3b, 0x54, 0x4c, 0x7b, 0x07, 0x94, 0x57, 0xd2,
+	0x50, 0x4a, 0xf7, 0xd9, 0x79, 0x1a, 0xb3, 0xb2, 0x55, 0xde, 0x71, 0x16, 0x1a, 0x4e, 0x59, 0x4a,
+	0x13, 0x23, 0x87, 0xef, 0xa1, 0xe6, 0x90, 0xc5, 0x31, 0x9f, 0x16, 0xb6, 0x49, 0x62, 0x67, 0x89,
+	0xe5, 0x90, 0xa6, 0x34, 0x1f, 0xf8, 0x1e, 0xba, 0x03, 0x31, 0x3d, 0x92, 0x03, 0xc1, 0x0b, 0x3a,
+	0x36, 0x19, 0xd4, 0xd2, 0x97, 0xb8, 0x23, 0xae, 0x32, 0xe0, 0xb2, 0x87, 0x54, 0x9e, 0xb1, 0x04,
+	0x2e, 0x06, 0x6d, 0x53, 0xd7, 0x85, 0xe9, 0x02, 0xc2, 0x6f, 0xa3, 0xd5, 0x32, 0x0f, 0x8c, 0x4c,
+	0x5b, 0xcb, 0xac, 0x0a, 0x17, 0xc4, 0x5d, 0x84, 0x74, 0xea, 0xba, 0x65, 0x17, 0x4d, 0x2b, 0x04,
+	0xef, 0xa0, 0xb0, 0x9f, 0x2b, 0x96, 0x91, 0x44, 0x75, 0x56, 0xf5, 0x25, 0x5e, 0x71, 0x9d, 0x6e,
+	0x59, 0x24, 0x4c, 0xed, 0xd7, 0xdd, 0x6f, 0xa1, 0xb6, 0xe3, 0xd0, 0x97, 0xea, 0xce, 0x6f, 0x56,
+	0x63, 0x00, 0x08, 0x25, 0xb3, 0xe9, 0xb4, 0x5c, 0x68, 0x08, 0x10, 0xb0, 0xb3, 0xc3, 0x0b, 0x04,
+	0x3e, 0x46, 0x6b, 0xcb, 0xc1, 0xa8, 0xbb, 0x05, 0x97, 0xaa, 0x2a, 0xfd, 0x8d, 0x89, 0xa6, 0x74,
+	0xb0, 0x94, 0x03, 0x63, 0xd5, 0x05, 0xda, 0xf1, 0x02, 0xd2, 0x85, 0x0e, 0x9a, 0xbf, 0xaf, 0x59,
+	0x81, 0x4c, 0x3f, 0x65, 0xd1, 0xbb, 0x56, 0x7f, 0x15, 0x28, 0x2f, 0x2a, 0x9b, 0x3a, 0x02, 0x6b,
+	0x8b, 0x3c, 0x8e, 0x7e, 0xe1, 0xa1, 0xb6, 0x13, 0x2a, 0x2f, 0xca, 0x75, 0xad, 0xab, 0xe6, 0xe8,
+	0x7a, 0x15, 0xd5, 0x0f, 0xe9, 0x27, 0xdc, 0x4c, 0x17, 0x3e, 0xa9, 0x4f, 0x81, 0xd0, 0x68, 0x9a,
+	0x73, 0x61, 0xb3, 0xbd, 0x3e, 0x05, 0x02, 0x2a, 0xdf, 0xc3, 0x34, 0x63, 0x87, 0x3c, 0x61, 0x3a,
+	0xfa, 0x57, 0x49, 0x38, 0xb2, 0x74, 0xd9, 0xff, 0x1a, 0xd7, 0xfa, 0x5f, 0xb3, 0xea, 0x7f, 0xd1,
+	0xdf, 0x6a, 0xf6, 0x7a, 0x55, 0x7a, 0xe1, 0x6f, 0x2e, 0xa2, 0xde, 0xbb, 0x96, 0xb9, 0x86, 0x63,
+	0x72, 0xee, 0x6a, 0xec, 0xc3, 0xac, 0xca, 0xa6, 0x5c, 0x5c, 0xd8, 0xe1, 0xc9, 0xcd, 0x16, 0xc3,
+	0x20, 0x8d, 0xa9, 0xfe, 0xc5, 0x9b, 0xc8, 0xdf, 0x1b, 0x9c, 0xd8, 0xf1, 0x69, 0xcd, 0x1d, 0x6c,
+	0x06, 0x27, 0xc4, 0x8f, 0x07, 0x27, 0xf8, 0x73, 0x28, 0x18, 0x40, 0x3b, 0x36, 0x85, 0x60, 0xdd,
+	0x11, 0x01, 0x98, 0x04, 0x05, 0x74, 0xe5, 0x7b, 0xa8, 0xb9, 0x9b, 0xf1, 0xf8, 0xac, 0x7f, 0xa4,
+	0x2f, 0xbf, 0x9c, 0x6d, 0x96, 0x43, 0x9a, 0xa7, 0xe6, 0x03, 0x3f, 0x44, 0x6b, 0x07, 0xb3, 0x31,
+	0x2b, 0xe8, 0x98, 0x3d, 0x32, 0x03, 0x92, 0x29, 0x07, 0x1d, 0x67, 0xd1, 0x92, 0x80, 0xbd, 0xe0,
+	0xda, 0x64, 0x69, 0x15, 0xec, 0xfa, 0x98, 0xa9, 0x39, 0x17, 0x67, 0x76, 0x32, 0x73, 0x77, 0xb5,
+	0x1c, 0xd2, 0xcc, 0xcd, 0x47, 0xf4, 0x97, 0x32, 0x0a, 0x8c, 0x09, 0xc0, 0x8f, 0x5a, 0x8f, 0x0e,
+	0x03, 0x1f, 0xe6, 0x66, 0x68, 0xc5, 0x9b, 0xa8, 0x4d, 0x98, 0x64, 0xe2, 0xdc, 0xd4, 0x80, 0x9a,
+	0x19, 0x97, 0xc4, 0x02, 0xd2, 0xb1, 0x39, 0xa7, 0x85, 0x0d, 0x8a, 0x40, 0xce, 0x69, 0x01, 0x91,
+	0xfe, 0x01, 0x13, 0x39, 0xcb, 0x6c, 0x50, 0x34, 0xce, 0x34, 0x05, 0xf3, 0x81, 0xc1, 0x8f, 0xf7,
+	0x06, 0xda, 0x32, 0x3e, 0x69, 0x9d, 0x95, 0x00, 0xe4, 0x3f, 0x68, 0x2a, 0xd2, 0x1c, 0xde, 0x2e,
+	0x0d, 0xdd, 0xd4, 0x91, 0xac, 0x10, 0xfc, 0x25, 0x74, 0x7b, 0x3f, 0x95, 0x30, 0x68, 0x1c, 0x1d,
+	0x1d, 0x7e, 0x90, 0x66, 0x19, 0x13, 0xfa, 0xa2, 0x21, 0xb9, 0x9d, 0x5c, 0xc1, 0xa3, 0x3f, 0x7a,
+	0x28, 0x2c, 0x1d, 0x07, 0xc7, 0x19, 0x4e, 0xa8, 0xd0, 0x81, 0x03, 0x4a, 0x1b, 0x52, 0x53, 0x70,
+	0xe5, 0xef, 0xcf, 0xb8, 0xa2, 0xf6, 0x5a, 0xf5, 0x1f, 0x01, 0x01, 0xd2, 0x03, 0x26, 0x52, 0x9e,
+	0xd8, 0xb9, 0xa2, 0x51, 0x68, 0x0a, 0x66, 0x4c, 0xc2, 0x68, 0x06, 0xdd, 0x8c, 0xcc, 0x72, 0xf8,
+	0xb1, 0xb7, 0x5b, 0x17, 0xcb, 0x30, 0x0c, 0x6f, 0xa5, 0xa4, 0xd5, 0x54, 0xd7, 0x9a, 0xd6, 0xc4,
+	0x12, 0x0a, 0xa6, 0xdb, 0x2b, 0x66, 0xd2, 0x8e, 0xd8, 0x41, 0x5c, 0xcc, 0x24, 0x60, 0x87, 0x6c,
+	0x6a, 0x66, 0xeb, 0x16, 0x09, 0xa6, 0x6c, 0x2a, 0xa3, 0xb9, 0x9d, 0xe3, 0x9e, 0xe8, 0xe9, 0xd2,
+	0x66, 0x6d, 0x95, 0x8d, 0xde, 0x8d, 0xd9, 0x58, 0x73, 0xb3, 0x71, 0x03, 0x35, 0xcc, 0x5a, 0x5b,
+	0x41, 0x1a, 0x73, 0x33, 0xa7, 0x76, 0x11, 0x7a, 0xc4, 0xe8, 0xc8, 0xf2, 0x02, 0xcd, 0x43, 0x59,
+	0x85, 0x44, 0x27, 0xe8, 0x15, 0xbd, 0xf1, 0xf1, 0x44, 0x70, 0xa5, 0x32, 0xf6, 0x5f, 0x6c, 0x8d,
+	0x51, 0x40, 0xa8, 0x62, 0xe5, 0x8c, 0x26, 0xa8, 0x62, 0xd1, 0x3f, 0x7c, 0xb4, 0xe2, 0xa6, 0x82,
+	0x73, 0x3e, 0xef, 0xdf, 0x9c, 0xaf, 0x76, 0xf5, 0x7c, 0xb8, 0x87, 0x56, 0x5c, 0x9b, 0xdc, 0xd0,
+	0xd1, 0x5d, 0xb6, 0x4d, 0x9b, 0x95, 0xb9, 0x6b, 0xc6, 0x13, 0xf4, 0x5a, 0x79, 0x3b, 0x68, 0x51,
+	0xbb, 0x85, 0xb4, 0xba, 0x02, 0xad, 0xeb, 0xff, 0x1c, 0x5d, 0xcb, 0x56, 0xb0, 0xda, 0x5e, 0x53,
+	0x37, 0xad, 0xc6, 0x4f, 0xd0, 0x46, 0x29, 0xfe, 0x44, 0xa4, 0x8a, 0x2d, 0xf4, 0xd6, 0x3f, 0x9b,
+	0xde, 0x0d, 0x75, 0xe3, 0x72, 0x57, 0x31, 0xec, 0xd8, 0x3f, 0x1a, 0x0c, 0xad, 0xe2, 0xc6, 0x4b,
+	0x2a, 0x5e, 0x5e, 0x8e, 0x7f, 0x88, 0x5e, 0x5f, 0x3a, 0xb1, 0xa3, 0xb9, 0xf9, 0xd9, 0x34, 0xbf,
+	0xae, 0x6e, 0x5e, 0x1f, 0xbd, 0x85, 0x5a, 0x55, 0x85, 0xbc, 0xb9, 0xce, 0x44, 0x3f, 0x29, 0xdf,
+	0x2a, 0x6e, 0x21, 0x07, 0xd9, 0x5e, 0x96, 0xf1, 0xb9, 0x7d, 0x14, 0xd7, 0x29, 0x10, 0xff, 0x73,
+	0x6f, 0xda, 0x40, 0x8d, 0x5e, 0xac, 0xff, 0x1f, 0x31, 0x73, 0x59, 0x83, 0x6a, 0x2a, 0xca, 0x6c,
+	0x54, 0xda, 0x52, 0x09, 0x93, 0xec, 0x5e, 0x46, 0xa5, 0xac, 0x1a, 0x76, 0x33, 0x36, 0x24, 0xde,
+	0x45, 0x68, 0x20, 0x52, 0x2e, 0xcc, 0x33, 0xd8, 0x0c, 0xa0, 0x6f, 0x5c, 0x99, 0x45, 0xc4, 0x88,
+	0xc6, 0xcc, 0x4a, 0x5d, 0x94, 0x43, 0x5c, 0x51, 0xad, 0x8a, 0x1e, 0x22, 0x7c, 0xbd, 0xb2, 0x43,
+	0xdf, 0x1c, 0xd0, 0x31, 0x83, 0x0e, 0x6f, 0xfb, 0x71, 0x58, 0x58, 0x7a, 0x61, 0x39, 0xf3, 0x06,
+	0xb2, 0x96, 0x3b, 0x40, 0x1b, 0x37, 0xef, 0x09, 0x76, 0x82, 0xe1, 0xa0, 0xec, 0xeb, 0xfa, 0x7f,
+	0x1b, 0xd0, 0x6f, 0xf9, 0x36, 0x9f, 0x42, 0x7b, 0xa6, 0x8b, 0xe8, 0x97, 0x9e, 0x35, 0x80, 0x9d,
+	0x07, 0x61, 0x6c, 0xdb, 0x67, 0x23, 0x3a, 0xcb, 0x54, 0x2f, 0x76, 0x1e, 0x51, 0xab, 0x89, 0x0b,
+	0x82, 0x54, 0x4f, 0xc4, 0x93, 0x54, 0xb1, 0x58, 0xcd, 0x04, 0x2b, 0xdf, 0x07, 0xab, 0xd4, 0x05,
+	0xe1, 0xf0, 0x0f, 0x33, 0x3a, 0x96, 0xf6, 0xa9, 0x50, 0x1f, 0x01, 0x81, 0xbf, 0x86, 0x42, 0x98,
+	0xd0, 0x68, 0x96, 0x49, 0x9b, 0x70, 0x4b, 0x73, 0xa9, 0x61, 0x95, 0x8f, 0x14, 0x69, 0x25, 0xa3,
+	0x14, 0xad, 0xbb, 0xe7, 0xec, 0x89, 0x31, 0xa8, 0xef, 0xe7, 0x09, 0x7b, 0x6a, 0x2b, 0x7c, 0x3d,
+	0x05, 0x02, 0xd0, 0x0f, 0xab, 0xf9, 0x2e, 0xb0, 0xf3, 0x1d, 0xd8, 0x40, 0xa3, 0xc7, 0x73, 0x6e,
+	0xcb, 0x52, 0x78, 0x6e, 0x69, 0xbc, 0x86, 0x6a, 0x47, 0x85, 0x7d, 0x49, 0xd7, 0x78, 0x11, 0xfd,
+	0xbc, 0xb2, 0x89, 0xd9, 0x1c, 0x54, 0xea, 0x89, 0xcb, 0xbe, 0x9d, 0xeb, 0x7a, 0x2c, 0x37, 0x21,
+	0x55, 0x75, 0x48, 0x1d, 0x52, 0xda, 0x36, 0x6f, 0xa0, 0x90, 0x09, 0x91, 0x73, 0xc1, 0x6c, 0xe9,
+	0x3d, 0xb8, 0x45, 0x2a, 0x04, 0xef, 0x38, 0xff, 0xc3, 0xb4, 0xef, 0xbf, 0x76, 0x7d, 0x22, 0xef,
+	0x89, 0xf2, 0x09, 0xa3, 0x5f, 0x5b, 0xbb, 0x08, 0x85, 0x0f, 0x60, 0x31, 0x61, 0x2a, 0xfa, 0x3a,
+	0x5a, 0x5d, 0x9a, 0x7b, 0xc1, 0x0f, 0x8f, 0xde, 0xd9, 0xa3, 0xf1, 0x84, 0x0d, 0xe3, 0x09, 0x9b,
+	0xd2, 0xd2, 0x5b, 0x99, 0x0b, 0xee, 0xfe, 0xd4, 0x7b, 0xf6, 0xbc, 0x7b, 0xeb, 0xcf, 0xcf, 0xbb,
+	0xb7, 0xfe, 0xf9, 0xbc, 0xeb, 0xfd, 0xf8, 0xb2, 0xeb, 0xfd, 0xfa, 0xb2, 0xeb, 0xfd, 0xf6, 0xb2,
+	0xeb, 0xfd, 0xfe, 0xb2, 0xeb, 0x3d, 0xbb, 0xec, 0x7a, 0x7f, 0xba, 0xec, 0x7a, 0x7f, 0xbf, 0xec,
+	0x7a, 0x1f, 0x7d, 0xfc, 0x92, 0x7f, 0x73, 0x0a, 0xd3, 0xfe, 0x76, 0xce, 0x53, 0xa1, 0x1c, 0x56,
+	0x71, 0x36, 0xbe, 0xf6, 0x0f, 0x28, 0xdc, 0xf4, 0xb4, 0xa1, 0xe9, 0x77, 0xfe, 0x15, 0x00, 0x00,
+	0xff, 0xff, 0x63, 0x45, 0x7b, 0x17, 0x4f, 0x15, 0x00, 0x00,
 }
 
 func (this *Spec) Equal(that interface{}) bool {
@@ -2849,6 +2899,14 @@ func (this *LinuxSeccomp) Equal(that interface{}) bool {
 			return false
 		}
 	}
+	if len(this.Flags) != len(that1.Flags) {
+		return false
+	}
+	for i := range this.Flags {
+		if this.Flags[i] != that1.Flags[i] {
+			return false
+		}
+	}
 	if len(this.Syscalls) != len(that1.Syscalls) {
 		return false
 	}
@@ -2928,6 +2986,15 @@ func (this *LinuxSyscall) Equal(that interface{}) bool {
 	if this.Action != that1.Action {
 		return false
 	}
+	if that1.ErrnoRet == nil {
+		if this.ErrnoRet != nil {
+			return false
+		}
+	} else if this.ErrnoRet == nil {
+		return false
+	} else if !this.ErrnoRet.Equal(that1.ErrnoRet) {
+		return false
+	}
 	if len(this.Args) != len(that1.Args) {
 		return false
 	}
@@ -2937,6 +3004,30 @@ func (this *LinuxSyscall) Equal(that interface{}) bool {
 		}
 	}
 	if !bytes.Equal(this.XXX_unrecognized, that1.XXX_unrecognized) {
+		return false
+	}
+	return true
+}
+func (this *LinuxSyscall_Errnoret) Equal(that interface{}) bool {
+	if that == nil {
+		return this == nil
+	}
+
+	that1, ok := that.(*LinuxSyscall_Errnoret)
+	if !ok {
+		that2, ok := that.(LinuxSyscall_Errnoret)
+		if ok {
+			that1 = &that2
+		} else {
+			return false
+		}
+	}
+	if that1 == nil {
+		return this == nil
+	} else if this == nil {
+		return false
+	}
+	if this.Errnoret != that1.Errnoret {
 		return false
 	}
 	return true
@@ -4785,6 +4876,15 @@ func (m *LinuxSeccomp) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 				i = encodeVarintOci(dAtA, i, uint64(size))
 			}
 			i--
+			dAtA[i] = 0x22
+		}
+	}
+	if len(m.Flags) > 0 {
+		for iNdEx := len(m.Flags) - 1; iNdEx >= 0; iNdEx-- {
+			i -= len(m.Flags[iNdEx])
+			copy(dAtA[i:], m.Flags[iNdEx])
+			i = encodeVarintOci(dAtA, i, uint64(len(m.Flags[iNdEx])))
+			i--
 			dAtA[i] = 0x1a
 		}
 	}
@@ -4891,7 +4991,16 @@ func (m *LinuxSyscall) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 				i = encodeVarintOci(dAtA, i, uint64(size))
 			}
 			i--
-			dAtA[i] = 0x1a
+			dAtA[i] = 0x22
+		}
+	}
+	if m.ErrnoRet != nil {
+		{
+			size := m.ErrnoRet.Size()
+			i -= size
+			if _, err := m.ErrnoRet.MarshalTo(dAtA[i:]); err != nil {
+				return 0, err
+			}
 		}
 	}
 	if len(m.Action) > 0 {
@@ -4913,6 +5022,18 @@ func (m *LinuxSyscall) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	return len(dAtA) - i, nil
 }
 
+func (m *LinuxSyscall_Errnoret) MarshalTo(dAtA []byte) (int, error) {
+	size := m.Size()
+	return m.MarshalToSizedBuffer(dAtA[:size])
+}
+
+func (m *LinuxSyscall_Errnoret) MarshalToSizedBuffer(dAtA []byte) (int, error) {
+	i := len(dAtA)
+	i = encodeVarintOci(dAtA, i, uint64(m.Errnoret))
+	i--
+	dAtA[i] = 0x18
+	return len(dAtA) - i, nil
+}
 func (m *LinuxIntelRdt) Marshal() (dAtA []byte, err error) {
 	size := m.Size()
 	dAtA = make([]byte, size)
@@ -5575,16 +5696,21 @@ func NewPopulatedLinuxSeccomp(r randyOci, easy bool) *LinuxSeccomp {
 	for i := 0; i < v51; i++ {
 		this.Architectures[i] = string(randStringOci(r))
 	}
+	v52 := r.Intn(10)
+	this.Flags = make([]string, v52)
+	for i := 0; i < v52; i++ {
+		this.Flags[i] = string(randStringOci(r))
+	}
 	if r.Intn(5) != 0 {
-		v52 := r.Intn(5)
-		this.Syscalls = make([]LinuxSyscall, v52)
-		for i := 0; i < v52; i++ {
-			v53 := NewPopulatedLinuxSyscall(r, easy)
-			this.Syscalls[i] = *v53
+		v53 := r.Intn(5)
+		this.Syscalls = make([]LinuxSyscall, v53)
+		for i := 0; i < v53; i++ {
+			v54 := NewPopulatedLinuxSyscall(r, easy)
+			this.Syscalls[i] = *v54
 		}
 	}
 	if !easy && r.Intn(10) != 0 {
-		this.XXX_unrecognized = randUnrecognizedOci(r, 4)
+		this.XXX_unrecognized = randUnrecognizedOci(r, 5)
 	}
 	return this
 }
@@ -5603,26 +5729,36 @@ func NewPopulatedLinuxSeccompArg(r randyOci, easy bool) *LinuxSeccompArg {
 
 func NewPopulatedLinuxSyscall(r randyOci, easy bool) *LinuxSyscall {
 	this := &LinuxSyscall{}
-	v54 := r.Intn(10)
-	this.Names = make([]string, v54)
-	for i := 0; i < v54; i++ {
+	v55 := r.Intn(10)
+	this.Names = make([]string, v55)
+	for i := 0; i < v55; i++ {
 		this.Names[i] = string(randStringOci(r))
 	}
 	this.Action = string(randStringOci(r))
+	oneofNumber_ErrnoRet := []int32{3}[r.Intn(1)]
+	switch oneofNumber_ErrnoRet {
+	case 3:
+		this.ErrnoRet = NewPopulatedLinuxSyscall_Errnoret(r, easy)
+	}
 	if r.Intn(5) != 0 {
-		v55 := r.Intn(5)
-		this.Args = make([]LinuxSeccompArg, v55)
-		for i := 0; i < v55; i++ {
-			v56 := NewPopulatedLinuxSeccompArg(r, easy)
-			this.Args[i] = *v56
+		v56 := r.Intn(5)
+		this.Args = make([]LinuxSeccompArg, v56)
+		for i := 0; i < v56; i++ {
+			v57 := NewPopulatedLinuxSeccompArg(r, easy)
+			this.Args[i] = *v57
 		}
 	}
 	if !easy && r.Intn(10) != 0 {
-		this.XXX_unrecognized = randUnrecognizedOci(r, 4)
+		this.XXX_unrecognized = randUnrecognizedOci(r, 5)
 	}
 	return this
 }
 
+func NewPopulatedLinuxSyscall_Errnoret(r randyOci, easy bool) *LinuxSyscall_Errnoret {
+	this := &LinuxSyscall_Errnoret{}
+	this.Errnoret = uint32(r.Uint32())
+	return this
+}
 func NewPopulatedLinuxIntelRdt(r randyOci, easy bool) *LinuxIntelRdt {
 	this := &LinuxIntelRdt{}
 	this.L3CacheSchema = string(randStringOci(r))
@@ -5651,9 +5787,9 @@ func randUTF8RuneOci(r randyOci) rune {
 	return rune(ru + 61)
 }
 func randStringOci(r randyOci) string {
-	v57 := r.Intn(100)
-	tmps := make([]rune, v57)
-	for i := 0; i < v57; i++ {
+	v58 := r.Intn(100)
+	tmps := make([]rune, v58)
+	for i := 0; i < v58; i++ {
 		tmps[i] = randUTF8RuneOci(r)
 	}
 	return string(tmps)
@@ -5675,11 +5811,11 @@ func randFieldOci(dAtA []byte, r randyOci, fieldNumber int, wire int) []byte {
 	switch wire {
 	case 0:
 		dAtA = encodeVarintPopulateOci(dAtA, uint64(key))
-		v58 := r.Int63()
+		v59 := r.Int63()
 		if r.Intn(2) == 0 {
-			v58 *= -1
+			v59 *= -1
 		}
-		dAtA = encodeVarintPopulateOci(dAtA, uint64(v58))
+		dAtA = encodeVarintPopulateOci(dAtA, uint64(v59))
 	case 1:
 		dAtA = encodeVarintPopulateOci(dAtA, uint64(key))
 		dAtA = append(dAtA, byte(r.Intn(256)), byte(r.Intn(256)), byte(r.Intn(256)), byte(r.Intn(256)), byte(r.Intn(256)), byte(r.Intn(256)), byte(r.Intn(256)), byte(r.Intn(256)))
@@ -6556,6 +6692,12 @@ func (m *LinuxSeccomp) Size() (n int) {
 			n += 1 + l + sovOci(uint64(l))
 		}
 	}
+	if len(m.Flags) > 0 {
+		for _, s := range m.Flags {
+			l = len(s)
+			n += 1 + l + sovOci(uint64(l))
+		}
+	}
 	if len(m.Syscalls) > 0 {
 		for _, e := range m.Syscalls {
 			l = e.Size()
@@ -6609,6 +6751,9 @@ func (m *LinuxSyscall) Size() (n int) {
 	if l > 0 {
 		n += 1 + l + sovOci(uint64(l))
 	}
+	if m.ErrnoRet != nil {
+		n += m.ErrnoRet.Size()
+	}
 	if len(m.Args) > 0 {
 		for _, e := range m.Args {
 			l = e.Size()
@@ -6621,6 +6766,15 @@ func (m *LinuxSyscall) Size() (n int) {
 	return n
 }
 
+func (m *LinuxSyscall_Errnoret) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	n += 1 + sovOci(uint64(m.Errnoret))
+	return n
+}
 func (m *LinuxIntelRdt) Size() (n int) {
 	if m == nil {
 		return 0
@@ -7153,6 +7307,7 @@ func (this *LinuxSeccomp) String() string {
 	s := strings.Join([]string{`&LinuxSeccomp{`,
 		`DefaultAction:` + fmt.Sprintf("%v", this.DefaultAction) + `,`,
 		`Architectures:` + fmt.Sprintf("%v", this.Architectures) + `,`,
+		`Flags:` + fmt.Sprintf("%v", this.Flags) + `,`,
 		`Syscalls:` + repeatedStringForSyscalls + `,`,
 		`XXX_unrecognized:` + fmt.Sprintf("%v", this.XXX_unrecognized) + `,`,
 		`}`,
@@ -7185,8 +7340,19 @@ func (this *LinuxSyscall) String() string {
 	s := strings.Join([]string{`&LinuxSyscall{`,
 		`Names:` + fmt.Sprintf("%v", this.Names) + `,`,
 		`Action:` + fmt.Sprintf("%v", this.Action) + `,`,
+		`ErrnoRet:` + fmt.Sprintf("%v", this.ErrnoRet) + `,`,
 		`Args:` + repeatedStringForArgs + `,`,
 		`XXX_unrecognized:` + fmt.Sprintf("%v", this.XXX_unrecognized) + `,`,
+		`}`,
+	}, "")
+	return s
+}
+func (this *LinuxSyscall_Errnoret) String() string {
+	if this == nil {
+		return "nil"
+	}
+	s := strings.Join([]string{`&LinuxSyscall_Errnoret{`,
+		`Errnoret:` + fmt.Sprintf("%v", this.Errnoret) + `,`,
 		`}`,
 	}, "")
 	return s
@@ -7561,7 +7727,7 @@ func (m *Spec) Unmarshal(dAtA []byte) error {
 					if err != nil {
 						return err
 					}
-					if skippy < 0 {
+					if (skippy < 0) || (iNdEx+skippy) < 0 {
 						return ErrInvalidLengthOci
 					}
 					if (iNdEx + skippy) > postIndex {
@@ -7686,10 +7852,7 @@ func (m *Spec) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
-				return ErrInvalidLengthOci
-			}
-			if (iNdEx + skippy) < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthOci
 			}
 			if (iNdEx + skippy) > l {
@@ -8098,10 +8261,7 @@ func (m *Process) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
-				return ErrInvalidLengthOci
-			}
-			if (iNdEx + skippy) < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthOci
 			}
 			if (iNdEx + skippy) > l {
@@ -8190,10 +8350,7 @@ func (m *Box) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
-				return ErrInvalidLengthOci
-			}
-			if (iNdEx + skippy) < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthOci
 			}
 			if (iNdEx + skippy) > l {
@@ -8390,10 +8547,7 @@ func (m *User) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
-				return ErrInvalidLengthOci
-			}
-			if (iNdEx + skippy) < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthOci
 			}
 			if (iNdEx + skippy) > l {
@@ -8604,10 +8758,7 @@ func (m *LinuxCapabilities) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
-				return ErrInvalidLengthOci
-			}
-			if (iNdEx + skippy) < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthOci
 			}
 			if (iNdEx + skippy) > l {
@@ -8728,10 +8879,7 @@ func (m *POSIXRlimit) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
-				return ErrInvalidLengthOci
-			}
-			if (iNdEx + skippy) < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthOci
 			}
 			if (iNdEx + skippy) > l {
@@ -8910,10 +9058,7 @@ func (m *Mount) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
-				return ErrInvalidLengthOci
-			}
-			if (iNdEx + skippy) < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthOci
 			}
 			if (iNdEx + skippy) > l {
@@ -9016,10 +9161,7 @@ func (m *Root) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
-				return ErrInvalidLengthOci
-			}
-			if (iNdEx + skippy) < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthOci
 			}
 			if (iNdEx + skippy) > l {
@@ -9172,10 +9314,7 @@ func (m *Hooks) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
-				return ErrInvalidLengthOci
-			}
-			if (iNdEx + skippy) < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthOci
 			}
 			if (iNdEx + skippy) > l {
@@ -9341,10 +9480,7 @@ func (m *Hook) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
-				return ErrInvalidLengthOci
-			}
-			if (iNdEx + skippy) < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthOci
 			}
 			if (iNdEx + skippy) > l {
@@ -9573,7 +9709,7 @@ func (m *Linux) Unmarshal(dAtA []byte) error {
 					if err != nil {
 						return err
 					}
-					if skippy < 0 {
+					if (skippy < 0) || (iNdEx+skippy) < 0 {
 						return ErrInvalidLengthOci
 					}
 					if (iNdEx + skippy) > postIndex {
@@ -9926,10 +10062,7 @@ func (m *Linux) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
-				return ErrInvalidLengthOci
-			}
-			if (iNdEx + skippy) < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthOci
 			}
 			if (iNdEx + skippy) > l {
@@ -10012,10 +10145,7 @@ func (m *Windows) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
-				return ErrInvalidLengthOci
-			}
-			if (iNdEx + skippy) < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthOci
 			}
 			if (iNdEx + skippy) > l {
@@ -10098,10 +10228,7 @@ func (m *Solaris) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
-				return ErrInvalidLengthOci
-			}
-			if (iNdEx + skippy) < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthOci
 			}
 			if (iNdEx + skippy) > l {
@@ -10209,10 +10336,7 @@ func (m *LinuxIDMapping) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
-				return ErrInvalidLengthOci
-			}
-			if (iNdEx + skippy) < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthOci
 			}
 			if (iNdEx + skippy) > l {
@@ -10327,10 +10451,7 @@ func (m *LinuxNamespace) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
-				return ErrInvalidLengthOci
-			}
-			if (iNdEx + skippy) < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthOci
 			}
 			if (iNdEx + skippy) > l {
@@ -10540,10 +10661,7 @@ func (m *LinuxDevice) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
-				return ErrInvalidLengthOci
-			}
-			if (iNdEx + skippy) < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthOci
 			}
 			if (iNdEx + skippy) > l {
@@ -10842,10 +10960,7 @@ func (m *LinuxResources) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
-				return ErrInvalidLengthOci
-			}
-			if (iNdEx + skippy) < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthOci
 			}
 			if (iNdEx + skippy) > l {
@@ -11030,10 +11145,7 @@ func (m *LinuxMemory) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
-				return ErrInvalidLengthOci
-			}
-			if (iNdEx + skippy) < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthOci
 			}
 			if (iNdEx + skippy) > l {
@@ -11243,10 +11355,7 @@ func (m *LinuxCPU) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
-				return ErrInvalidLengthOci
-			}
-			if (iNdEx + skippy) < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthOci
 			}
 			if (iNdEx + skippy) > l {
@@ -11373,10 +11482,7 @@ func (m *LinuxWeightDevice) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
-				return ErrInvalidLengthOci
-			}
-			if (iNdEx + skippy) < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthOci
 			}
 			if (iNdEx + skippy) > l {
@@ -11484,10 +11590,7 @@ func (m *LinuxThrottleDevice) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
-				return ErrInvalidLengthOci
-			}
-			if (iNdEx + skippy) < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthOci
 			}
 			if (iNdEx + skippy) > l {
@@ -11746,10 +11849,7 @@ func (m *LinuxBlockIO) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
-				return ErrInvalidLengthOci
-			}
-			if (iNdEx + skippy) < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthOci
 			}
 			if (iNdEx + skippy) > l {
@@ -11819,10 +11919,7 @@ func (m *LinuxPids) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
-				return ErrInvalidLengthOci
-			}
-			if (iNdEx + skippy) < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthOci
 			}
 			if (iNdEx + skippy) > l {
@@ -11995,10 +12092,7 @@ func (m *LinuxDeviceCgroup) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
-				return ErrInvalidLengthOci
-			}
-			if (iNdEx + skippy) < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthOci
 			}
 			if (iNdEx + skippy) > l {
@@ -12102,10 +12196,7 @@ func (m *LinuxNetwork) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
-				return ErrInvalidLengthOci
-			}
-			if (iNdEx + skippy) < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthOci
 			}
 			if (iNdEx + skippy) > l {
@@ -12207,10 +12298,7 @@ func (m *LinuxHugepageLimit) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
-				return ErrInvalidLengthOci
-			}
-			if (iNdEx + skippy) < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthOci
 			}
 			if (iNdEx + skippy) > l {
@@ -12312,10 +12400,7 @@ func (m *LinuxInterfacePriority) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
-				return ErrInvalidLengthOci
-			}
-			if (iNdEx + skippy) < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthOci
 			}
 			if (iNdEx + skippy) > l {
@@ -12426,6 +12511,38 @@ func (m *LinuxSeccomp) Unmarshal(dAtA []byte) error {
 			iNdEx = postIndex
 		case 3:
 			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Flags", wireType)
+			}
+			var stringLen uint64
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowOci
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				stringLen |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			intStringLen := int(stringLen)
+			if intStringLen < 0 {
+				return ErrInvalidLengthOci
+			}
+			postIndex := iNdEx + intStringLen
+			if postIndex < 0 {
+				return ErrInvalidLengthOci
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.Flags = append(m.Flags, string(dAtA[iNdEx:postIndex]))
+			iNdEx = postIndex
+		case 4:
+			if wireType != 2 {
 				return fmt.Errorf("proto: wrong wireType = %d for field Syscalls", wireType)
 			}
 			var msglen int
@@ -12464,10 +12581,7 @@ func (m *LinuxSeccomp) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
-				return ErrInvalidLengthOci
-			}
-			if (iNdEx + skippy) < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthOci
 			}
 			if (iNdEx + skippy) > l {
@@ -12607,10 +12721,7 @@ func (m *LinuxSeccompArg) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
-				return ErrInvalidLengthOci
-			}
-			if (iNdEx + skippy) < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthOci
 			}
 			if (iNdEx + skippy) > l {
@@ -12720,6 +12831,26 @@ func (m *LinuxSyscall) Unmarshal(dAtA []byte) error {
 			m.Action = string(dAtA[iNdEx:postIndex])
 			iNdEx = postIndex
 		case 3:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Errnoret", wireType)
+			}
+			var v uint32
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowOci
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				v |= uint32(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			m.ErrnoRet = &LinuxSyscall_Errnoret{v}
+		case 4:
 			if wireType != 2 {
 				return fmt.Errorf("proto: wrong wireType = %d for field Args", wireType)
 			}
@@ -12759,10 +12890,7 @@ func (m *LinuxSyscall) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
-				return ErrInvalidLengthOci
-			}
-			if (iNdEx + skippy) < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthOci
 			}
 			if (iNdEx + skippy) > l {
@@ -12845,10 +12973,7 @@ func (m *LinuxIntelRdt) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
-				return ErrInvalidLengthOci
-			}
-			if (iNdEx + skippy) < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthOci
 			}
 			if (iNdEx + skippy) > l {

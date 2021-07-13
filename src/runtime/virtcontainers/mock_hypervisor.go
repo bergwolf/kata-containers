@@ -21,7 +21,9 @@ type mockHypervisor struct {
 }
 
 func (m *mockHypervisor) capabilities(ctx context.Context) types.Capabilities {
-	return types.Capabilities{}
+	caps := types.Capabilities{}
+	caps.SetFsSharingSupport()
+	return caps
 }
 
 func (m *mockHypervisor) hypervisorConfig() HypervisorConfig {
@@ -41,7 +43,7 @@ func (m *mockHypervisor) startSandbox(ctx context.Context, timeout int) error {
 	return nil
 }
 
-func (m *mockHypervisor) stopSandbox(ctx context.Context) error {
+func (m *mockHypervisor) stopSandbox(ctx context.Context, waitOnly bool) error {
 	return nil
 }
 
@@ -107,6 +109,10 @@ func (m *mockHypervisor) cleanup(ctx context.Context) error {
 
 func (m *mockHypervisor) getPids() []int {
 	return []int{m.mockPid}
+}
+
+func (m *mockHypervisor) getVirtioFsPid() *int {
+	return nil
 }
 
 func (m *mockHypervisor) fromGrpc(ctx context.Context, hypervisorConfig *HypervisorConfig, j []byte) error {

@@ -6,7 +6,7 @@
 use crate::container::Config;
 use anyhow::{anyhow, Context, Error, Result};
 use nix::errno::Errno;
-use oci::{Linux, LinuxIDMapping, LinuxNamespace, Spec};
+use oci::{Linux, LinuxIdMapping, LinuxNamespace, Spec};
 use std::collections::HashMap;
 use std::path::{Component, PathBuf};
 
@@ -26,16 +26,6 @@ fn contain_namespace(nses: &[LinuxNamespace], key: &str) -> bool {
     }
 
     false
-}
-
-fn get_namespace_path(nses: &[LinuxNamespace], key: &str) -> Result<String> {
-    for ns in nses {
-        if ns.r#type.as_str() == key {
-            return Ok(ns.path.clone());
-        }
-    }
-
-    Err(einval())
 }
 
 fn rootfs(root: &str) -> Result<()> {
@@ -107,7 +97,7 @@ fn security(oci: &Spec) -> Result<()> {
     Ok(())
 }
 
-fn idmapping(maps: &[LinuxIDMapping]) -> Result<()> {
+fn idmapping(maps: &[LinuxIdMapping]) -> Result<()> {
     for map in maps {
         if map.size > 0 {
             return Ok(());
@@ -166,31 +156,6 @@ lazy_static! {
     };
 }
 
-fn check_host_ns(path: &str) -> Result<()> {
-    let cpath = PathBuf::from(path);
-    let hpath = PathBuf::from("/proc/self/ns/net");
-
-    let real_hpath = hpath
-        .read_link()
-        .context(format!("read link {:?}", hpath))?;
-    let meta = cpath
-        .symlink_metadata()
-        .context(format!("symlink metadata {:?}", cpath))?;
-    let file_type = meta.file_type();
-
-    if !file_type.is_symlink() {
-        return Ok(());
-    }
-    let real_cpath = cpath
-        .read_link()
-        .context(format!("read link {:?}", cpath))?;
-    if real_cpath == real_hpath {
-        return Err(einval());
-    }
-
-    Ok(())
-}
-
 fn sysctl(oci: &Spec) -> Result<()> {
     let linux = get_linux(oci)?;
 
@@ -238,7 +203,7 @@ fn rootless_euid_mapping(oci: &Spec) -> Result<()> {
     Ok(())
 }
 
-fn has_idmapping(maps: &[LinuxIDMapping], id: u32) -> bool {
+fn has_idmapping(maps: &[LinuxIdMapping], id: u32) -> bool {
     for map in maps {
         if id >= map.container_id && id < map.container_id + map.size {
             return true;
@@ -334,19 +299,6 @@ mod tests {
         assert_eq!(contain_namespace(&namespaces, ""), false);
         assert_eq!(contain_namespace(&namespaces, "Net"), false);
         assert_eq!(contain_namespace(&namespaces, "ipc"), false);
-
-        assert_eq!(
-            get_namespace_path(&namespaces, "net").unwrap(),
-            "/sys/cgroups/net"
-        );
-        assert_eq!(
-            get_namespace_path(&namespaces, "uts").unwrap(),
-            "/sys/cgroups/uts"
-        );
-
-        get_namespace_path(&namespaces, "").unwrap_err();
-        get_namespace_path(&namespaces, "Uts").unwrap_err();
-        get_namespace_path(&namespaces, "ipc").unwrap_err();
     }
 
     #[test]
@@ -441,7 +393,7 @@ mod tests {
         usernamespace(&spec).unwrap();
 
         let mut linux = Linux::default();
-        linux.uid_mappings = vec![LinuxIDMapping {
+        linux.uid_mappings = vec![LinuxIdMapping {
             container_id: 0,
             host_id: 1000,
             size: 0,
@@ -450,7 +402,7 @@ mod tests {
         usernamespace(&spec).unwrap_err();
 
         let mut linux = Linux::default();
-        linux.uid_mappings = vec![LinuxIDMapping {
+        linux.uid_mappings = vec![LinuxIdMapping {
             container_id: 0,
             host_id: 1000,
             size: 100,
@@ -497,12 +449,12 @@ mod tests {
                 path: "/sys/cgroups/user".to_owned(),
             },
         ];
-        linux.uid_mappings = vec![LinuxIDMapping {
+        linux.uid_mappings = vec![LinuxIdMapping {
             container_id: 0,
             host_id: 1000,
             size: 1000,
         }];
-        linux.gid_mappings = vec![LinuxIDMapping {
+        linux.gid_mappings = vec![LinuxIdMapping {
             container_id: 0,
             host_id: 1000,
             size: 1000,
@@ -526,12 +478,6 @@ mod tests {
             }),
         ];
         rootless_euid(&spec).unwrap();
-    }
-
-    #[test]
-    fn test_check_host_ns() {
-        check_host_ns("/proc/self/ns/net").unwrap_err();
-        check_host_ns("/proc/sys/net/ipv4/tcp_sack").unwrap();
     }
 
     #[test]

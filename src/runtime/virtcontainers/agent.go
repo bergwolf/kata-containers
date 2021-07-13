@@ -132,9 +132,6 @@ type agent interface {
 	// readProcessStderr will tell the agent to read a process stderr
 	readProcessStderr(ctx context.Context, c *Container, processID string, data []byte) (int, error)
 
-	// processListContainer will list the processes running inside the container
-	processListContainer(ctx context.Context, sandbox *Sandbox, c Container, options ProcessListOptions) (ProcessList, error)
-
 	// updateContainer will update the resources of a running container
 	updateContainer(ctx context.Context, sandbox *Sandbox, c Container, resources specs.LinuxResources) error
 
@@ -163,10 +160,10 @@ type agent interface {
 	resumeContainer(ctx context.Context, sandbox *Sandbox, c Container) error
 
 	// configure will update agent settings based on provided arguments
-	configure(ctx context.Context, h hypervisor, id, sharePath string, config interface{}) error
+	configure(ctx context.Context, h hypervisor, id, sharePath string, config KataAgentConfig) error
 
 	// configureFromGrpc will update agent settings based on provided arguments which from Grpc
-	configureFromGrpc(h hypervisor, id string, config interface{}) error
+	configureFromGrpc(ctx context.Context, h hypervisor, id string, config KataAgentConfig) error
 
 	// reseedRNG will reseed the guest random number generator
 	reseedRNG(ctx context.Context, data []byte) error
@@ -206,7 +203,7 @@ type agent interface {
 
 	// getOOMEvent will wait on OOM events that occur in the sandbox.
 	// Will return the ID of the container where the event occurred.
-	getOOMEvent(ctx context.Context, ) (string, error)
+	getOOMEvent(ctx context.Context) (string, error)
 
 	// getAgentMetrics get metrics of agent and guest through agent
 	getAgentMetrics(context.Context, *grpc.GetMetricsRequest) (*grpc.Metrics, error)

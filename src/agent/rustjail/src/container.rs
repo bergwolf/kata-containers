@@ -5,10 +5,10 @@
 
 use anyhow::{anyhow, Context, Result};
 use libc::pid_t;
-use oci::{ContainerState, LinuxDevice, LinuxIDMapping};
+use oci::{ContainerState, LinuxDevice, LinuxIdMapping};
 use oci::{Hook, Linux, LinuxNamespace, LinuxResources, Spec};
 use std::clone::Clone;
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::fmt::Display;
 use std::fs;
 use std::os::unix::io::RawFd;
@@ -48,6 +48,7 @@ use oci::State as OCIState;
 use std::collections::HashMap;
 use std::os::unix::io::FromRawFd;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use slog::{info, o, Logger};
 
@@ -57,13 +58,11 @@ use crate::sync_with_async::{read_async, write_async};
 use async_trait::async_trait;
 use rlimit::{setrlimit, Resource, Rlim};
 use tokio::io::AsyncBufReadExt;
+use tokio::sync::Mutex;
 
 use crate::utils;
 
-const STATE_FILENAME: &str = "state.json";
 const EXEC_FIFO_FILENAME: &str = "exec.fifo";
-const VER_MARKER: &str = "1.2.5";
-const PID_NS_PATH: &str = "/proc/self/ns/pid";
 
 const INIT: &str = "INIT";
 const NO_PIVOT: &str = "NO_PIVOT";
@@ -83,17 +82,13 @@ pub struct ContainerStatus {
 impl ContainerStatus {
     fn new() -> Self {
         ContainerStatus {
-            pre_status: ContainerState::CREATED,
-            cur_status: ContainerState::CREATED,
+            pre_status: ContainerState::Created,
+            cur_status: ContainerState::Created,
         }
     }
 
     fn status(&self) -> ContainerState {
         self.cur_status
-    }
-
-    fn pre_status(&self) -> ContainerState {
-        self.pre_status
     }
 
     fn transition(&mut self, to: ContainerState) {
@@ -106,6 +101,9 @@ pub type Config = CreateOpts;
 type NamespaceType = String;
 
 lazy_static! {
+    // This locker ensures the child exit signal will be received by the right receiver.
+    pub static ref WAIT_PID_LOCKER: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+
     static ref NAMESPACES: HashMap<&'static str, CloneFlags> = {
         let mut m = HashMap::new();
         m.insert("user", CloneFlags::CLONE_NEWUSER);
@@ -132,62 +130,62 @@ lazy_static! {
     };
 
     pub static ref DEFAULT_DEVICES: Vec<LinuxDevice> = {
-        let mut v = Vec::new();
-        v.push(LinuxDevice {
-            path: "/dev/null".to_string(),
-            r#type: "c".to_string(),
-            major: 1,
-            minor: 3,
-            file_mode: Some(0o666),
-            uid: Some(0xffffffff),
-            gid: Some(0xffffffff),
-        });
-        v.push(LinuxDevice {
-            path: "/dev/zero".to_string(),
-            r#type: "c".to_string(),
-            major: 1,
-            minor: 5,
-            file_mode: Some(0o666),
-            uid: Some(0xffffffff),
-            gid: Some(0xffffffff),
-        });
-        v.push(LinuxDevice {
-            path: "/dev/full".to_string(),
-            r#type: String::from("c"),
-            major: 1,
-            minor: 7,
-            file_mode: Some(0o666),
-            uid: Some(0xffffffff),
-            gid: Some(0xffffffff),
-        });
-        v.push(LinuxDevice {
-            path: "/dev/tty".to_string(),
-            r#type: "c".to_string(),
-            major: 5,
-            minor: 0,
-            file_mode: Some(0o666),
-            uid: Some(0xffffffff),
-            gid: Some(0xffffffff),
-        });
-        v.push(LinuxDevice {
-            path: "/dev/urandom".to_string(),
-            r#type: "c".to_string(),
-            major: 1,
-            minor: 9,
-            file_mode: Some(0o666),
-            uid: Some(0xffffffff),
-            gid: Some(0xffffffff),
-        });
-        v.push(LinuxDevice {
-            path: "/dev/random".to_string(),
-            r#type: "c".to_string(),
-            major: 1,
-            minor: 8,
-            file_mode: Some(0o666),
-            uid: Some(0xffffffff),
-            gid: Some(0xffffffff),
-        });
-        v
+        vec![
+            LinuxDevice {
+                path: "/dev/null".to_string(),
+                r#type: "c".to_string(),
+                major: 1,
+                minor: 3,
+                file_mode: Some(0o666),
+                uid: Some(0xffffffff),
+                gid: Some(0xffffffff),
+            },
+            LinuxDevice {
+                path: "/dev/zero".to_string(),
+                r#type: "c".to_string(),
+                major: 1,
+                minor: 5,
+                file_mode: Some(0o666),
+                uid: Some(0xffffffff),
+                gid: Some(0xffffffff),
+            },
+            LinuxDevice {
+                path: "/dev/full".to_string(),
+                r#type: String::from("c"),
+                major: 1,
+                minor: 7,
+                file_mode: Some(0o666),
+                uid: Some(0xffffffff),
+                gid: Some(0xffffffff),
+            },
+            LinuxDevice {
+                path: "/dev/tty".to_string(),
+                r#type: "c".to_string(),
+                major: 5,
+                minor: 0,
+                file_mode: Some(0o666),
+                uid: Some(0xffffffff),
+                gid: Some(0xffffffff),
+            },
+            LinuxDevice {
+                path: "/dev/urandom".to_string(),
+                r#type: "c".to_string(),
+                major: 1,
+                minor: 9,
+                file_mode: Some(0o666),
+                uid: Some(0xffffffff),
+                gid: Some(0xffffffff),
+            },
+            LinuxDevice {
+                path: "/dev/random".to_string(),
+                r#type: "c".to_string(),
+                major: 1,
+                minor: 8,
+                file_mode: Some(0o666),
+                uid: Some(0xffffffff),
+                gid: Some(0xffffffff),
+            },
+        ]
     };
 }
 
@@ -255,7 +253,7 @@ pub struct State {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct SyncPC {
+pub struct SyncPc {
     #[serde(default)]
     pid: pid_t,
 }
@@ -268,7 +266,7 @@ pub trait Container: BaseContainer {
 impl Container for LinuxContainer {
     fn pause(&mut self) -> Result<()> {
         let status = self.status();
-        if status != ContainerState::RUNNING && status != ContainerState::CREATED {
+        if status != ContainerState::Running && status != ContainerState::Created {
             return Err(anyhow!(
                 "failed to pause container: current status is: {:?}",
                 status
@@ -281,7 +279,7 @@ impl Container for LinuxContainer {
                 .unwrap()
                 .freeze(FreezerState::Frozen)?;
 
-            self.status.transition(ContainerState::PAUSED);
+            self.status.transition(ContainerState::Paused);
             return Ok(());
         }
         Err(anyhow!("failed to get container's cgroup manager"))
@@ -289,7 +287,7 @@ impl Container for LinuxContainer {
 
     fn resume(&mut self) -> Result<()> {
         let status = self.status();
-        if status != ContainerState::PAUSED {
+        if status != ContainerState::Paused {
             return Err(anyhow!("container status is: {:?}, not paused", status));
         }
 
@@ -299,7 +297,7 @@ impl Container for LinuxContainer {
                 .unwrap()
                 .freeze(FreezerState::Thawed)?;
 
-            self.status.transition(ContainerState::RUNNING);
+            self.status.transition(ContainerState::Running);
             return Ok(());
         }
         Err(anyhow!("failed to get container's cgroup manager"))
@@ -341,7 +339,7 @@ fn do_init_child(cwfd: RawFd) -> Result<()> {
         Err(_e) => sched::unshare(CloneFlags::CLONE_NEWPID)?,
     }
 
-    match fork() {
+    match unsafe { fork() } {
         Ok(ForkResult::Parent { child, .. }) => {
             log_child!(
                 cfd_log,
@@ -464,7 +462,7 @@ fn do_init_child(cwfd: RawFd) -> Result<()> {
     // Ref: https://github.com/opencontainers/runc/commit/50a19c6ff828c58e5dab13830bd3dacde268afe5
     //
     if !nses.is_empty() {
-        prctl::set_dumpable(false)
+        capctl::prctl::set_dumpable(false)
             .map_err(|e| anyhow!(e).context("set process non-dumpable failed"))?;
     }
 
@@ -540,7 +538,7 @@ fn do_init_child(cwfd: RawFd) -> Result<()> {
         // notify parent to run prestart hooks
         write_sync(cwfd, SYNC_SUCCESS, "")?;
         // wait parent run prestart hooks
-        let _ = read_sync(crfd)?;
+        read_sync(crfd)?;
     }
 
     if mount_fd != -1 {
@@ -597,7 +595,7 @@ fn do_init_child(cwfd: RawFd) -> Result<()> {
 
     // NoNewPeiviledges, Drop capabilities
     if oci_process.no_new_privileges {
-        prctl::set_no_new_privileges(true).map_err(|_| anyhow!("cannot set no new privileges"))?;
+        capctl::prctl::set_no_new_privs().map_err(|_| anyhow!("cannot set no new privileges"))?;
     }
 
     if oci_process.capabilities.is_some() {
@@ -607,8 +605,6 @@ fn do_init_child(cwfd: RawFd) -> Result<()> {
 
     if init {
         // notify parent to run poststart hooks
-        // cfd is closed when return from join_namespaces
-        // should retunr cfile instead of cfd?
         write_sync(cwfd, SYNC_SUCCESS, "")?;
     }
 
@@ -634,12 +630,12 @@ fn do_init_child(cwfd: RawFd) -> Result<()> {
         env::set_var(v[0], v[1]);
     }
 
-    // set the "HOME" env getting from "/etc/passwd"
+    // set the "HOME" env getting from "/etc/passwd", if
+    // there's no uid entry in /etc/passwd, set "/" as the
+    // home env.
     if env::var_os(HOME_ENV_KEY).is_none() {
-        match utils::home_dir(guser.uid) {
-            Ok(home_dir) => env::set_var(HOME_ENV_KEY, home_dir),
-            Err(e) => log_child!(cfd_log, "failed to get home dir: {:?}", e),
-        }
+        let home_dir = utils::home_dir(guser.uid).unwrap_or_else(|_| String::from("/"));
+        env::set_var(HOME_ENV_KEY, home_dir);
     }
 
     let exec_file = Path::new(&args[0]);
@@ -734,7 +730,7 @@ impl BaseContainer for LinuxContainer {
         };
 
         let status = self.status();
-        let pid = if status != ContainerState::STOPPED {
+        let pid = if status != ContainerState::Stopped {
             self.init_process_pid
         } else {
             0
@@ -817,7 +813,7 @@ impl BaseContainer for LinuxContainer {
             if stat::stat(fifo_file.as_str()).is_ok() {
                 return Err(anyhow!("exec fifo exists"));
             }
-            unistd::mkfifo(fifo_file.as_str(), Mode::from_bits(0o622).unwrap())?;
+            unistd::mkfifo(fifo_file.as_str(), Mode::from_bits(0o644).unwrap())?;
 
             fifofd = fcntl::open(
                 fifo_file.as_str(),
@@ -908,7 +904,7 @@ impl BaseContainer for LinuxContainer {
             child = child.env(PIDNS_FD, format!("{}", pidns.unwrap()));
         }
 
-        let child = child.spawn()?;
+        child.spawn()?;
 
         unistd::close(crfd)?;
         unistd::close(cwfd)?;
@@ -964,19 +960,6 @@ impl BaseContainer for LinuxContainer {
 
         self.created = SystemTime::now();
 
-        // create the pipes for notify process exited
-        let (exit_pipe_r, exit_pipe_w) = unistd::pipe2(OFlag::O_CLOEXEC)
-            .context("failed to create pipe")
-            .map_err(|e| {
-                let _ = signal::kill(Pid::from_raw(child.id() as i32), Some(Signal::SIGKILL))
-                    .map_err(|e| warn!(logger, "signal::kill creating pipe {:?}", e));
-
-                e
-            })?;
-
-        p.exit_pipe_w = Some(exit_pipe_w);
-        p.exit_pipe_r = Some(exit_pipe_r);
-
         if p.init {
             let spec = self.config.spec.as_mut().unwrap();
             update_namespaces(&self.logger, spec, p.pid)?;
@@ -997,7 +980,7 @@ impl BaseContainer for LinuxContainer {
 
         if init {
             self.exec()?;
-            self.status.transition(ContainerState::RUNNING);
+            self.status.transition(ContainerState::Running);
         }
 
         Ok(())
@@ -1019,7 +1002,7 @@ impl BaseContainer for LinuxContainer {
             }
         }
 
-        self.status.transition(ContainerState::STOPPED);
+        self.status.transition(ContainerState::Stopped);
         mount::umount2(
             spec.root.as_ref().unwrap().path.as_str(),
             MntFlags::MNT_DETACH,
@@ -1055,7 +1038,7 @@ impl BaseContainer for LinuxContainer {
             .unwrap()
             .as_secs();
 
-        self.status.transition(ContainerState::RUNNING);
+        self.status.transition(ContainerState::Running);
         unistd::close(fd)?;
 
         Ok(())
@@ -1089,9 +1072,8 @@ fn do_exec(args: &[String]) -> ! {
         .iter()
         .map(|s| CString::new(s.to_string()).unwrap_or_default())
         .collect();
-    let a: Vec<&CStr> = sa.iter().map(|s| s.as_c_str()).collect();
 
-    let _ = unistd::execvp(p.as_c_str(), a.as_slice()).map_err(|e| match e {
+    let _ = unistd::execvp(p.as_c_str(), &sa).map_err(|e| match e {
         nix::Error::Sys(errno) => {
             std::process::exit(errno as i32);
         }
@@ -1264,7 +1246,7 @@ async fn join_namespaces(
 
     if p.init {
         info!(logger, "notify child parent ready to run prestart hook!");
-        let _ = read_async(pipe_r).await?;
+        read_async(pipe_r).await?;
 
         info!(logger, "get ready to run prestart hook!");
 
@@ -1302,7 +1284,7 @@ async fn join_namespaces(
     Ok(())
 }
 
-fn write_mappings(logger: &Logger, path: &str, maps: &[LinuxIDMapping]) -> Result<()> {
+fn write_mappings(logger: &Logger, path: &str, maps: &[LinuxIdMapping]) -> Result<()> {
     let data = maps
         .iter()
         .filter(|m| m.size != 0)
@@ -1324,7 +1306,7 @@ fn write_mappings(logger: &Logger, path: &str, maps: &[LinuxIDMapping]) -> Resul
 
 fn setid(uid: Uid, gid: Gid) -> Result<()> {
     // set uid/gid
-    prctl::set_keep_capabilities(true)
+    capctl::prctl::set_keepcaps(true)
         .map_err(|e| anyhow!(e).context("set keep capabilities returned"))?;
 
     {
@@ -1338,7 +1320,7 @@ fn setid(uid: Uid, gid: Gid) -> Result<()> {
         capabilities::reset_effective()?;
     }
 
-    prctl::set_keep_capabilities(false)
+    capctl::prctl::set_keepcaps(false)
         .map_err(|e| anyhow!(e).context("set keep capabilities returned"))?;
 
     Ok(())
@@ -1412,17 +1394,7 @@ impl LinuxContainer {
             logger: logger.new(o!("module" => "rustjail", "subsystem" => "container", "cid" => id)),
         })
     }
-
-    fn load<T: Into<String>>(_id: T, _base: T) -> Result<Self> {
-        Err(anyhow!("not supported"))
-    }
 }
-
-// Handle the differing rlimit types for different targets
-#[cfg(target_env = "musl")]
-type RlimitsType = libc::c_int;
-#[cfg(target_env = "gnu")]
-type RlimitsType = libc::__rlimit_resource_t;
 
 fn setgroups(grps: &[libc::gid_t]) -> Result<()> {
     let ret = unsafe { libc::setgroups(grps.len(), grps.as_ptr() as *const libc::gid_t) };
@@ -1457,11 +1429,9 @@ fn set_sysctls(sysctls: &HashMap<String, String>) -> Result<()> {
     Ok(())
 }
 
-use std::io::Read;
-use std::os::unix::process::ExitStatusExt;
 use std::process::Stdio;
-use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 async fn execute_hook(logger: &Logger, h: &Hook, st: &OCIState) -> Result<()> {
     let logger = logger.new(o!("action" => "execute-hook"));
@@ -1473,160 +1443,88 @@ async fn execute_hook(logger: &Logger, h: &Hook, st: &OCIState) -> Result<()> {
     }
 
     let args = h.args.clone();
-    let envs = h.env.clone();
+    let env: HashMap<String, String> = h
+        .env
+        .iter()
+        .map(|e| {
+            let v: Vec<&str> = e.split('=').collect();
+            (v[0].to_string(), v[1].to_string())
+        })
+        .collect();
+
+    // Avoid the exit signal to be reaped by the global reaper.
+    let _wait_locker = WAIT_PID_LOCKER.lock().await;
+    let mut child = tokio::process::Command::new(path)
+        .args(args.iter())
+        .envs(env.iter())
+        .kill_on_drop(true)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // default timeout 10s
+    let mut timeout: u64 = 10;
+
+    // if timeout is set if hook, then use the specified value
+    if let Some(t) = h.timeout {
+        if t > 0 {
+            timeout = t as u64;
+        }
+    }
+
     let state = serde_json::to_string(st)?;
+    let path = h.path.clone();
 
-    let (rfd, wfd) = unistd::pipe2(OFlag::O_CLOEXEC)?;
-    defer!({
-        let _ = unistd::close(rfd);
-        let _ = unistd::close(wfd);
-    });
+    let join_handle = tokio::spawn(async move {
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(state.as_bytes())
+            .await
+            .unwrap();
 
-    match unistd::fork()? {
-        ForkResult::Parent { child } => {
-            let mut pipe_r = PipeStream::from_fd(rfd);
-            let buf = read_async(&mut pipe_r).await?;
-            let status = if buf.len() == 4 {
-                let buf_array: [u8; 4] = [buf[0], buf[1], buf[2], buf[3]];
-                i32::from_be_bytes(buf_array)
-            } else {
-                -libc::EPIPE
-            };
+        // Close stdin so that hook program could receive EOF
+        child.stdin.take();
 
-            info!(logger, "hook child: {} status: {}", child, status);
+        // read something from stdout for debug
+        let mut out = String::new();
+        child
+            .stdout
+            .as_mut()
+            .unwrap()
+            .read_to_string(&mut out)
+            .await
+            .unwrap();
+        info!(logger, "child stdout: {}", out.as_str());
 
-            if status != 0 {
-                if status == -libc::ETIMEDOUT {
-                    return Err(anyhow!(nix::Error::from_errno(Errno::ETIMEDOUT)));
-                } else if status == -libc::EPIPE {
-                    return Err(anyhow!(nix::Error::from_errno(Errno::EPIPE)));
-                } else {
+        match child.wait().await {
+            Ok(exit) => {
+                let code = exit
+                    .code()
+                    .ok_or_else(|| anyhow!("hook exit status has no status code"))?;
+
+                if code != 0 {
+                    error!(logger, "hook {} exit status is {}", &path, code);
                     return Err(anyhow!(nix::Error::from_errno(Errno::UnknownErrno)));
                 }
+
+                debug!(logger, "hook {} exit status is 0", &path);
+                Ok(())
             }
-
-            Ok(())
+            Err(e) => Err(anyhow!(
+                "wait child error: {} {}",
+                e,
+                e.raw_os_error().unwrap()
+            )),
         }
+    });
 
-        ForkResult::Child => {
-            let (tx, rx) = mpsc::channel();
-            let (tx_logger, rx_logger) = mpsc::channel();
-
-            tx_logger.send(logger.clone()).unwrap();
-
-            let handle = std::thread::spawn(move || {
-                let logger = rx_logger.recv().unwrap();
-
-                // write oci state to child
-                let env: HashMap<String, String> = envs
-                    .iter()
-                    .map(|e| {
-                        let v: Vec<&str> = e.split('=').collect();
-                        (v[0].to_string(), v[1].to_string())
-                    })
-                    .collect();
-
-                let mut child = std::process::Command::new(path.to_str().unwrap())
-                    .args(args.iter())
-                    .envs(env.iter())
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .unwrap();
-
-                // send out our pid
-                tx.send(child.id() as libc::pid_t).unwrap();
-                info!(logger, "hook grand: {}", child.id());
-
-                child
-                    .stdin
-                    .as_mut()
-                    .unwrap()
-                    .write_all(state.as_bytes())
-                    .unwrap();
-
-                // Close stdin so that hook program could receive EOF.
-                child.stdin.take();
-
-                // read something from stdout for debug
-                let mut out = String::new();
-                child
-                    .stdout
-                    .as_mut()
-                    .unwrap()
-                    .read_to_string(&mut out)
-                    .unwrap();
-                info!(logger, "child stdout: {}", out.as_str());
-                match child.wait() {
-                    Ok(exit) => {
-                        let code: i32 = if exit.success() {
-                            0
-                        } else {
-                            match exit.code() {
-                                Some(c) => (c as u32 | 0x80000000) as i32,
-                                None => exit.signal().unwrap(),
-                            }
-                        };
-
-                        tx.send(code).unwrap();
-                    }
-
-                    Err(e) => {
-                        info!(
-                            logger,
-                            "wait child error: {} {}",
-                            e,
-                            e.raw_os_error().unwrap()
-                        );
-
-                        // There is apparently race between this wait and
-                        // child reaper. Ie, the child can already
-                        // be reaped by subreaper, child.wait returns
-                        // ECHILD. I have no idea how to get the
-                        // correct exit status here at present,
-                        // just pretend it exits successfully.
-                        // -- FIXME
-                        // just in case. Should not happen any more
-
-                        tx.send(0).unwrap();
-                    }
-                }
-            });
-
-            let pid = rx.recv().unwrap();
-            info!(logger, "hook grand: {}", pid);
-
-            let status = {
-                if let Some(timeout) = h.timeout {
-                    match rx.recv_timeout(Duration::from_secs(timeout as u64)) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            let error = if e == RecvTimeoutError::Timeout {
-                                -libc::ETIMEDOUT
-                            } else {
-                                -libc::EPIPE
-                            };
-                            let _ = signal::kill(Pid::from_raw(pid), Some(Signal::SIGKILL));
-                            error
-                        }
-                    }
-                } else if let Ok(s) = rx.recv() {
-                    s
-                } else {
-                    let _ = signal::kill(Pid::from_raw(pid), Some(Signal::SIGKILL));
-                    -libc::EPIPE
-                }
-            };
-
-            handle.join().unwrap();
-            let _ = write_sync(
-                wfd,
-                SYNC_DATA,
-                std::str::from_utf8(&status.to_be_bytes()).unwrap_or_default(),
-            );
-            std::process::exit(0);
-        }
+    match tokio::time::timeout(Duration::new(timeout, 0), join_handle).await {
+        Ok(r) => r.unwrap(),
+        Err(_) => Err(anyhow!(nix::Error::from_errno(Errno::ETIMEDOUT))),
     }
 }
 
@@ -1639,6 +1537,7 @@ mod tests {
     use std::os::unix::fs::MetadataExt;
     use std::os::unix::io::AsRawFd;
     use tempfile::tempdir;
+    use tokio::process::Command;
 
     macro_rules! sl {
         () => {
@@ -1646,12 +1545,27 @@ mod tests {
         };
     }
 
+    async fn which(cmd: &str) -> String {
+        let output: std::process::Output = Command::new("which")
+            .arg(cmd)
+            .output()
+            .await
+            .expect("which command failed to run");
+
+        match String::from_utf8(output.stdout) {
+            Ok(v) => v.trim_end_matches('\n').to_string(),
+            Err(e) => panic!("Invalid UTF-8 sequence: {}", e),
+        }
+    }
+
     #[tokio::test]
     async fn test_execute_hook() {
+        let xargs = which("xargs").await;
+
         execute_hook(
             &slog_scope::logger(),
             &Hook {
-                path: "/usr/bin/xargs".to_string(),
+                path: xargs,
                 args: vec![],
                 env: vec![],
                 timeout: None,
@@ -1659,7 +1573,7 @@ mod tests {
             &OCIState {
                 version: "1.2.3".to_string(),
                 id: "321".to_string(),
-                status: ContainerState::RUNNING,
+                status: ContainerState::Running,
                 pid: 2,
                 bundle: "".to_string(),
                 annotations: Default::default(),
@@ -1669,21 +1583,51 @@ mod tests {
         .unwrap()
     }
 
+    #[tokio::test]
+    async fn test_execute_hook_with_timeout() {
+        let sleep = which("sleep").await;
+
+        let res = execute_hook(
+            &slog_scope::logger(),
+            &Hook {
+                path: sleep,
+                args: vec!["2".to_string()],
+                env: vec![],
+                timeout: Some(1),
+            },
+            &OCIState {
+                version: "1.2.3".to_string(),
+                id: "321".to_string(),
+                status: ContainerState::Running,
+                pid: 2,
+                bundle: "".to_string(),
+                annotations: Default::default(),
+            },
+        )
+        .await;
+
+        let expected_err = nix::Error::from_errno(Errno::ETIMEDOUT);
+        assert_eq!(
+            res.unwrap_err().downcast::<nix::Error>().unwrap(),
+            expected_err
+        );
+    }
+
     #[test]
     fn test_status_transtition() {
         let mut status = ContainerStatus::new();
         let status_table: [ContainerState; 4] = [
-            ContainerState::CREATED,
-            ContainerState::RUNNING,
-            ContainerState::PAUSED,
-            ContainerState::STOPPED,
+            ContainerState::Created,
+            ContainerState::Running,
+            ContainerState::Paused,
+            ContainerState::Stopped,
         ];
 
         for s in status_table.iter() {
             let pre_status = status.status();
             status.transition(*s);
 
-            assert_eq!(pre_status, status.pre_status());
+            assert_eq!(pre_status, status.pre_status);
         }
     }
 
@@ -1813,7 +1757,7 @@ mod tests {
     fn test_linuxcontainer_pause_bad_status() {
         let ret = new_linux_container_and_then(|mut c: LinuxContainer| {
             // Change state to pause, c.pause() should fail
-            c.status.transition(ContainerState::PAUSED);
+            c.status.transition(ContainerState::Paused);
             c.pause().map_err(|e| anyhow!(e))
         });
 
@@ -1845,7 +1789,7 @@ mod tests {
     fn test_linuxcontainer_resume_bad_status() {
         let ret = new_linux_container_and_then(|mut c: LinuxContainer| {
             // Change state to created, c.resume() should fail
-            c.status.transition(ContainerState::CREATED);
+            c.status.transition(ContainerState::Created);
             c.resume().map_err(|e| anyhow!(e))
         });
 
@@ -1856,7 +1800,7 @@ mod tests {
     #[test]
     fn test_linuxcontainer_resume_cgroupmgr_is_none() {
         let ret = new_linux_container_and_then(|mut c: LinuxContainer| {
-            c.status.transition(ContainerState::PAUSED);
+            c.status.transition(ContainerState::Paused);
             c.cgroup_manager = None;
             c.resume().map_err(|e| anyhow!(e))
         });
@@ -1869,7 +1813,7 @@ mod tests {
         let ret = new_linux_container_and_then(|mut c: LinuxContainer| {
             c.cgroup_manager = FsManager::new("").ok();
             // Change status to paused, this way we can resume it
-            c.status.transition(ContainerState::PAUSED);
+            c.status.transition(ContainerState::Paused);
             c.resume().map_err(|e| anyhow!(e))
         });
 

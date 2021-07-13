@@ -33,7 +33,7 @@ type HypervisorConfig struct {
 	MemSlots uint32
 
 	// MemOffset specifies memory space for nvdimm device
-	MemOffset uint32
+	MemOffset uint64
 
 	// VirtioFSCacheSize is the DAX cache size in MiB
 	VirtioFSCacheSize uint32
@@ -95,6 +95,9 @@ type HypervisorConfig struct {
 	// EntropySource is the path to a host source of
 	// entropy (/dev/random, /dev/urandom or real hardware RNG device)
 	EntropySource string
+
+	// EntropySourceList is the list of valid entropy sources
+	EntropySourceList []string
 
 	// Shared file system type:
 	//   - virtio-9p (default)
@@ -251,7 +254,6 @@ type SandboxConfig struct {
 	// only one agent config can be non-nil according to agent type
 	KataAgentConfig *KataAgentConfig `json:",omitempty"`
 
-	ShimType       string
 	KataShimConfig *ShimConfig
 
 	NetworkConfig NetworkConfig
@@ -272,6 +274,9 @@ type SandboxConfig struct {
 	SandboxCgroupOnly bool
 
 	DisableGuestSeccomp bool
+
+	// SandboxBindMounts - list of paths to mount into guest
+	SandboxBindMounts []string
 
 	// Experimental enables experimental features
 	Experimental []string

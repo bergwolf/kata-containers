@@ -17,17 +17,16 @@ var defaultInitrdPath = "/usr/share/kata-containers/kata-containers-initrd.img"
 var defaultFirmwarePath = ""
 var defaultMachineAccelerators = ""
 var defaultCPUFeatures = ""
-var defaultShimPath = "/usr/libexec/kata-containers/kata-shim"
 var systemdUnitName = "kata-containers.target"
 
 const defaultKernelParams = ""
-const defaultMachineType = "pc"
+const defaultMachineType = "q35"
 
 const defaultVCPUCount uint32 = 1
 const defaultMaxVCPUCount uint32 = 0
 const defaultMemSize uint32 = 2048 // MiB
 const defaultMemSlots uint32 = 10
-const defaultMemOffset uint32 = 0 // MiB
+const defaultMemOffset uint64 = 0 // MiB
 const defaultVirtioMem bool = false
 const defaultBridgesCount uint32 = 1
 const defaultInterNetworkingModel = "tcfilter"
@@ -55,6 +54,7 @@ const defaultDisableImageNvdimm = false
 const defaultVhostUserStorePath string = "/var/run/kata-containers/vhost-user/"
 const defaultRxRateLimiterMaxRate = uint64(0)
 const defaultTxRateLimiterMaxRate = uint64(0)
+const defaultConfidentialGuest = false
 
 var defaultSGXEPCSize = int64(0)
 
