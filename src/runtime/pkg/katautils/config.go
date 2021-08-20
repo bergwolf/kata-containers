@@ -107,6 +107,8 @@ type hypervisor struct {
 	TxRateLimiterMaxRate    uint64   `toml:"tx_rate_limiter_max_rate"`
 	MemOffset               uint64   `toml:"memory_offset"`
 	VirtioFSCacheSize       uint32   `toml:"virtio_fs_cache_size"`
+	VirtioFSNydusd          string   `toml:"virtio_fs_nydusd"`
+	VirtioFSNydusdExtraArgs []string `toml:"virtio_fs_nydusd_extra_args"`
 	DefaultMaxVCPUs         uint32   `toml:"default_maxvcpus"`
 	MemorySize              uint32   `toml:"default_memory"`
 	MemSlots                uint32   `toml:"memory_slots"`
@@ -416,7 +418,7 @@ func (h hypervisor) blockDeviceDriver() (string, error) {
 }
 
 func (h hypervisor) sharedFS() (string, error) {
-	supportedSharedFS := []string{config.Virtio9P, config.VirtioFS}
+	supportedSharedFS := []string{config.Virtio9P, config.VirtioFS, config.VirtioFSNydus}
 
 	if h.SharedFS == "" {
 		return config.Virtio9P, nil
@@ -654,6 +656,11 @@ func newQemuHypervisorConfig(h hypervisor) (vc.HypervisorConfig, error) {
 			errors.New("cannot enable virtio-fs without daemon path in configuration file")
 	}
 
+	if sharedFS == config.VirtioFSNydus && h.VirtioFSNydusd == "" {
+		return vc.HypervisorConfig{},
+			errors.New("cannot enable virtio nydus without nydusd daemon path in configuration file")
+	}
+
 	if vSock, err := utils.SupportsVsocks(); !vSock {
 		return vc.HypervisorConfig{}, err
 	}
@@ -689,6 +696,8 @@ func newQemuHypervisorConfig(h hypervisor) (vc.HypervisorConfig, error) {
 		VirtioFSCacheSize:       h.VirtioFSCacheSize,
 		VirtioFSCache:           h.defaultVirtioFSCache(),
 		VirtioFSExtraArgs:       h.VirtioFSExtraArgs,
+		VirtioFSNydusd:          h.VirtioFSNydusd,
+		VirtioFSNydusdExtraArgs: h.VirtioFSNydusdExtraArgs,
 		MemPrealloc:             h.MemPrealloc,
 		HugePages:               h.HugePages,
 		IOMMU:                   h.IOMMU,

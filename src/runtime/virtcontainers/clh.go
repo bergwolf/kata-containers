@@ -159,7 +159,7 @@ func (s *CloudHypervisorState) reset() {
 type cloudHypervisor struct {
 	store     persistapi.PersistDriver
 	console   console.Console
-	virtiofsd Virtiofsd
+	virtiofsd VirtiofsDaemon
 	APIClient clhClient
 	ctx       context.Context
 	id        string
@@ -750,14 +750,14 @@ func (clh *cloudHypervisor) toGrpc(ctx context.Context) ([]byte, error) {
 func (clh *cloudHypervisor) Save() (s persistapi.HypervisorState) {
 	s.Pid = clh.state.PID
 	s.Type = string(ClhHypervisor)
-	s.VirtiofsdPid = clh.state.VirtiofsdPID
+	s.VirtiofsDaemonPid = clh.state.VirtiofsdPID
 	s.APISocket = clh.state.apiSocket
 	return
 }
 
 func (clh *cloudHypervisor) Load(s persistapi.HypervisorState) {
 	clh.state.PID = s.Pid
-	clh.state.VirtiofsdPID = s.VirtiofsdPid
+	clh.state.VirtiofsdPID = s.VirtiofsDaemonPid
 	clh.state.apiSocket = s.APISocket
 }
 

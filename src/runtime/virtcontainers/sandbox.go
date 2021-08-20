@@ -1208,7 +1208,6 @@ func (s *Sandbox) startVM(ctx context.Context) (err error) {
 	}); err != nil {
 		return err
 	}
-
 	// In case of vm factory, network interfaces are hotplugged
 	// after vm is started.
 	if s.factory != nil {
@@ -1304,7 +1303,6 @@ func (s *Sandbox) CreateContainer(ctx context.Context, contConfig ContainerConfi
 	if err != nil {
 		return nil, err
 	}
-
 	// create and start the container
 	if err = c.create(ctx); err != nil {
 		return nil, err

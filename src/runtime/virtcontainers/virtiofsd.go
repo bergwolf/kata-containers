@@ -34,13 +34,19 @@ var (
 	errVirtiofsdSocketPathEmpty    = errors.New("virtiofsd socket path is empty")
 	errVirtiofsdSourcePathEmpty    = errors.New("virtiofsd source path is empty")
 	errVirtiofsdSourceNotAvailable = errors.New("virtiofsd source path not available")
+
+	errUnimplemented = errors.New("unimplemented")
 )
 
-type Virtiofsd interface {
+type VirtiofsDaemon interface {
 	// Start virtiofsd, return pid of virtiofsd process
 	Start(context.Context, onQuitFunc) (pid int, err error)
 	// Stop virtiofsd process
 	Stop(context.Context) error
+	// for NydusdVirtiofs to mount rafs
+	MountRAFS(opt MountOption) error
+	// for NydusdVirtiofs to umount rafs
+	UmountRAFS(mountpoint string) error
 }
 
 // Helper function to execute when virtiofsd quit
@@ -155,6 +161,7 @@ func (v *virtiofsd) Start(ctx context.Context, onQuit onQuitFunc) (int, error) {
 
 func (v *virtiofsd) Stop(ctx context.Context) error {
 	if err := v.kill(ctx); err != nil {
+		v.Logger().WithError(err).WithField("pid", v.PID).Warn("kill virtiofsd failed")
 		return nil
 	}
 
@@ -163,6 +170,14 @@ func (v *virtiofsd) Stop(ctx context.Context) error {
 		v.Logger().WithError(err).WithField("path", v.socketPath).Warn("removing virtiofsd socket failed")
 	}
 	return nil
+}
+
+func (v *virtiofsd) MountRAFS(opt MountOption) error {
+	return errUnimplemented
+}
+
+func (v *virtiofsd) UmountRAFS(mountpoint string) error {
+	return errUnimplemented
 }
 
 func (v *virtiofsd) args(FdSocketNumber uint) ([]string, error) {
@@ -232,7 +247,6 @@ func (v *virtiofsd) kill(ctx context.Context) (err error) {
 	if err != nil {
 		v.PID = 0
 	}
-
 	return err
 }
 
@@ -243,6 +257,14 @@ type virtiofsdMock struct {
 // Start the virtiofsd daemon
 func (v *virtiofsdMock) Start(ctx context.Context, onQuit onQuitFunc) (int, error) {
 	return 9999999, nil
+}
+
+func (v *virtiofsdMock) MountRAFS(opt MountOption) error {
+	return errUnimplemented
+}
+
+func (v *virtiofsdMock) UmountRAFS(mountpoint string) error {
+	return errUnimplemented
 }
 
 func (v *virtiofsdMock) Stop(ctx context.Context) error {

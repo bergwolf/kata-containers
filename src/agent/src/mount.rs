@@ -24,7 +24,7 @@ use crate::device::{
     get_scsi_device_name, get_virtio_blk_pci_device_name, online_device, wait_for_pmem_device,
     DRIVER_9P_TYPE, DRIVER_BLK_CCW_TYPE, DRIVER_BLK_TYPE, DRIVER_EPHEMERAL_TYPE, DRIVER_LOCAL_TYPE,
     DRIVER_MMIO_BLK_TYPE, DRIVER_NVDIMM_TYPE, DRIVER_SCSI_TYPE, DRIVER_VIRTIOFS_TYPE,
-    DRIVER_WATCHABLE_BIND_TYPE,
+    DRIVER_WATCHABLE_BIND_TYPE, DRIVER_OVERLAYFS_TYPE
 };
 use crate::linux_abi::*;
 use crate::pci;
@@ -39,7 +39,6 @@ use tracing::instrument;
 pub const TYPE_ROOTFS: &str = "rootfs";
 
 pub const MOUNT_GUEST_TAG: &str = "kataShared";
-
 // Allocating an FSGroup that owns the pod's volumes
 const FS_GID: &str = "fsgid";
 
@@ -130,6 +129,7 @@ pub const STORAGE_HANDLER_LIST: &[&str] = &[
     DRIVER_9P_TYPE,
     DRIVER_VIRTIOFS_TYPE,
     DRIVER_EPHEMERAL_TYPE,
+    DRIVER_OVERLAYFS_TYPE,
     DRIVER_MMIO_BLK_TYPE,
     DRIVER_LOCAL_TYPE,
     DRIVER_SCSI_TYPE,
@@ -231,6 +231,15 @@ async fn ephemeral_storage_handler(
     }
 
     Ok("".to_string())
+}
+
+#[instrument]
+async fn overlayfs_storage_handler(
+    logger: &Logger,
+    storage: &Storage,
+    sandbox: Arc<Mutex<Sandbox>>,
+) -> Result<String> {
+    common_storage_handler(logger, storage)
 }
 
 #[instrument]
@@ -538,6 +547,9 @@ pub async fn add_storages(
             }
             DRIVER_EPHEMERAL_TYPE => {
                 ephemeral_storage_handler(&logger, &storage, sandbox.clone()).await
+            }
+            DRIVER_OVERLAYFS_TYPE => {
+                overlayfs_storage_handler(&logger, &storage, sandbox.clone()).await
             }
             DRIVER_MMIO_BLK_TYPE => {
                 virtiommio_blk_storage_handler(&logger, &storage, sandbox.clone()).await
