@@ -78,6 +78,9 @@ function waitForLabelRemoval() {
 
 function run_test() {
     YAMLPATH="./tools/packaging/kata-deploy/"
+    echo "setup RBAC"
+    kubectl apply -f "$YAMLPATH/kata-rbac/base/kata-rbac.yaml"
+
     echo "verify connectivity with a pod using Kata"
 
     deployment=""
