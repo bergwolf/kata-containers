@@ -21,4 +21,4 @@ source /test-kata.sh
 trap destroy_aks EXIT
 
 setup_aks
-test_kata || kubectl describe deployments/nginx-deployment-qemu
+test_kata
