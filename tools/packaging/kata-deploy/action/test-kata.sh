@@ -9,6 +9,16 @@ set -o errexit
 set -o pipefail
 set -o nounset
 
+finish() {
+	echo bergwolf1
+	kubectl get pods
+	echo bergwolf2
+	kubectl describe pods
+	echo bergwolf3
+}
+
+trap finish EXIT
+
 function die() {
     msg="$*"
     echo "ERROR: $msg" >&2
