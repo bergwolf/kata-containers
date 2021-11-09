@@ -23,6 +23,13 @@ function die() {
 function destroy_aks() {
     set +x
 
+    echo bergwolf1
+    kubectl describe pods
+    echo bergwolf2
+    kubectl describe deployments
+    echo bergwolf3
+    journalctl -t containerd
+    echo bergwolfdone
     export KUBECONFIG="${PWD}/_output/${DNS_PREFIX}/kubeconfig/kubeconfig.${LOCATION}.json"
 
     az login --service-principal -u "$AZ_APPID" -p "$AZ_PASSWORD" --tenant "$AZ_TENANT_ID"
