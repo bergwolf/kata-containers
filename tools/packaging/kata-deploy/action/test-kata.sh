@@ -5,9 +5,19 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
-set -o errexit
 set -o pipefail
 set -o nounset
+set +e
+
+finish() {
+	echo bergwolf1
+	kubectl get pods
+	echo bergwolf2
+	kubectl describe pods
+	echo bergwolf3
+}
+
+trap finish EXIT
 
 finish() {
 	echo bergwolf1
@@ -85,7 +95,7 @@ function run_test() {
       # our 'wait' for deployment status will fail to find the deployment at all
       sleep 3 
 
-      kubectl wait --timeout=5m --for=condition=Available deployment/${deployment}
+      kubectl wait --timeout=5m --for=condition=Available deployment/${deployment} || kubectl describe pods
       kubectl expose deployment/${deployment}
 
       # test pod connectivity:
@@ -171,3 +181,5 @@ function test_kata() {
 
     set +x
 }
+
+set -e
