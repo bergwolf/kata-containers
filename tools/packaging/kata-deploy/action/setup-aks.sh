@@ -28,7 +28,8 @@ function destroy_aks() {
     echo bergwolf2
     kubectl describe deployments
     echo bergwolf3
-    journalctl -t containerd
+    which containerd
+    containerd --version
     echo bergwolfdone
     export KUBECONFIG="${PWD}/_output/${DNS_PREFIX}/kubeconfig/kubeconfig.${LOCATION}.json"
 

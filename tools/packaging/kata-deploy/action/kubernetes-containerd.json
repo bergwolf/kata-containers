@@ -6,6 +6,7 @@
       "orchestratorVersion": "1.20.5",
       "kubernetesConfig": {
         "containerRuntime": "containerd",
+	"containerdVersion": "1.5.2",
         "useManagedIdentity": false
       }
     },
