@@ -6,7 +6,7 @@
       "orchestratorVersion": "1.20.5",
       "kubernetesConfig": {
         "containerRuntime": "containerd",
-	"linuxContainerdURL": "https://github.com/containerd/containerd/releases/download/v1.5.7/containerd-1.5.7-linux-amd64.tar.gz",
+	"linuxContainerdURL": "https",
         "useManagedIdentity": false
       }
     },
