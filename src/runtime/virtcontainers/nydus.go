@@ -124,19 +124,19 @@ func (nd *nydusd) setupPassthroughFS() error {
 	return nc.Mount(sharedPathInGuest, mr)
 }
 
-func (nd *nydusd) MountRAFS(opt MountOption) error {
+func (nd *nydusd) Mount(opt MountOption) error {
 	nc, err := NewNydusClient(nd.apiSockPath)
 	if err != nil {
 		return err
 	}
-	nd.Logger().WithField("from", opt.bootstrap).
+	nd.Logger().WithField("from", opt.source).
 		WithField("dest", opt.mountpoint).Info("prepare mount rafs")
 
-	mr := NewMountRequest(nydusRafsType, opt.bootstrap, opt.daemonConfig)
+	mr := NewMountRequest(nydusRafsType, opt.source, opt.config)
 	return nc.Mount(opt.mountpoint, mr)
 }
 
-func (nd *nydusd) UmountRAFS(mountpoint string) error {
+func (nd *nydusd) Umount(mountpoint string) error {
 	nc, err := NewNydusClient(nd.apiSockPath)
 	if err != nil {
 		return err
@@ -197,11 +197,6 @@ type ErrorMessage struct {
 	Message string `json:"message"`
 }
 
-type MountOption struct {
-	mountpoint   string
-	bootstrap    string
-	daemonConfig string
-}
 type MountRequest struct {
 	FsType string `json:"fs_type"`
 	Source string `json:"source"`

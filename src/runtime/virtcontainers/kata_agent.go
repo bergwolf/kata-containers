@@ -148,12 +148,6 @@ func newKataAgent() agent {
 	return &kataAgent{}
 }
 
-// Rafs represents Registry Acceleration File System,
-// details refer to https://github.com/dragonflyoss/image-service/blob/master/docs/nydus-design.md
-var rafsMountPath = func(cid string) string {
-	return filepath.Join("/images", cid, lowerDir)
-}
-
 // The function is declared this way for mocking in unit tests
 var kataHostSharedDir = func() string {
 	if rootless.IsRootless() {
@@ -188,16 +182,22 @@ func getSandboxPath(id string) string {
 	return filepath.Join(kataHostSharedDir(), id)
 }
 
-// Use in nydus case, passthrough_fs is compatible with original sharedir
-// root = "/run/kata-containers/shared/"
-// passthrough_fs = "/run/kata-containers/shared/containers"
-// rafs = "/run/kata-containers/shared/images"
+// Use in nydus case, guest shared dir is compatible with virtiofsd sharedir
+// nydus images are presented in kataGuestNydusImageDir
+//
+// virtiofs mountpoint: "/run/kata-containers/shared/"
+// kataGuestSharedDir: "/run/kata-containers/shared/containers"
+// kataGuestNydusImageDir: "/run/kata-containers/shared/images"
 var kataGuestNydusRootDir = func() string {
 	if rootless.IsRootless() {
 		// filepath.Join removes trailing slashes, but it is necessary for mounting
 		return filepath.Join(rootless.GetRootlessDir(), defaultKataGuestNydusRootDir) + "/"
 	}
 	return defaultKataGuestNydusRootDir
+}
+
+var imageMountPath = func(cid string) string {
+	return filepath.Join("/images", cid, lowerDir)
 }
 
 var kataGuestNydusImageDir = func() string {
@@ -1283,13 +1283,13 @@ func (k *kataAgent) buildContainerRootfsWithNydus(sandbox *Sandbox, c *Container
 		return nil, err
 	}
 	mountOpt := &MountOption{
-		mountpoint:   rafsMountPath(c.id),
-		bootstrap:    extraOption.Source,
-		daemonConfig: extraOption.Config,
+		mountpoint: imageMountPath(c.id),
+		source:     extraOption.Source,
+		config:     extraOption.Config,
 	}
 	k.Logger().Infof("nydus option: %v", extraOption)
 	// mount lowerdir to guest /run/kata-containers/shared/images/<cid>/lowerdir
-	if err := q.virtiofsDaemon.MountRAFS(*mountOpt); err != nil {
+	if err := q.virtiofsDaemon.Mount(*mountOpt); err != nil {
 		return nil, err
 	}
 	rootfs := &grpc.Storage{}

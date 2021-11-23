@@ -395,8 +395,8 @@ func nydusContainerCleanup(ctx context.Context, sharedDir string, c *Container) 
 		return errors.New("nydus only support qemu currently")
 	}
 	q, _ := sandbox.hypervisor.(*qemu)
-	if err := q.virtiofsDaemon.UmountRAFS(rafsMountPath(c.id)); err != nil {
-		return errors.Wrap(err, "umount rafs err")
+	if err := q.virtiofsDaemon.Umount(imageMountPath(c.id)); err != nil {
+		return errors.Wrap(err, "umount virtiofs submount failed")
 	}
 	if err := bindUnmountContainerSnapshotDir(ctx, sharedDir, c.id); err != nil {
 		return errors.Wrap(err, "umount snapshotdir err")

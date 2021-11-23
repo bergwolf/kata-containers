@@ -43,10 +43,16 @@ type VirtiofsDaemon interface {
 	Start(context.Context, onQuitFunc) (pid int, err error)
 	// Stop virtiofsd process
 	Stop(context.Context) error
-	// for NydusdVirtiofs to mount rafs
-	MountRAFS(opt MountOption) error
-	// for NydusdVirtiofs to umount rafs
-	UmountRAFS(mountpoint string) error
+	// Add a submount to the virtiofs mountpoint
+	Mount(opt MountOption) error
+	// Umount a submount from the virtiofs mountpoint
+	Umount(mountpoint string) error
+}
+
+type MountOption struct {
+	source     string
+	mountpoint string
+	config     string
 }
 
 // Helper function to execute when virtiofsd quit
@@ -172,11 +178,11 @@ func (v *virtiofsd) Stop(ctx context.Context) error {
 	return nil
 }
 
-func (v *virtiofsd) MountRAFS(opt MountOption) error {
+func (v *virtiofsd) Mount(opt MountOption) error {
 	return errUnimplemented
 }
 
-func (v *virtiofsd) UmountRAFS(mountpoint string) error {
+func (v *virtiofsd) Umount(mountpoint string) error {
 	return errUnimplemented
 }
 
@@ -259,11 +265,11 @@ func (v *virtiofsdMock) Start(ctx context.Context, onQuit onQuitFunc) (int, erro
 	return 9999999, nil
 }
 
-func (v *virtiofsdMock) MountRAFS(opt MountOption) error {
+func (v *virtiofsdMock) Mount(opt MountOption) error {
 	return errUnimplemented
 }
 
-func (v *virtiofsdMock) UmountRAFS(mountpoint string) error {
+func (v *virtiofsdMock) Umount(mountpoint string) error {
 	return errUnimplemented
 }
 
