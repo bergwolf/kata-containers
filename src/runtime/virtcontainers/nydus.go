@@ -18,10 +18,11 @@ import (
 	"time"
 
 	"github.com/cenkalti/backoff"
-	"github.com/kata-containers/kata-containers/src/runtime/pkg/katautils/katatrace"
+	"github.com/containernetworking/plugins/pkg/ns"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
-	log "github.com/sirupsen/logrus"
+
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/katautils/katatrace"
 )
 
 const (
@@ -35,6 +36,8 @@ const (
 	nydusPassthroughfsType = "passthrough_fs"
 
 	sharedPathInGuest = "/containers"
+
+	shimNsPath = "/proc/self/ns/net"
 )
 
 var nydusdTracingTags = map[string]string{
@@ -78,9 +81,14 @@ func (nd *nydusd) Start(ctx context.Context, onQuit onQuitFunc) (int, error) {
 		"args": strings.Join(args, " "),
 	}
 	nd.Logger().WithFields(fields).Info()
-	if err := cmd.Start(); err != nil {
+
+	// Create nydusd in shim netns as it needs to access host network
+	if err = doNetNS(shimNsPath, func(_ ns.NetNS) error {
+		return cmd.Start()
+	}); err != nil {
 		return pid, err
 	}
+
 	// Monitor nydusd's stdout/stderr and stop sandbox if nydusd quits
 	go func() {
 		scanner := bufio.NewScanner(r)
@@ -150,7 +158,7 @@ func (nd *nydusd) Stop(ctx context.Context) error {
 	return nil
 }
 
-func (nd *nydusd) Logger() *log.Entry {
+func (nd *nydusd) Logger() *logrus.Entry {
 	return virtLog.WithField("subsystem", "nydusd")
 }
 
