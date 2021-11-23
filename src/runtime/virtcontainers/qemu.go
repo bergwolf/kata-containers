@@ -493,12 +493,12 @@ func (q *qemu) createVirtiofsDaemon() (VirtiofsDaemon, error) {
 			logLevel = "debug"
 		}
 		return &nydusd{
-			path:        q.config.VirtioFSNydusd,
+			path:        q.config.VirtioFSDaemon,
 			sockPath:    virtiofsdSocketPath,
 			apiSockPath: apiSockPath,
 			sourcePath:  filepath.Join(getSharePath(q.id)),
 			logLevel:    logLevel,
-			extraArgs:   q.config.VirtioFSNydusdExtraArgs,
+			extraArgs:   q.config.VirtioFSExtraArgs,
 		}, nil
 	}
 
