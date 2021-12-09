@@ -108,4 +108,4 @@ When run in this way, the agent can be controlled using the low-level Kata
 agent control tool, rather than the Kata runtime.
 
 For further details, see the
-[agent control tool documentation](../../tools/agent-ctl/README.md#run-the-tool-and-the-agent-in-the-same-environment).
+[agent control tool documentation](../tools/agent-ctl/README.md#run-the-tool-and-the-agent-in-the-same-environment).
