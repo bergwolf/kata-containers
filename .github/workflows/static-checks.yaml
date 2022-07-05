@@ -73,6 +73,23 @@ jobs:
         echo "Set environment variables for the libseccomp crate to link the libseccomp library statically"
         echo "LIBSECCOMP_LINK_TYPE=static" >> $GITHUB_ENV
         echo "LIBSECCOMP_LIB_PATH=${libseccomp_install_dir}/lib" >> $GITHUB_ENV
+    - name: Cache Go
+      uses: actions/cache@v2
+      with:
+        path: /go/pkg/mod
+        key: ${{ runner.os }}-go-${{ hashFiles('**/src/runtime/go.sum') }}
+        restore-keys: |
+          ${{ runner.os }}-go
+    - name: Cache Cargo
+      uses: Swatinem/rust-cache@v1
+      with:
+        target-dir: |
+          ./src/agent/target
+          ./src/tools/agent-ctl/target
+          ./src/tools/runk/target
+          ./src/tools/trace-forwarder/target
+        cache-on-failure: true
+        key: ${{ runner.os }}-cargo-amd64
     # Check whether the vendored code is up-to-date & working as the first thing
     - name: Check vendored code
       if: ${{ !contains(github.event.pull_request.labels.*.name, 'force-skip-ci') }}
