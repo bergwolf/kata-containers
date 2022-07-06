@@ -88,7 +88,7 @@ pub const SYSFS_BUS_PCI_PATH: &str = "/sys/bus/pci";
 pub const SYSFS_CGROUPPATH: &str = "/sys/fs/cgroup";
 pub const SYSFS_ONLINE_FILE: &str = "online";
 
-pub const PROC_MOUNTSTATS: &str = "/proc/self/mountstats";
+pub const PROC_MOUNTSTATS: &str = "/proc/mounts";
 pub const PROC_CGROUPS: &str = "/proc/cgroups";
 
 pub const SYSTEM_DEV_PATH: &str = "/dev";

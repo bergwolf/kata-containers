@@ -843,7 +843,8 @@ pub fn get_mount_fs_type_from_file(mount_file: &str, mount_point: &str) -> Resul
     let content = fs::read_to_string(mount_file)
         .map_err(|e| anyhow!("read mount file {}: {}", mount_file, e))?;
 
-    let re = Regex::new(format!("device .+ mounted on {} with fstype (.+)", mount_point).as_str())?;
+    // Format: /dev/sda1 /mountpoint ext4 rw,relatime 0 0
+    let re = Regex::new(format!(".+ {} (.+) .+ .+ .+", mount_point).as_str())?;
 
     // Read the file line by line using the lines() iterator from std::io::BufRead.
     for (_index, line) in content.lines().enumerate() {
@@ -1317,13 +1318,13 @@ mod tests {
             },
             TestData {
                 // contents missing fields
-                contents: "device /dev/mapper/root mounted on /",
+                contents: "/dev/sda1 /ext4 rw,nosuid,nodev,noexec,relatime,size=5120k 0 0",
                 mount_point: "/",
                 error_contains: "failed to find FS type for mount point /",
                 fs_type: "",
             },
             TestData {
-                contents: "device /dev/mapper/root mounted on / with fstype ext4",
+                contents: "/dev/sda1 / ext4 rw,nosuid,nodev,noexec,relatime,size=5120k 0 0",
                 mount_point: "/",
                 error_contains: "",
                 fs_type: "ext4",
