@@ -10,7 +10,7 @@ on:
 name: Static checks dragonball
 jobs:
   test-dragonball:
-    runs-on: self-hosted
+    runs-on: ubuntu-20.04
     env:
       RUST_BACKTRACE: "1"
     steps:
@@ -19,6 +19,13 @@ jobs:
         if: ${{ !contains(github.event.pull_request.labels.*.name, 'force-skip-ci') }}
         run: |
           echo "GOPATH=${{ github.workspace }}" >> $GITHUB_ENV
+      - name: Check kvm
+        run: |
+          sudo modprobe kvm
+          sudo ls /dev/kvm || echo haha no /dev/kvm yet
+          sudo modprobe kvm_intel || echo modprobe kvm_intel failed
+          sudo dmesg | tail
+          ls /dev/kvm
       - name: Install Rust
         if: ${{ !contains(github.event.pull_request.labels.*.name, 'force-skip-ci') }}
         run: |
