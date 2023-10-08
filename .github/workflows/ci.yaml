@@ -1,4 +1,4 @@
-name: Run the Kata Containers CI
+name: Run the Kata Containers CI haha
 on:
   workflow_call:
     inputs:
