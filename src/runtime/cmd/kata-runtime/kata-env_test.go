@@ -14,7 +14,6 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
-	goruntime "runtime"
 	"strings"
 	"testing"
 
@@ -89,6 +88,8 @@ func makeRuntimeConfig(prefixDir string) (configFile string, ociConfig oci.Runti
 	enableIOThreads := true
 	hotPlugVFIO = config.BridgePort
 	coldPlugVFIO = config.NoPort
+	pcieRootPort := uint32(0)
+	pcieSwitchPort := uint32(0)
 	disableNewNetNs := false
 	sharedFS := "virtio-9p"
 	virtioFSdaemon := filepath.Join(prefixDir, "virtiofsd")
@@ -133,8 +134,10 @@ func makeRuntimeConfig(prefixDir string) (configFile string, ociConfig oci.Runti
 		EnableIOThreads:      enableIOThreads,
 		HotPlugVFIO:          hotPlugVFIO,
 		ColdPlugVFIO:         coldPlugVFIO,
+		PCIeRootPort:         pcieRootPort,
+		PCIeSwitchPort:       pcieSwitchPort,
 		DisableNewNetNs:      disableNewNetNs,
-		DefaultVCPUCount:     hypConfig.NumVCPUs,
+		DefaultVCPUCount:     hypConfig.NumVCPUs(),
 		DefaultMaxVCPUCount:  hypConfig.DefaultMaxVCPUs,
 		DefaultMemSize:       hypConfig.MemorySize,
 		DefaultMsize9p:       hypConfig.Msize9p,
@@ -180,7 +183,7 @@ func genericGetExpectedHostDetails(tmpdir string, expectedVendor string, expecte
 	}
 
 	const expectedKernelVersion = "99.1"
-	const expectedArch = goruntime.GOARCH
+	const expectedArch = runtime.GOARCH
 
 	expectedDistro := DistroInfo{
 		Name:    "Foo",
@@ -250,7 +253,7 @@ VERSION_ID="%s"
 		}
 	}
 
-	if goruntime.GOARCH == "arm64" {
+	if runtime.GOARCH == "arm64" {
 		expectedHostDetails.CPU.Vendor = "ARM Limited"
 		expectedHostDetails.CPU.Model = "v8"
 	}
@@ -276,6 +279,8 @@ func getExpectedHypervisor(config oci.RuntimeConfig) HypervisorInfo {
 		VirtioFSDaemon:    config.HypervisorConfig.VirtioFSDaemon,
 		HotPlugVFIO:       config.HypervisorConfig.HotPlugVFIO,
 		ColdPlugVFIO:      config.HypervisorConfig.ColdPlugVFIO,
+		PCIeRootPort:      config.HypervisorConfig.PCIeRootPort,
+		PCIeSwitchPort:    config.HypervisorConfig.PCIeSwitchPort,
 	}
 
 	if os.Geteuid() == 0 {
@@ -369,6 +374,10 @@ func TestEnvGetMetaInfo(t *testing.T) {
 }
 
 func TestEnvGetHostInfo(t *testing.T) {
+	if os.Getenv("GITHUB_RUNNER_CI_NON_VIRT") == "true" {
+		t.Skip("Skipping the test as the GitHub self hosted runners for ARM64 do not support Virtualization")
+	}
+
 	tmpdir := t.TempDir()
 
 	expectedHostDetails, err := getExpectedHostDetails(tmpdir)
@@ -429,6 +438,10 @@ func TestEnvGetHostInfoNoProcVersion(t *testing.T) {
 }
 
 func TestEnvGetEnvInfo(t *testing.T) {
+	if os.Getenv("GITHUB_RUNNER_CI_NON_VIRT") == "true" {
+		t.Skip("Skipping the test as the GitHub self hosted runners for ARM64 do not support Virtualization")
+	}
+
 	tmpdir := t.TempDir()
 
 	// Run test twice to ensure the individual component debug+trace
@@ -457,6 +470,10 @@ func TestEnvGetEnvInfo(t *testing.T) {
 }
 
 func TestEnvGetEnvInfoNoHypervisorVersion(t *testing.T) {
+	if os.Getenv("GITHUB_RUNNER_CI_NON_VIRT") == "true" {
+		t.Skip("Skipping the test as the GitHub self hosted runners for ARM64 do not support Virtualization")
+	}
+
 	assert := assert.New(t)
 
 	tmpdir := t.TempDir()
@@ -910,7 +927,6 @@ func TestGetHypervisorInfoSocket(t *testing.T) {
 	}
 
 	hypervisors := []TestHypervisorDetails{
-		{vc.AcrnHypervisor, false},
 		{vc.ClhHypervisor, true},
 		{vc.FirecrackerHypervisor, true},
 		{vc.MockHypervisor, false},

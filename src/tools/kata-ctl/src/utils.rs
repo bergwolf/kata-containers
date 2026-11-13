@@ -30,7 +30,7 @@ pub const PROC_VERSION_FILE: &str = "/proc/version";
 
 pub fn get_kernel_version(proc_version_file: &str) -> Result<String> {
     let contents = fs::read_to_string(proc_version_file)
-        .context(format!("Failed to read file {}", proc_version_file))?;
+        .context(format!("Failed to read file {proc_version_file}"))?;
 
     let fields: Vec<&str> = contents.split_whitespace().collect();
 
@@ -70,11 +70,7 @@ pub fn get_distro_details(os_release: &str, os_release_clr: &str) -> Result<(Str
                 if e.kind() == std::io::ErrorKind::NotFound {
                     continue;
                 } else {
-                    return Err(anyhow!(
-                        "Error reading file {}: {}",
-                        release_file,
-                        e.to_string()
-                    ));
+                    return Err(anyhow!("Error reading file {}: {}", release_file, e));
                 }
             }
             Ok(contents) => {
@@ -105,7 +101,13 @@ pub fn get_distro_details(os_release: &str, os_release_clr: &str) -> Result<(Str
     Ok((name, version))
 }
 
-#[cfg(any(target_arch = "s390x", target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg(any(
+    target_arch = "s390x",
+    target_arch = "x86_64",
+    target_arch = "aarch64",
+    all(target_arch = "powerpc64", target_endian = "little"),
+))]
+#[allow(clippy::const_is_empty)]
 pub fn get_generic_cpu_details(cpu_info_file: &str) -> Result<(String, String)> {
     let cpu_info = kata_sys_util::cpu::get_single_cpu_info(cpu_info_file, "\n\n")?;
     let lines = cpu_info.lines();
@@ -147,7 +149,7 @@ pub fn supports_vsocks(vsock_path: &str) -> Result<bool> {
     let metadata = fs::metadata(vsock_path).map_err(|err| {
         anyhow!(
             "Host system does not support vhost-vsock (try running (`sudo modprobe vhost_vsock`) : {}",
-            err.to_string()
+            err
         )
     })?;
     Ok(metadata.is_file())
@@ -157,14 +159,43 @@ pub fn supports_vsocks(vsock_path: &str) -> Result<bool> {
 mod tests {
     use super::*;
     use serial_test::serial;
+    use std::env;
     use std::io::Write;
+    use std::process::Command;
     use tempfile::tempdir;
 
+    /// Set on the copy of the test binary that does the dropping, so it knows
+    /// to do it rather than start another one.
+    const DROP_PRIVS_CHILD: &str = "KATA_CTL_TEST_DROP_PRIVS_CHILD";
+
+    /// Dropping privileges cannot be undone and applies to the whole process,
+    /// and every test here runs in a thread of one. Dropping in place would
+    /// take root away from whatever else is running, which under `sudo make
+    /// test` leaves the longer tests unable to touch the files they created.
+    /// So run the real thing in a fresh copy of this binary and go by what it
+    /// exits with. A new process rather than a fork of this one: looking a
+    /// user up in the child of a process this threaded is a way to deadlock.
     #[test]
     #[serial]
     fn test_drop_privs() {
-        let res = drop_privs();
-        assert!(res.is_ok());
+        if env::var_os(DROP_PRIVS_CHILD).is_some() {
+            drop_privs().unwrap();
+            return;
+        }
+
+        let before = nix::unistd::Uid::effective();
+        let status = Command::new(env::current_exe().unwrap())
+            .args(["utils::tests::test_drop_privs", "--exact", "--nocapture"])
+            .env(DROP_PRIVS_CHILD, "1")
+            .status()
+            .unwrap();
+
+        assert!(status.success(), "dropping privileges failed: {}", status);
+        assert_eq!(
+            nix::unistd::Uid::effective(),
+            before,
+            "the suite dropped its own privileges"
+        );
     }
 
     #[test]
@@ -262,7 +293,7 @@ mod tests {
             arch_specific::ARCH_CPU_MODEL_FIELD,
             expected_model_name
         );
-        writeln!(file, "{}", contents).unwrap();
+        writeln!(file, "{contents}").unwrap();
         let res = get_generic_cpu_details(path.to_str().unwrap());
         assert_eq!(res.as_ref().unwrap().0, expected_vendor_id);
         assert_eq!(res.as_ref().unwrap().1, expected_model_name);

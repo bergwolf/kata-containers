@@ -9,7 +9,7 @@ use std::convert::TryFrom;
 
 use serde::{Deserialize, Serialize};
 
-pub const DEFAULT_REMOVE_CONTAINER_REQUEST_TIMEOUT: u32 = 10;
+use oci_spec::runtime as oci;
 
 #[derive(PartialEq, Clone, Default)]
 pub struct Empty {}
@@ -40,7 +40,7 @@ pub struct StringUser {
     pub additional_gids: Vec<String>,
 }
 
-#[derive(PartialEq, Clone, Default)]
+#[derive(PartialEq, Clone, Debug, Default)]
 pub struct Device {
     pub id: String,
     pub field_type: String,
@@ -58,6 +58,16 @@ pub struct Storage {
     pub fs_group: Option<FSGroup>,
     pub options: Vec<String>,
     pub mount_point: String,
+    pub shared: bool,
+}
+
+#[derive(PartialEq, Clone, Default)]
+pub struct SharedMount {
+    pub name: String,
+    pub src_ctr: String,
+    pub src_path: String,
+    pub dst_ctr: String,
+    pub dst_path: String,
 }
 
 #[derive(Deserialize, Default, Clone, PartialEq, Eq, Debug, Hash)]
@@ -82,7 +92,7 @@ pub struct Interface {
     pub mtu: u64,
     pub hw_addr: String,
     #[serde(default)]
-    pub pci_addr: String,
+    pub device_path: String,
     #[serde(default)]
     pub field_type: String,
     #[serde(default)]
@@ -102,6 +112,8 @@ pub struct Route {
     pub source: String,
     pub scope: u32,
     pub family: IPFamily,
+    pub flags: u32,
+    pub mtu: u32,
 }
 
 #[derive(Deserialize, Debug, PartialEq, Clone, Default)]
@@ -118,6 +130,10 @@ pub struct CreateContainerRequest {
     pub oci: Option<oci::Spec>,
     pub sandbox_pidns: bool,
     pub rootfs_mounts: Vec<oci::Mount>,
+    pub shared_mounts: Vec<SharedMount>,
+    pub stdin_port: Option<u32>,
+    pub stdout_port: Option<u32>,
+    pub stderr_port: Option<u32>,
 }
 
 #[derive(PartialEq, Clone, Default)]
@@ -159,14 +175,12 @@ impl ContainerProcessID {
 #[derive(PartialEq, Clone, Debug)]
 pub struct RemoveContainerRequest {
     pub container_id: String,
-    pub timeout: u32,
 }
 
 impl RemoveContainerRequest {
-    pub fn new(id: &str, timeout: u32) -> Self {
+    pub fn new(id: &str) -> Self {
         Self {
             container_id: id.to_string(),
-            timeout,
         }
     }
 }
@@ -175,7 +189,6 @@ impl std::default::Default for RemoveContainerRequest {
     fn default() -> Self {
         Self {
             container_id: "".to_string(),
-            timeout: DEFAULT_REMOVE_CONTAINER_REQUEST_TIMEOUT,
         }
     }
 }
@@ -242,6 +255,9 @@ pub struct ExecProcessRequest {
     pub process_id: ContainerProcessID,
     pub string_user: Option<StringUser>,
     pub process: Option<oci::Process>,
+    pub stdin_port: Option<u32>,
+    pub stdout_port: Option<u32>,
+    pub stderr_port: Option<u32>,
 }
 
 #[derive(PartialEq, Clone, Default, Debug)]
@@ -444,7 +460,7 @@ impl TryFrom<String> for KernelModule {
             } else if flag {
                 // a former param's string contains \"
                 if let Some(former_param) = parameters.pop() {
-                    let cur_param = format!("{} {}", former_param, info);
+                    let cur_param = format!("{former_param} {info}");
                     parameters.push(cur_param);
                 }
             } else {
@@ -511,6 +527,7 @@ pub struct AgentDetails {
     pub device_handlers: Vec<String>,
     pub storage_handlers: Vec<std::string::String>,
     pub supports_seccomp: bool,
+    pub extra_features: Vec<std::string::String>,
 }
 
 #[derive(PartialEq, Clone, Default)]
@@ -581,6 +598,32 @@ pub struct VolumeStatsRequest {
 
 #[derive(PartialEq, Clone, Default, Debug)]
 pub struct VolumeStatsResponse {
+    pub data: String,
+}
+
+#[derive(PartialEq, Clone, Default, Debug)]
+pub struct AddSwapRequest {
+    pub pci_path: Vec<u32>,
+}
+
+#[derive(PartialEq, Clone, Default, Debug)]
+pub struct AddSwapPathRequest {
+    pub path: String,
+}
+
+#[derive(PartialEq, Clone, Default, Debug)]
+pub struct SetPolicyRequest {
+    pub policy: String,
+}
+
+#[derive(PartialEq, Clone, Default, Debug)]
+pub struct GetDiagnosticDataRequest {
+    pub log_type: String,
+    pub container_id: String,
+}
+
+#[derive(PartialEq, Clone, Default, Debug)]
+pub struct GetDiagnosticDataResponse {
     pub data: String,
 }
 

@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use std::{os::unix::fs::FileTypeExt, path::PathBuf};
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use kata_sys_util::validate;
@@ -36,46 +36,40 @@ impl Args {
     /// Check the shim argument object is vaild or not.
     ///
     /// The id, namespace, address and publish_binary are mandatory for START, RUN and DELETE.
-    /// And bundle is mandatory for DELETE.
+    /// And bundle is mandatory for DELETE, though it may already have been removed. Without
+    /// -bundle, it is the working directory, as for shims built on containerd's shim library.
     pub fn validate(&mut self, should_check_bundle: bool) -> Result<()> {
-        if self.id.is_empty()
-            || self.namespace.is_empty()
-            || self.address.is_empty()
-            || self.publish_binary.is_empty()
-        {
+        if self.id.is_empty() || self.namespace.is_empty() || self.publish_binary.is_empty() {
             return Err(anyhow!(Error::ArgumentIsEmpty(format!(
                 "id: {} namespace: {} address: {} publish_binary: {}",
-                &self.id, &self.namespace, &self.address, &self.publish_binary
+                self.id, self.namespace, self.address, self.publish_binary
             ))));
         }
 
         validate::verify_id(&self.id).context("verify container id")?;
         validate::verify_id(&self.namespace).context("verify namespace")?;
 
-        // Ensure `address` is a valid path.
-        let path = PathBuf::from(self.address.clone())
-            .canonicalize()
-            .context(Error::InvalidPath(self.address.clone()))?;
-        let md = path
-            .metadata()
-            .context(Error::FileGetMetadata(format!("{:?}", path)))?;
-        if !md.file_type().is_socket() {
-            return Err(Error::InvalidArgument).context("address is not socket");
-        }
-        self.address = path
-            .to_str()
-            .map(|v| v.to_owned())
-            .ok_or(Error::InvalidArgument)?;
-
         // Ensure `bundle` is a valid path.
         if should_check_bundle {
             if self.bundle.is_empty() {
-                return Err(anyhow!(Error::ArgumentIsEmpty("bundle".to_string())));
+                self.bundle = std::env::current_dir()
+                    .context("get working directory as bundle")?
+                    .to_str()
+                    .ok_or(Error::InvalidArgument)
+                    .context("working directory to string")?
+                    .to_owned();
             }
 
-            let path = PathBuf::from(self.bundle.clone())
-                .canonicalize()
-                .map_err(|_| Error::InvalidArgument)?;
+            let path = match PathBuf::from(self.bundle.clone()).canonicalize() {
+                Ok(path) => path,
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::NotFound
+                        && Path::new(&self.bundle).is_absolute() =>
+                {
+                    return Ok(());
+                }
+                Err(_) => return Err(Error::InvalidArgument.into()),
+            };
             let md = path
                 .metadata()
                 .map_err(|_| Error::InvalidArgument)
@@ -101,10 +95,14 @@ mod tests {
 
     use anyhow::anyhow;
     use kata_sys_util::validate;
+    use serial_test::serial;
 
     #[test]
+    #[serial]
     fn test_args_is_valid() {
         let dir = tempfile::tempdir().unwrap();
+        // Other tests leave the working directory removed, which an empty bundle defaults to.
+        std::env::set_current_dir(dir.path()).unwrap();
         let path = dir.path().to_path_buf();
         let path = path.to_str().unwrap();
         let bind_address = &format!("{}/socket1", path);
@@ -146,7 +144,7 @@ mod tests {
                 should_check_bundle: false,
                 result: Err(anyhow!(Error::ArgumentIsEmpty(format!(
                     "id: {} namespace: {} address: {} publish_binary: {}",
-                    &arg.id, &arg.namespace, &arg.address, &arg.publish_binary
+                    arg.id, arg.namespace, arg.address, arg.publish_binary
                 )))),
             },
             TestData {
@@ -165,7 +163,7 @@ mod tests {
                 should_check_bundle: false,
                 result: Err(anyhow!(Error::ArgumentIsEmpty(format!(
                     "id: {} namespace: {} address: {} publish_binary: {}",
-                    &arg.id, &arg.namespace, &arg.address, &arg.publish_binary
+                    arg.id, arg.namespace, arg.address, arg.publish_binary
                 )))),
             },
             TestData {
@@ -182,10 +180,7 @@ mod tests {
                     arg.clone()
                 },
                 should_check_bundle: false,
-                result: Err(anyhow!(Error::ArgumentIsEmpty(format!(
-                    "id: {} namespace: {} address: {} publish_binary: {}",
-                    &arg.id, &arg.namespace, &arg.address, &arg.publish_binary
-                )))),
+                result: Ok(()),
             },
             TestData {
                 arg: {
@@ -203,7 +198,7 @@ mod tests {
                 should_check_bundle: false,
                 result: Err(anyhow!(Error::ArgumentIsEmpty(format!(
                     "id: {} namespace: {} address: {} publish_binary: {}",
-                    &arg.id, &arg.namespace, &arg.address, &arg.publish_binary
+                    arg.id, arg.namespace, arg.address, arg.publish_binary
                 )))),
             },
             TestData {
@@ -225,7 +220,7 @@ mod tests {
             TestData {
                 arg: arg.clone(),
                 should_check_bundle: true,
-                result: Err(anyhow!(Error::ArgumentIsEmpty("bundle".to_string()))),
+                result: Ok(()),
             },
             TestData {
                 arg: {
@@ -278,22 +273,6 @@ mod tests {
             },
             TestData {
                 arg: {
-                    arg.address = default_address.clone() + "/..";
-                    arg.clone()
-                },
-                should_check_bundle: true,
-                result: Err(anyhow!(Error::InvalidPath(arg.address.clone()))),
-            },
-            TestData {
-                arg: {
-                    arg.address = default_address.clone() + "/..";
-                    arg.clone()
-                },
-                should_check_bundle: true,
-                result: Err(anyhow!(Error::InvalidPath(arg.address.clone()))),
-            },
-            TestData {
-                arg: {
                     arg.address = default_address;
                     arg
                 },
@@ -308,13 +287,55 @@ mod tests {
             let result = t.arg.clone().validate(should_check_bundle);
             let msg = format!("{}, result: {:?}", msg, result);
 
-            if t.result.is_ok() {
-                assert!(result.is_ok(), "{}", msg);
-            } else {
-                let expected_error = format!("{}", t.result.as_ref().unwrap_err());
+            if let Err(expected_err) = &t.result {
+                let expected_error = format!("{expected_err}");
                 let actual_error = format!("{}", result.unwrap_err());
                 assert!(actual_error == expected_error, "{}", msg);
+            } else {
+                assert!(result.is_ok(), "{}", msg);
             }
         }
+    }
+
+    #[test]
+    fn test_args_missing_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut arg = Args {
+            id: "default_id".to_string(),
+            namespace: "default_namespace".to_string(),
+            publish_binary: "containerd".to_string(),
+            ..Default::default()
+        };
+
+        let missing = dir.path().join("removed-bundle");
+        arg.bundle = missing.to_str().unwrap().to_string();
+        arg.validate(true).unwrap();
+        assert_eq!(arg.bundle, missing.to_str().unwrap());
+
+        arg.bundle = "removed-bundle".to_string();
+        let err = arg.validate(true).unwrap_err();
+        assert_eq!(err.to_string(), Error::InvalidArgument.to_string());
+
+        let file = dir.path().join("file");
+        std::fs::write(&file, "").unwrap();
+        arg.bundle = file.to_str().unwrap().to_string();
+        arg.validate(true).unwrap_err();
+    }
+
+    #[test]
+    #[serial]
+    fn test_args_bundle_defaults_to_workdir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        let mut arg = Args {
+            id: "default_id".to_string(),
+            namespace: "default_namespace".to_string(),
+            publish_binary: "containerd".to_string(),
+            ..Default::default()
+        };
+
+        arg.validate(true).unwrap();
+        let workdir = dir.path().canonicalize().unwrap();
+        assert_eq!(arg.bundle, workdir.to_str().unwrap());
     }
 }

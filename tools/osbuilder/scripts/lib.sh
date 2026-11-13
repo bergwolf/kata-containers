@@ -8,6 +8,7 @@ set -e
 
 KATA_REPO=${KATA_REPO:-github.com/kata-containers/kata-containers}
 # Give preference to variable set by CI
+# shellcheck disable=SC2154
 yq_file="${script_dir}/../../../ci/install_yq.sh"
 kata_versions_file="${script_dir}/../../../versions.yaml"
 
@@ -46,9 +47,54 @@ check_program()
 	type "$1" >/dev/null 2>&1
 }
 
+# Subject CNs of root CAs whose private keys are publicly known
+# (https://github.com/kata-containers/kata-containers/issues/14106).
+compromised_ca_cns=(
+	"AAA Certificate Services"
+	"emSign ECC Root CA - G3"
+)
+
+# Print the "subject=" lines among openssl's output on stdin that name one of
+# compromised_ca_cns. OpenSSL 3 prints "CN=name, ...", 1.1.1 prints "/CN=name/..."
+# or "CN = name".
+grep_compromised_ca_subjects()
+{
+	local cns
+	cns=$(IFS='|'; echo "${compromised_ca_cns[*]}")
+	grep -E "^subject=.*CN ?= ?(${cns})(,|/|\$)" || true
+}
+
+# Fail if a CA bundle that ends up in a guest trusts one of compromised_ca_cns.
+check_ca_bundle()
+{
+	local bundle="${1:?CA bundle path is required}"
+	local subjects bad
+
+	check_program openssl || die "openssl is required to inspect ${bundle}"
+	[[ -s "${bundle}" ]] || die "CA bundle ${bundle} is missing or empty"
+
+	subjects=$(openssl crl2pkcs7 -nocrl -certfile "${bundle}" |
+		openssl pkcs7 -print_certs -noout) || die "failed to parse CA bundle ${bundle}"
+	[[ "${subjects}" == *subject=* ]] || die "no certificates found in CA bundle ${bundle}"
+
+	bad=$(grep_compromised_ca_subjects <<<"${subjects}")
+	[[ -z "${bad}" ]] || die "refusing to ship ${bundle}, it trusts compromised CA certificates: ${bad}"
+}
+
+# Succeed if the single PEM certificate in $1 is one of compromised_ca_cns.
+is_compromised_ca_cert()
+{
+	local cert="${1:?certificate path is required}"
+	local subject
+
+	check_program openssl || die "openssl is required to inspect ${cert}"
+	subject=$(openssl x509 -noout -subject -in "${cert}") || die "failed to parse certificate ${cert}"
+	[[ -n "$(grep_compromised_ca_subjects <<<"${subject}")" ]]
+}
+
 check_root()
 {
-	if [ "$(id -u)" != "0" ]; then
+	if [[ "$(id -u)" != "0" ]]; then
 		echo "Root is needed"
 		exit 1
 	fi
@@ -56,6 +102,7 @@ check_root()
 
 generate_dnf_config()
 {
+	# shellcheck disable=SC2154
 	cat > "${DNF_CONF}" << EOF
 [main]
 reposdir=/root/mash
@@ -64,14 +111,16 @@ reposdir=/root/mash
 name=${OS_NAME}-${OS_VERSION} base
 releasever=${OS_VERSION}
 EOF
-	if [ "$BASE_URL" != "" ]; then
-		echo "baseurl=$BASE_URL" >> "$DNF_CONF"
-	elif [ "$METALINK" != "" ]; then
-		echo "metalink=$METALINK" >> "$DNF_CONF"
+	# shellcheck disable=SC2154
+	if [[ "${BASE_URL}" != "" ]]; then
+		echo "baseurl=${BASE_URL}" >> "${DNF_CONF}"
+	elif [[ "${METALINK}" != "" ]]; then
+		echo "metalink=${METALINK}" >> "${DNF_CONF}"
 	fi
 
-	if [ -n "$GPG_KEY_URL" ]; then
-		if [ ! -f "${CONFIG_DIR}/${GPG_KEY_FILE}" ]; then
+	if [[ -n "${GPG_KEY_URL}" ]]; then
+		# shellcheck disable=SC2154
+		if [[ ! -f "${CONFIG_DIR}/${GPG_KEY_FILE}" ]]; then
 			curl -L "${GPG_KEY_URL}" -o "${CONFIG_DIR}/${GPG_KEY_FILE}"
 		fi
 		cat >> "${DNF_CONF}" << EOF
@@ -79,15 +128,17 @@ gpgcheck=1
 gpgkey=file://${CONFIG_DIR}/${GPG_KEY_FILE}
 EOF
 	fi
-	if [ "$SELINUX" == "yes" ]; then
+	# shellcheck disable=SC2154
+	if [[ "${SELINUX}" == "yes" ]]; then
 		cat > "${DNF_CONF}" << EOF
 [appstream]
 name=${OS_NAME}-${OS_VERSION} upstream
 releasever=${OS_VERSION}
 EOF
-		echo "metalink=$METALINK_APPSTREAM" >> "$DNF_CONF"
-		if [ -n "$GPG_KEY_URL" ]; then
-			if [ ! -f "${CONFIG_DIR}/${GPG_KEY_FILE}" ]; then
+		# shellcheck disable=SC2154
+		echo "metalink=${METALINK_APPSTREAM}" >> "${DNF_CONF}"
+		if [[ -n "${GPG_KEY_URL}" ]]; then
+			if [[ ! -f "${CONFIG_DIR}/${GPG_KEY_FILE}" ]]; then
 				curl -L "${GPG_KEY_URL}" -o "${CONFIG_DIR}/${GPG_KEY_FILE}"
 			fi
 			cat >> "${DNF_CONF}" << EOF
@@ -103,7 +154,7 @@ build_rootfs()
 	# Mandatory
 	local ROOTFS_DIR="$1"
 
-	[ -z "$ROOTFS_DIR" ] && die "need rootfs"
+	[[ -z "${ROOTFS_DIR}" ]] && die "need rootfs"
 
 	# In case of support EXTRA packages, use it to allow
 	# users add more packages to the base rootfs
@@ -115,12 +166,12 @@ build_rootfs()
 	#local CONFIG_DIR=${CONFIG_DIR}
 
 	check_root
-	if [ ! -f "${DNF_CONF}" ] && [ -z "${DISTRO_REPO}" ] ; then
+	if [[ ! -f "${DNF_CONF}" ]] && [[ -z "${DISTRO_REPO}" ]] ; then
 		DNF_CONF="./kata-${OS_NAME}-dnf.conf"
 		generate_dnf_config
 	fi
 	mkdir -p "${ROOTFS_DIR}"
-	if [ -n "${PKG_MANAGER}" ]; then
+	if [[ -n "${PKG_MANAGER}" ]]; then
 		info "DNF path provided by user: ${PKG_MANAGER}"
 	elif check_program "dnf"; then
 		PKG_MANAGER="dnf"
@@ -131,16 +182,17 @@ build_rootfs()
 	fi
 
 	DNF="${PKG_MANAGER} -y --installroot=${ROOTFS_DIR} --noplugins"
-	if [ -n "${DNF_CONF}" ] ; then
+	if [[ -n "${DNF_CONF}" ]] ; then
 		DNF="${DNF} --config=${DNF_CONF}"
 	else
 		DNF="${DNF} --releasever=${OS_VERSION}"
 	fi
 
 	info "install packages for rootfs"
-	$DNF install ${EXTRA_PKGS} ${PACKAGES}
+	# shellcheck disable=SC2154,SC2086
+	${DNF} install ${EXTRA_PKGS} ${PACKAGES}
 
-	rm -rf ${ROOTFS_DIR}/usr/share/{bash-completion,cracklib,doc,info,locale,man,misc,pixmaps,terminfo,zoneinfo,zsh}
+	rm -rf "${ROOTFS_DIR}"/usr/share/{bash-completion,cracklib,doc,info,locale,man,misc,pixmaps,terminfo,zoneinfo,zsh}
 }
 
 # Create a YAML metadata file inside the rootfs.
@@ -151,7 +203,7 @@ create_summary_file()
 {
 	local -r rootfs_dir="$1"
 
-	[ -z "$rootfs_dir" ] && die "need rootfs"
+	[[ -z "${rootfs_dir}" ]] && die "need rootfs"
 
 	local -r file_dir="/var/lib/osbuilder"
 	local -r dir="${rootfs_dir}${file_dir}"
@@ -159,16 +211,16 @@ create_summary_file()
 	local -r filename="osbuilder.yaml"
 	local file="${dir}/${filename}"
 
-	local -r now=$(date -u -d@${SOURCE_DATE_EPOCH:-$(date +%s.%N)} '+%Y-%m-%dT%T.%N%zZ')
+	local -r now=$(date -u -d@"${SOURCE_DATE_EPOCH:-$(date +%s.%N)}" '+%Y-%m-%dT%T.%N%zZ')
 
 	# sanitise package lists
-	PACKAGES=$(echo "$PACKAGES"|tr ' ' '\n'|sort -u|tr '\n' ' ')
-	EXTRA_PKGS=$(echo "$EXTRA_PKGS"|tr ' ' '\n'|sort -u|tr '\n' ' ')
+	PACKAGES=$(echo "${PACKAGES}"|tr ' ' '\n'|sort -u|tr '\n' ' ')
+	EXTRA_PKGS=$(echo "${EXTRA_PKGS}"|tr ' ' '\n'|sort -u|tr '\n' ' ')
 
 	local -r packages=$(for pkg in ${PACKAGES}; do echo "      - \"${pkg}\""; done)
 	local -r extra=$(for pkg in ${EXTRA_PKGS}; do echo "      - \"${pkg}\""; done)
 
-	mkdir -p "$dir"
+	mkdir -p "${dir}"
 
 	# Semantic version of the summary file format.
 	#
@@ -177,13 +229,17 @@ create_summary_file()
 
 	local -r osbuilder_url="https://github.com/kata-containers/kata-containers/tools/osbuilder"
 
+	# shellcheck disable=SC2154
 	local agent="${AGENT_DEST}"
-	[ "$AGENT_INIT" = yes ] && agent="${init}"
+	# shellcheck disable=SC2154,SC2034
+	[[ "${AGENT_INIT}" = yes ]] && agent="${init}"
 
-	local -r agentdir="${script_dir}/../../../"
-	local -r agent_version=$(cat ${agentdir}/VERSION)
+	local agent_version
+	agent_version=$(cat "${script_dir}/../VERSION" 2> /dev/null)
+	[[ -z "${agent_version}" ]] && agent_version="unknown"
 
-	cat >"$file"<<-EOF
+	# shellcheck disable=SC2154
+	cat >"${file}"<<-EOF
 	---
 	osbuilder:
 	  url: "${osbuilder_url}"
@@ -207,7 +263,8 @@ ${extra}
 	  agent-is-init-daemon: "${AGENT_INIT}"
 EOF
 
-	local rootfs_file="${file_dir}/$(basename "${file}")"
+	local rootfs_file
+	rootfs_file="${file_dir}/$(basename "${file}")"
 	info "Created summary file '${rootfs_file}' inside rootfs"
 }
 
@@ -217,26 +274,36 @@ EOF
 generate_dockerfile()
 {
 	dir="$1"
-	[ -d "${dir}" ] || die "${dir}: not a directory"
+	[[ -d "${dir}" ]] || die "${dir}: not a directory"
 
-	local rustarch="$ARCH"
-	[ "$ARCH" = ppc64le ] && rustarch=powerpc64le
+	local rustarch="${ARCH}"
+	[[ "${ARCH}" = ppc64le ]] && rustarch=powerpc64le
 
-	[ -n "${http_proxy:-}" ] && readonly set_proxy="RUN sed -i '$ a proxy="${http_proxy:-}"' /etc/dnf/dnf.conf /etc/yum.conf; true"
+	# shellcheck disable=SC2027
+	[[ -n "${http_proxy:-}" ]] && readonly set_proxy="RUN sed -i '$ a proxy="${http_proxy:-}"' /etc/dnf/dnf.conf /etc/yum.conf; true"
 
-	# Rust agent
-	readonly install_rust="
+	# Only install Rust if agent needs to be built
+	local install_rust=""
+
+	# shellcheck disable=SC2154
+	if [[ -n "${AGENT_SOURCE_BIN}" ]] ; then
+		if [[ "${RUST_VERSION}" == "null" ]]; then
+			detect_rust_version || \
+				die "Could not detect the required rust version for AGENT_VERSION='${AGENT_VERSION:-main}'."
+		fi
+		install_rust="
 ENV http_proxy=${http_proxy:-}
 ENV https_proxy=${http_proxy:-}
 RUN curl --proto '=https' --tlsv1.2 https://sh.rustup.rs -sSLf | \
-    sh -s -- -y --default-toolchain ${RUST_VERSION} -t ${rustarch}-unknown-linux-${LIBC}
+	sh -s -- -y --default-toolchain ${RUST_VERSION} -t ${rustarch}-unknown-linux-${LIBC}
 RUN . /root/.cargo/env; cargo install cargo-when
 "
+	fi
+
 	pushd "${dir}"
 
 	sed \
 		-e "s#@OS_VERSION@#${OS_VERSION:-}#g" \
-		-e "s#@ARCH@#$ARCH#g" \
 		-e "s#@INSTALL_RUST@#${install_rust//$'\n'/\\n}#g" \
 		-e "s#@SET_PROXY@#${set_proxy:-}#g" \
 		Dockerfile.in > Dockerfile
@@ -245,39 +312,44 @@ RUN . /root/.cargo/env; cargo install cargo-when
 
 get_package_version_from_kata_yaml()
 {
-    local yq_path="$1"
-    local yq_version
-    local yq_args
+	local yq_path="$1"
+	local yq_version
+	local yq_args
+	local yq
 
-	typeset -r yq=$(command -v yq || command -v "${GOPATH}/bin/yq" || echo "${GOPATH}/bin/yq")
-	if [ ! -f "$yq" ]; then
-		source "$yq_file"
+	# shellcheck disable=SC2154
+	yq=$(command -v yq || command -v "${GOPATH}/bin/yq" || true)
+	if [[ -z "${yq}" ]] || [[ ! -f "${yq}" ]]; then
+		# shellcheck source=/dev/null
+		source "${yq_file}"
+		yq=$(command -v yq || command -v "${GOPATH}/bin/yq") || die "yq not found after running install_yq.sh"
 	fi
 
-    yq_version=$($yq -V)
-    case $yq_version in
-    *"version "[1-3]*)
-        yq_args="r -X - ${yq_path}"
-        ;;
-    *)
-        yq_args="e .${yq_path} -"
-        ;;
-    esac
+	yq_version=$(${yq} -V)
+	case ${yq_version} in
+	*"version "[1-3]*)
+		yq_args="r -X - ${yq_path}"
+		;;
+	*)
+		yq_args="e .${yq_path} -"
+		;;
+	esac
 
-	PKG_VERSION="$(cat "${kata_versions_file}" | $yq ${yq_args})"
+	# shellcheck disable=SC2086
+	PKG_VERSION="$(${yq} ${yq_args} < "${kata_versions_file}")"
 
-	[ "$?" == "0" ] && [ "$PKG_VERSION" != "null" ] && echo "$PKG_VERSION" || echo ""
+	[[ "${PKG_VERSION}" != "null" ]] && echo "${PKG_VERSION}" || echo ""
 }
 
 detect_rust_version()
 {
 	info "Detecting agent rust version"
-    local yq_path="languages.rust.meta.newest-version"
+	local yq_path="languages.rust.meta.newest-version"
 
 	info "Get rust version from ${kata_versions_file}"
-	RUST_VERSION="$(get_package_version_from_kata_yaml "$yq_path")"
+	RUST_VERSION="$(get_package_version_from_kata_yaml "${yq_path}")"
 
-	[ -n "$RUST_VERSION" ]
+	[[ -n "${RUST_VERSION}" ]]
 }
 
 detect_libseccomp_info()
@@ -287,16 +359,20 @@ detect_libseccomp_info()
 	info "Get libseccomp version and url from ${kata_versions_file}"
 	local libseccomp_ver_yq_path="externals.libseccomp.version"
 	local libseccomp_url_yq_path="externals.libseccomp.url"
-	export LIBSECCOMP_VERSION="$(get_package_version_from_kata_yaml "$libseccomp_ver_yq_path")"
-	export LIBSECCOMP_URL="$(get_package_version_from_kata_yaml "$libseccomp_url_yq_path")"
+	LIBSECCOMP_VERSION="$(get_package_version_from_kata_yaml "${libseccomp_ver_yq_path}")"
+	export LIBSECCOMP_VERSION
+	LIBSECCOMP_URL="$(get_package_version_from_kata_yaml "${libseccomp_url_yq_path}")"
+	export LIBSECCOMP_URL
 
 	info "Get gperf version and url from ${kata_versions_file}"
 	local gperf_ver_yq_path="externals.gperf.version"
 	local gperf_url_yq_path="externals.gperf.url"
-	export GPERF_VERSION="$(get_package_version_from_kata_yaml "$gperf_ver_yq_path")"
-	export GPERF_URL="$(get_package_version_from_kata_yaml "$gperf_url_yq_path")"
+	GPERF_VERSION="$(get_package_version_from_kata_yaml "${gperf_ver_yq_path}")"
+	export GPERF_VERSION
+	GPERF_URL="$(get_package_version_from_kata_yaml "${gperf_url_yq_path}")"
+	export GPERF_URL
 
-	[ -n "$LIBSECCOMP_VERSION" ] && [ -n $GPERF_VERSION ] && [ -n "$LIBSECCOMP_URL" ] && [ -n $GPERF_URL ]
+	[[ -n "${LIBSECCOMP_VERSION}" ]] && [[ -n "${GPERF_VERSION}" ]] && [[ -n "${LIBSECCOMP_URL}" ]] && [[ -n "${GPERF_URL}" ]]
 }
 
 before_starting_container() {

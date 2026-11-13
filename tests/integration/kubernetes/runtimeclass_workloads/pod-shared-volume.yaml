@@ -8,8 +8,9 @@ kind: Pod
 metadata:
   name: test-shared-volume
 spec:
-  terminationGracePeriodSeconds: 0
   runtimeClassName: kata
+  securityContext:
+    supplementalGroups: [10]
   restartPolicy: Never
   volumes:
   - name: shared-data

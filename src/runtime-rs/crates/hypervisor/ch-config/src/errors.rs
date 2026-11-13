@@ -10,9 +10,6 @@ pub enum VmConfigError {
     #[error("empty sandbox path")]
     EmptySandboxPath,
 
-    #[error("empty VSOCK socket path")]
-    EmptyVsockSocketPath,
-
     #[error("cannot specify image and initrd")]
     MultipleBootFiles,
 
@@ -41,16 +38,6 @@ pub enum VmConfigError {
 
     #[error("VSOCK config error: {0}")]
     VsockError(VsockConfigError),
-
-    #[error("TDX requires virtio-blk VM rootfs driver")]
-    TDXVMRootfsNotVirtioBlk,
-
-    #[error("TDX requires virtio-blk container rootfs block device driver")]
-    TDXContainerRootfsNotVirtioBlk,
-
-    // LIMITATION: Current CH TDX limitation.
-    #[error("TDX requires an image=, not an initrd=")]
-    TDXDisallowsInitrd,
 }
 
 #[derive(Error, Debug, PartialEq)]
@@ -63,9 +50,6 @@ pub enum PmemConfigError {
 pub enum DiskConfigError {
     #[error("Need path for DiskConfig")]
     MissingPath,
-
-    #[error("Found unexpected path for DiskConfig with TDX: {0}")]
-    UnexpectedPathForTDX(String),
 }
 
 #[derive(Error, Debug, PartialEq)]
@@ -73,14 +57,11 @@ pub enum CpusConfigError {
     #[error("Boot vCPUs cannot be zero or negative")]
     BootVCPUsTooSmall,
 
-    #[error("Too many boot vCPUs specified: {0}")]
-    BootVCPUsTooBig(<u8 as TryFrom<i32>>::Error),
-
     #[error("Max vCPUs cannot be zero or negative")]
     MaxVCPUsTooSmall,
 
-    #[error("Too many max vCPUs specified: {0}")]
-    MaxVCPUsTooBig(<u8 as TryFrom<u32>>::Error),
+    #[error("Max vCPUs cannot be represented in CPU topology: {0}")]
+    MaxVCPUsTooBigForTopology(<u16 as TryFrom<u32>>::Error),
 
     #[error("Boot vCPUs cannot be larger than max vCPUs")]
     BootVPUsGtThanMaxVCPUs,
@@ -93,9 +74,6 @@ pub enum PayloadConfigError {
 
     #[error("No initrd/initramfs specified")]
     NoInitrd,
-
-    #[error("Need firmware for TDX")]
-    TDXFirmwareMissing,
 }
 
 #[derive(Error, Debug, PartialEq)]
@@ -117,6 +95,15 @@ pub enum MemoryConfigError {
 
     #[error("Failed to query system memory information: {0}")]
     SysInfoFail(#[source] nix::errno::Errno),
+
+    #[error("Template memory path is empty")]
+    NoTemplateMemoryPath,
+
+    #[error("Template memory path is not accessible: {0}")]
+    TemplateMemoryPathNotAccessible(String),
+
+    #[error("Template mode requires no shared filesystem")]
+    TemplateRequiresNoSharedFs,
 }
 
 #[derive(Error, Debug, PartialEq)]

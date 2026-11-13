@@ -20,13 +20,14 @@ use slog::Logger;
 use tokio::sync::Mutex;
 use tracing::instrument;
 
-use crate::device::{DRIVER_EPHEMERAL_TYPE, FS_TYPE_HUGETLB};
 use crate::mount::baremount;
 use crate::sandbox::Sandbox;
 use crate::storage::{
     common_storage_handler, new_device, parse_options, StorageContext, StorageHandler, MODE_SETGID,
 };
+use kata_types::device::DRIVER_EPHEMERAL_TYPE;
 
+const FS_TYPE_HUGETLB: &str = "hugetlbfs";
 const FS_GID_EQ: &str = "fsgid=";
 const SYS_FS_HUGEPAGES_PREFIX: &str = "/sys/kernel/mm/hugepages";
 
@@ -35,6 +36,11 @@ pub struct EphemeralHandler {}
 
 #[async_trait::async_trait]
 impl StorageHandler for EphemeralHandler {
+    #[instrument]
+    fn driver_types(&self) -> &[&str] {
+        &[DRIVER_EPHEMERAL_TYPE]
+    }
+
     #[instrument]
     async fn create_device(
         &self,
@@ -86,7 +92,7 @@ impl EphemeralHandler {
         info!(logger, "mounting hugePages storage options: {:?}", options);
 
         let (pagesize, size) = Self::get_pagesize_and_size_from_option(options)
-            .context(format!("parse mount options: {:?}", &options))?;
+            .context(format!("parse mount options: {:?}", options))?;
 
         info!(
             logger,
@@ -106,19 +112,19 @@ impl EphemeralHandler {
         let mut file = OpenOptions::new()
             .write(true)
             .open(&path)
-            .context(format!("open nr_hugepages directory {:?}", &path))?;
+            .context(format!("open nr_hugepages directory {:?}", path))?;
 
         file.write_all(numpages.as_bytes())
-            .context(format!("write nr_hugepages failed: {:?}", &path))?;
+            .context(format!("write nr_hugepages failed: {:?}", path))?;
 
         // Even if the write succeeds, the kernel isn't guaranteed to be
         // able to allocate all the pages we requested.  Verify that it
         // did.
-        let verify = fs::read_to_string(&path).context(format!("reading {:?}", &path))?;
+        let verify = fs::read_to_string(&path).context(format!("reading {:?}", path))?;
         let allocated = verify
             .trim_end()
             .parse::<u64>()
-            .map_err(|_| anyhow!("Unexpected text {:?} in {:?}", &verify, &path))?;
+            .map_err(|_| anyhow!("Unexpected text {:?} in {:?}", verify, path))?;
         if allocated != size / pagesize {
             return Err(anyhow!(
                 "Only allocated {} of {} hugepages of size {}",
@@ -160,11 +166,11 @@ impl EphemeralHandler {
         let pagesize = pagesize_str
             .unwrap()
             .parse::<u64>()
-            .context(format!("parse pagesize: {:?}", &pagesize_str))?;
+            .context(format!("parse pagesize: {:?}", pagesize_str))?;
         let size = size_str
             .unwrap()
             .parse::<u64>()
-            .context(format!("parse size: {:?}", &pagesize_str))?;
+            .context(format!("parse size: {:?}", size_str))?;
 
         Ok((pagesize, size))
     }

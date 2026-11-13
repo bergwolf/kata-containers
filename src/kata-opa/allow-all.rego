@@ -1,3 +1,8 @@
+# Copyright (c) 2023 Microsoft Corporation
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+
 package agent_policy
 
 default AddARPNeighborsRequest := true
@@ -8,11 +13,14 @@ default CreateContainerRequest := true
 default CreateSandboxRequest := true
 default DestroySandboxRequest := true
 default ExecProcessRequest := true
+default GetDiagnosticDataRequest := true
 default GetMetricsRequest := true
 default GetOOMEventRequest := true
 default GuestDetailsRequest := true
 default ListInterfacesRequest := true
 default ListRoutesRequest := true
+default MemAgentCompactConfig := true
+default MemAgentMemcgConfig := true
 default MemHotplugByProbeRequest := true
 default OnlineCPUMemRequest := true
 default PauseContainerRequest := true
@@ -20,7 +28,7 @@ default PullImageRequest := true
 default ReadStreamRequest := true
 default RemoveContainerRequest := true
 default RemoveStaleVirtiofsShareMountsRequest := true
-default ReseedRandomDevRequest := false
+default ReseedRandomDevRequest := true
 default ResumeContainerRequest := true
 default SetGuestDateTimeRequest := true
 default SetPolicyRequest := true

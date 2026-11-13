@@ -54,33 +54,32 @@ func isSystemMount(m string) bool {
 	return false
 }
 
-func isHostDevice(m string) bool {
+// isHostDevice returns whether the given path is a non-regular file
+// under /dev (or /dev itself) on the host. If os.Stat fails on the
+// file, it returns false plus the error from os.Stat.
+func isHostDevice(m string) (bool, error) {
 	m = filepath.Clean(m)
 	if m == "/dev" {
-		return true
+		return true, nil
 	}
 
 	if strings.HasPrefix(m, "/dev/") {
-		// Check if regular file
 		s, err := os.Stat(m)
-
-		// This should not happen. In case file does not exist let the
-		// error be handled by the agent, simply return false here.
 		if err != nil {
-			return false
+			return false, err
 		}
 
 		if s.Mode().IsRegular() {
-			return false
+			return false, nil
 		}
 
 		// This is not a regular file in /dev. It is either a
 		// device file, directory or any other special file which is
 		// specific to the host system.
-		return true
+		return true, nil
 	}
 
-	return false
+	return false, nil
 }
 
 func major(dev uint64) int {
@@ -131,7 +130,7 @@ func getDeviceForPath(path string) (device, error) {
 		return device{}, err
 	}
 
-	if isHostDevice(path) {
+	if isDevice, _ := isHostDevice(path); isDevice {
 		// stat.Rdev describes the device that this file (inode) represents.
 		devMajor = major(uint64(stat.Rdev))
 		devMinor = minor(uint64(stat.Rdev))
@@ -194,14 +193,14 @@ func getDeviceForPath(path string) (device, error) {
 	return dev, nil
 }
 
-var blockFormatTemplate = "/sys/dev/block/%d:%d/dm"
+var blockFormatTemplate = "/sys/dev/block/%d:%d/"
 
-var checkStorageDriver = isDeviceMapper
+var checkStorageDriver = isBlockDevice
 
-// isDeviceMapper checks if the device with the major and minor numbers is a devicemapper block device
-func isDeviceMapper(major, minor int) (bool, error) {
+// isBlockDevice checks if the device with the major and minor numbers is a block device
+func isBlockDevice(major, minor int) (bool, error) {
 
-	//Check if /sys/dev/block/${major}-${minor}/dm exists
+	//Check if /sys/dev/block/${major}-${minor}/ exists
 	sysPath := fmt.Sprintf(blockFormatTemplate, major, minor)
 
 	_, err := os.Stat(sysPath)
@@ -209,9 +208,9 @@ func isDeviceMapper(major, minor int) (bool, error) {
 		return true, nil
 	} else if os.IsNotExist(err) {
 		return false, nil
+	} else {
+		return false, err
 	}
-
-	return false, err
 }
 
 const mountPerm = os.FileMode(0755)
@@ -273,6 +272,18 @@ type Mount struct {
 	// FSGroupChangePolicy specifies the policy that will be used when applying
 	// group id ownership change for a volume.
 	FSGroupChangePolicy volume.FSGroupChangePolicy
+
+	// EncryptionKey is the encryption key used for the volume.
+	// Currently, valid values are "" for no encryption or "ephemeral"
+	// to instruct the agent to generate a one-time key.
+	EncryptionKey string
+
+	// BlockDeviceCreateFs requests filesystem creation before mounting a
+	// fresh block volume. The filesystem type comes from the Storage Fstype.
+	BlockDeviceCreateFs bool
+
+	// Shared indicates whether the mount is shared across containers.
+	Shared bool
 }
 
 func isSymlink(path string) bool {
@@ -305,16 +316,8 @@ const (
 	K8sSecret    = "kubernetes.io~secret"
 )
 
-// IsEphemeralStorage returns true if the given path
-// to the storage belongs to kubernetes ephemeral storage
-//
-// This method depends on a specific path used by k8s
-// to detect if it's of type ephemeral. As of now,
-// this is a very k8s specific solution that works
-// but in future there should be a better way for this
-// method to determine if the path is for ephemeral
-// volume type
-func IsEphemeralStorage(path string) bool {
+// IsTmpFSEmptyDir returns true for tmpfs-backed emptyDirs (medium: Memory).
+func IsTmpFSEmptyDir(path string) bool {
 	if !isEmptyDir(path) {
 		return false
 	}
@@ -326,10 +329,9 @@ func IsEphemeralStorage(path string) bool {
 	return false
 }
 
-// Isk8sHostEmptyDir returns true if the given path
-// to the storage belongs to kubernetes empty-dir of medium "default"
-// i.e volumes that are directories on the host.
-func Isk8sHostEmptyDir(path string) bool {
+// IsNonTmpFSEmptyDir returns true for non-tmpfs-backed emptyDirs.
+// This includes disk-backed (medium: "", default) and hugepage-backed (medium: HugePages).
+func IsNonTmpFSEmptyDir(path string) bool {
 	if !isEmptyDir(path) {
 		return false
 	}
@@ -338,6 +340,22 @@ func Isk8sHostEmptyDir(path string) bool {
 		return true
 	}
 	return false
+}
+
+// IsHugePageEmptyDir returns true for hugepage-backed emptyDirs (medium: HugePages).
+func IsHugePageEmptyDir(path string) bool {
+	if !isEmptyDir(path) {
+		return false
+	}
+	if _, fsType, _, _ := utils.GetDevicePathAndFsTypeOptions(path); fsType == "hugetlbfs" {
+		return true
+	}
+	return false
+}
+
+// IsDiskEmptyDir returns true for disk-backed emptyDirs (medium: "", default).
+func IsDiskEmptyDir(path string) bool {
+	return IsNonTmpFSEmptyDir(path) && !IsHugePageEmptyDir(path)
 }
 
 func checkKubernetesVolume(path, volumeType string) bool {
@@ -388,7 +406,11 @@ func countFiles(path string, limit int) (numFiles int, err error) {
 		if file.IsDir() {
 			inc, err := countFiles(filepath.Join(path, file.Name()), (limit - numFiles))
 			if err != nil {
-				return numFiles, err
+				return 0, err
+			}
+			// exceeded limit
+			if inc == -1 {
+				return -1, nil
 			}
 			numFiles = numFiles + inc
 		} else {

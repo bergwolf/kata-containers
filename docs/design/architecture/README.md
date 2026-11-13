@@ -57,7 +57,7 @@ section explains what this means.
 > [the architectural history document](history.md).
 
 The
-[containerd runtime shimv2 architecture](https://github.com/containerd/containerd/tree/main/runtime/v2)
+[containerd runtime shimv2 architecture](https://github.com/containerd/containerd/tree/main/core/runtime/v2)
 or _shim API_ architecture resolves the issues with the old
 architecture by defining a set of shimv2 APIs that a compatible
 runtime implementation must supply. Rather than calling the runtime
@@ -322,7 +322,7 @@ The runtime is responsible for starting the [hypervisor](#hypervisor)
 and it's VM, and communicating with the [agent](#agent) using a
 [ttRPC based protocol](#agent-communications-protocol) over a VSOCK
 socket that provides a communications link between the VM and the
-host. 
+host.
 
 This protocol allows the runtime to send container management commands
 to the agent. The protocol is also used to carry the standard I/O
@@ -348,6 +348,16 @@ The `exec` command allows an administrator or developer to enter the
 [workload](#workload).
 
 See [the developer guide](../../Developer-Guide.md#connect-to-debug-console) for further details.
+
+### policy command
+
+The `policy set` command allows an administrator or developer to set the policy
+to [VM root environment](#environments). In this way, we can enable/disable
+kata-agent API through policy.
+The command is: `kata-runtime policy set policy.rego --sandbox-id XXXXXXXX`
+
+Please refer to [`genpolicy tool`](../../../src/tools/genpolicy/README.md) to see how to generate `policy.rego` mentioned above.
+And more about policy itself can be found at [Policy Details](../../../src/tools/genpolicy/genpolicy-auto-generated-policy-details.md).
 
 ### Configuration
 

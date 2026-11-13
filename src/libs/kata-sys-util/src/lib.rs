@@ -12,7 +12,9 @@ pub mod fs;
 pub mod hooks;
 pub mod k8s;
 pub mod mount;
+pub mod netns;
 pub mod numa;
+pub mod oci_docker;
 pub mod protection;
 pub mod rand;
 pub mod spec;
@@ -28,14 +30,6 @@ macro_rules! sl {
     () => {
         slog_scope::logger()
     };
-}
-
-#[macro_export]
-macro_rules! eother {
-    () => (std::io::Error::new(std::io::ErrorKind::Other, ""));
-    ($fmt:expr, $($arg:tt)*) => ({
-        std::io::Error::new(std::io::ErrorKind::Other, format!($fmt, $($arg)*))
-    })
 }
 
 pub fn check_kernel_cmd_line(

@@ -13,7 +13,7 @@ import (
 )
 
 func testHypervisorConfigValid(t *testing.T, hypervisorConfig *HypervisorConfig, success bool) {
-	err := validateHypervisorConfig(hypervisorConfig)
+	err := validateHypervisorConfig(hypervisorConfig, QemuHypervisor)
 	assert := assert.New(t)
 	assert.False(success && err != nil)
 	assert.False(!success && err == nil)
@@ -27,4 +27,13 @@ func TestHypervisorConfigNoKernelPath(t *testing.T) {
 	}
 
 	testHypervisorConfigValid(t, hypervisorConfig, false)
+}
+
+func TestRemoteHypervisorConfigNoKernelPath(t *testing.T) {
+	hypervisorConfig := &HypervisorConfig{
+		RemoteHypervisorSocket: "dummy_socket",
+		KernelPath:             "",
+	}
+
+	testHypervisorConfigValid(t, hypervisorConfig, true)
 }

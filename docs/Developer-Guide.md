@@ -15,10 +15,21 @@ The recommended way to create a development environment is to first
 to create a working system.
 
 The installation guide instructions will install all required Kata Containers
-components, plus *Docker*, the hypervisor, and the Kata Containers image and
-guest kernel.
+components, plus a container manager, the hypervisor, and the Kata
+Containers image and guest kernel.
+
+Alternatively, you can perform a
+[manual installation](install/container-manager/containerd/containerd-install.md),
+or continue with [the instructions below](#requirements-to-build-individual-components)
+to build the Kata Containers components from source.
 
 # Requirements to build individual components
+
+> **Note:**
+>
+> If you decide to build from sources, you should be aware of the
+> implications of using an unpackaged system which will not be automatically
+> updated as new [releases](https://github.com/kata-containers/kata-containers/releases) are made available.
 
 You need to install the following to build Kata Containers components:
 
@@ -114,17 +125,52 @@ If you want to enable SELinux in Permissive mode, add `enforcing=0` to the kerne
 Enable full debug as follows:
 
 ```bash
-$ sudo sed -i -e 's/^# *\(enable_debug\).*=.*$/\1 = true/g' /etc/kata-containers/configuration.toml
-$ sudo sed -i -e 's/^kernel_params = "\(.*\)"/kernel_params = "\1 agent.log=debug initcall_debug"/g' /etc/kata-containers/configuration.toml
+$ sudo sed -i -E 's/^(\s*enable_debug\s*=\s*)false/\1true/' /etc/kata-containers/configuration.toml
+$ sudo sed -i -e 's/^kernel_params = "\(.*\)"/kernel_params = "\1 initcall_debug"/g' /etc/kata-containers/configuration.toml
+```
+
+For both the Go runtime and runtime-rs, setting `enable_debug = true` in the
+relevant Kata configuration sections is the baseline for enabling debug
+behavior. Setting `enable_debug = true` in the `[agent.kata]` section adds the
+agent debug kernel parameter automatically, so `agent.log=debug` does not need
+to be added to `kernel_params` manually.
+
+The runtime-rs shim also supports component-level log filtering through
+`log_level`. For runtime-rs, `enable_debug = true` in the `[runtime]`,
+`[agent.kata]`, and selected `[hypervisor.*]` sections promotes the component
+log filter from the default `info` level to `debug`. If `log_level` is
+explicitly set to another level, such as `trace` or `warn`, the explicit value
+is honored.
+
+For example, with runtime-rs:
+
+```toml
+[runtime]
+log_level = "debug" # show runtime-rs shim messages in the kata journal
+
+[hypervisor.qemu]
+enable_debug = true # modify kernel parameters and QEMU invocation
+log_level = "debug" # show hypervisor component messages in the kata journal
+
+[agent.kata]
+enable_debug = true # add guest agent debug to kernel parameters
+log_level = "debug" # show forwarded agent messages in the kata journal
 ```
 
 ### debug logs and shimv2
 
-If you are using `containerd` and the Kata `containerd-shimv2` to launch Kata Containers, and wish
-to enable Kata debug logging, there are two ways this can be enabled via the `containerd` configuration file,
-detailed below.
+If you are using `containerd` and the Kata `containerd-shimv2` to launch Kata
+Containers, `containerd` debug logging can also be useful when debugging
+containerd, CRI, or shim launch behavior.
 
-The Kata logs appear in the `containerd` log files, along with logs from `containerd` itself.
+For the Go runtime, Kata logs appear in the `containerd` log files, along with
+logs from `containerd` itself, so `containerd` debug settings are commonly used
+for Kata debug output.
+
+For runtime-rs, the shim writes Kata logs to `journald` directly using the
+`kata` identifier. Enabling `containerd` debug is not required to see runtime-rs
+Kata debug logs; the runtime-rs `enable_debug` and `log_level` settings above
+are enough for those component logs.
 
 For more information about `containerd` debug, please see the
 [`containerd` documentation](https://github.com/containerd/containerd/blob/main/docs/getting-started.md).
@@ -187,7 +233,7 @@ it stores. When messages are suppressed, it is noted in the logs. This can be ch
 for by looking for those notifications, such as:
 
 ```bash
-$ sudo journalctl --since today | fgrep Suppressed
+$ sudo journalctl --since today | grep -F Suppressed
 Jun 29 14:51:17 mymachine systemd-journald[346]: Suppressed 4150 messages from /system.slice/docker.service
 ```
 
@@ -257,8 +303,10 @@ to install `libseccomp` for the agent.
 
 ```bash
 $ mkdir -p ${seccomp_install_path} ${gperf_install_path}
-$ kata-containers/ci/install_libseccomp.sh ${seccomp_install_path} ${gperf_install_path}
+$ pushd kata-containers/ci
+$ script -fec 'sudo -E ./install_libseccomp.sh ${seccomp_install_path} ${gperf_install_path}"'
 $ export LIBSECCOMP_LIB_PATH="${seccomp_install_path}/lib"
+$ popd
 ```
 
 On `ppc64le` and `s390x`, `glibc` is used. You will need to install the `libseccomp` library
@@ -276,14 +324,14 @@ provided by your distribution.
 
 As a prerequisite, you need to install Docker. Otherwise, you will not be
 able to run the `rootfs.sh` script with `USE_DOCKER=true` as expected in
-the following example.
+the following example. Specifying the `OS_VERSION` is required when using `distro="ubuntu"`.
 
 ```bash
 $ export distro="ubuntu" # example
 $ export ROOTFS_DIR="$(realpath kata-containers/tools/osbuilder/rootfs-builder/rootfs)"
 $ sudo rm -rf "${ROOTFS_DIR}"
 $ pushd kata-containers/tools/osbuilder/rootfs-builder
-$ script -fec 'sudo -E USE_DOCKER=true ./rootfs.sh "${distro}"'
+$ script -fec 'sudo -E USE_DOCKER=true OS_VERSION=resolute ./rootfs.sh "${distro}"'
 $ popd
 ```
 
@@ -437,7 +485,7 @@ You can build and install the guest kernel image as shown [here](../tools/packag
 # Install a hypervisor
 
 When setting up Kata using a [packaged installation method](install/README.md#installing-on-a-linux-system), the
-`QEMU` VMM is installed automatically. Cloud-Hypervisor and Firecracker VMMs are available from the [release tarballs](https://github.com/kata-containers/kata-containers/releases), as well as through [`kata-deploy`](../tools/packaging/kata-deploy/README.md).
+`QEMU` VMM is installed automatically. Cloud-Hypervisor, Firecracker and StratoVirt VMMs are available from the [release tarballs](https://github.com/kata-containers/kata-containers/releases), as well as through [`kata-deploy`](../tools/packaging/kata-deploy/helm-chart/README.md).
 You may choose to manually build your VMM/hypervisor.
 
 ## Build a custom QEMU
@@ -448,7 +496,7 @@ and repository utilized can be found by looking at the [versions file](../versio
 Find the correct version of QEMU from the versions file:
 ```bash
 $ source kata-containers/tools/packaging/scripts/lib.sh
-$ qemu_version="$(get_from_kata_deps "assets.hypervisor.qemu.version")"
+$ qemu_version="$(get_from_kata_deps ".assets.hypervisor.qemu.version")"
 $ echo "${qemu_version}"
 ```
 Get source from the matching branch of QEMU:
@@ -486,19 +534,6 @@ If you do not want to install the respective QEMU version, the configuration fil
 
 See the [static-build script for QEMU](../tools/packaging/static-build/qemu/build-static-qemu.sh) for a reference on how to get, setup, configure and build QEMU for Kata.
 
-### Build a custom QEMU for aarch64/arm64 - REQUIRED
-> **Note:**
->
-> - You should only do this step if you are on aarch64/arm64.
-> - You should include [Eric Auger's latest PCDIMM/NVDIMM patches](https://patchwork.kernel.org/cover/10647305/) which are
->   under upstream review for supporting NVDIMM on aarch64.
->
-You could build the custom `qemu-system-aarch64` as required with the following command:
-```bash
-$ git clone https://github.com/kata-containers/tests.git
-$ script -fec 'sudo -E tests/.ci/install_qemu.sh'
-```
-
 ## Build `virtiofsd`
 
 When using the file system type virtio-fs (default), `virtiofsd` is required
@@ -522,10 +557,18 @@ $ sudo kata-runtime check
 If your system is *not* able to run Kata Containers, the previous command will error out and explain why.
 
 # Run Kata Containers with Containerd
+
 Refer to the [How to use Kata Containers and Containerd](how-to/containerd-kata.md) how-to guide.
 
 # Run Kata Containers with Kubernetes
-Refer to the [Run Kata Containers with Kubernetes](how-to/run-kata-with-k8s.md) how-to guide.
+
+- Containerd
+
+Refer to the [How to use Kata Containers and Containerd with Kubernetes](how-to/how-to-use-k8s-with-containerd-and-kata.md) how-to guide.
+
+- CRI-O
+
+Refer to the [How to use Kata Containers and CRI-O with Kubernetes](how-to/how-to-use-k8s-with-crio-and-kata.md) how-to guide.
 
 # Troubleshoot Kata Containers
 
@@ -627,7 +670,7 @@ the following steps (using rootfs or initrd image).
 >
 > Look for `INIT_PROCESS=systemd` in the `config.sh` osbuilder rootfs config file
 > to verify an osbuilder distro supports systemd for the distro you want to build rootfs for.
-> For an example, see the [Clear Linux config.sh file](../tools/osbuilder/rootfs-builder/clearlinux/config.sh).
+> For an example, see the [Ubuntu config.sh file](../tools/osbuilder/rootfs-builder/ubuntu/config.sh).
 >
 > For a non-systemd-based distro, create an equivalent system
 > service using that distro’s init system syntax. Alternatively, you can build a distro
@@ -730,7 +773,7 @@ sudo sed -i -e 's/^kernel_params = "\(.*\)"/kernel_params = "\1 agent.debug_cons
 
 ##### Connecting to the debug console
 
-Next, connect to the debug console. The VSOCKS paths vary slightly between each
+Next, connect to the debug console. The VSOCK paths vary slightly between each
 VMM solution.
 
 In case of cloud-hypervisor, connect to the `vsock` as shown:
@@ -757,6 +800,11 @@ $ sudo su -c 'cd /var/run/vc/vm/${sandbox_id} && socat "stdin,raw,echo=0,escape=
 
 To disconnect from the virtual machine, type `CONTROL+q` (hold down the
 `CONTROL` key and press `q`).
+
+## Use a debugger with the runtime
+
+For developers interested in using a debugger with the runtime, please
+look at [this document](Debug-shim-guide.md).
 
 ## Obtain details of the image
 

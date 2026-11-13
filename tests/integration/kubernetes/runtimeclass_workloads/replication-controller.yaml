@@ -17,10 +17,9 @@ spec:
       labels:
         app: nginx-rc-test
     spec:
-      terminationGracePeriodSeconds: 0
       runtimeClassName: kata
       containers:
       - name: nginxtest
-        image: quay.io/sjenning/${nginx_version}
+        image: ${NGINX_IMAGE}
         ports:
         - containerPort: 80

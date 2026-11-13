@@ -8,6 +8,7 @@
 package virtcontainers
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -26,7 +27,7 @@ const defaultQemuPath = "/usr/bin/qemu-system-ppc64"
 
 const defaultQemuMachineType = QemuPseries
 
-const defaultQemuMachineOptions = "accel=kvm,usb=off"
+const defaultQemuMachineOptions = "accel=kvm,usb=off,cap-ail-mode-3=off"
 
 const qmpMigrationWaitTimeout = 5 * time.Second
 
@@ -156,8 +157,13 @@ func (q *qemuPPC64le) enableProtection() error {
 	}
 }
 
+func (q *qemuPPC64le) buildInitdataDevice(ctx context.Context, devices []govmmQemu.Device, initdataImage string) []govmmQemu.Device {
+	hvLogger.Warnf("buildInitdataDevice not implemented for PPC64le; ignoring initdata image: %s", initdataImage)
+	return devices
+}
+
 // append protection device
-func (q *qemuPPC64le) appendProtectionDevice(devices []govmmQemu.Device, firmware, firmwareVolume string) ([]govmmQemu.Device, string, error) {
+func (q *qemuPPC64le) appendProtectionDevice(devices []govmmQemu.Device, firmware, firmwareVolume string, initdataDigest []byte) ([]govmmQemu.Device, string, error) {
 	switch q.protection {
 	case pefProtection:
 		return append(devices,

@@ -7,10 +7,7 @@
 mod agent;
 mod trans;
 
-use std::{
-    os::unix::io::{IntoRawFd, RawFd},
-    sync::Arc,
-};
+use std::{os::unix::io::RawFd, sync::Arc};
 
 use anyhow::{Context, Result};
 use kata_types::config::Agent as AgentConfig;
@@ -111,12 +108,19 @@ impl KataAgent {
         );
         let sock =
             sock::new(&inner.socket_address, inner.config.server_port).context("new sock")?;
+        info!(sl!(), "try to connect agent server through {:?}", sock);
         let stream = sock.connect(&config).await.context("connect")?;
-        let fd = stream.into_raw_fd();
-        info!(sl!(), "get stream raw fd {:?}", fd);
-        let c = Client::new(fd);
+        let client_fd = stream.raw_fd();
+        info!(
+            sl!(),
+            "get stream raw fd {:?} with socket address: {:?} and server_port {:?}",
+            client_fd,
+            &inner.socket_address,
+            inner.config.server_port
+        );
+        let c = Client::new(stream.into_ttrpc_socket());
         inner.client = Some(c);
-        inner.client_fd = fd;
+        inner.client_fd = client_fd;
         Ok(())
     }
 
@@ -153,5 +157,17 @@ impl KataAgent {
     pub(crate) async fn agent_config(&self) -> AgentConfig {
         let inner = self.inner.read().await;
         inner.config.clone()
+    }
+
+    /// Disconnect from the agent gRPC server and clean up related resources.
+    pub(crate) async fn disconnect(&self) -> Result<()> {
+        let mut inner = self.inner.write().await;
+        inner.log_forwarder.stop();
+
+        // If there is a valid client, drop it (closes the connection).
+        inner.client.take();
+        inner.client_fd = -1;
+
+        Ok(())
     }
 }

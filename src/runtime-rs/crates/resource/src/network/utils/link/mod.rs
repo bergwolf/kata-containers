@@ -7,14 +7,14 @@
 mod create;
 pub use create::{create_link, LinkType};
 mod driver_info;
-pub use driver_info::{get_driver_info, DriverInfo};
+pub use driver_info::get_driver_info;
 mod macros;
 mod manager;
 pub use manager::get_link_from_message;
 
 use std::os::unix::io::RawFd;
 
-use netlink_packet_route::link::nlas::State;
+use netlink_packet_route::link::State;
 
 #[cfg(test)]
 pub use create::net_test_utils;

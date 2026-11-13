@@ -4,28 +4,59 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use std::{path::PathBuf, str::from_utf8, sync::Arc};
-
 use anyhow::{anyhow, Context, Result};
 use common::{
-    message::Message,
-    types::{Request, Response},
+    config::{load_config, load_config_from, load_config_with_path},
+    message::{Action, Message},
+    types::{
+        ContainerProcess, PlatformInfo, ProcessType, SandboxConfig, SandboxRequest,
+        SandboxResponse, SandboxStatusInfo, StartSandboxInfo, TaskRequest, TaskResponse,
+        DEFAULT_SHM_SIZE,
+    },
     RuntimeHandler, RuntimeInstance, Sandbox, SandboxNetworkEnv,
 };
-use hypervisor::Param;
-use kata_sys_util::spec::load_oci_spec;
+
+use containerd_shim_protos::events::task::{TaskCreate, TaskDelete, TaskStart};
+use hypervisor::utils::{
+    authorize_rootless_device, create_dir_all_with_inherit_owner, create_vmm_user, find_user,
+    is_recorded_vmm_user, remove_dir_all_if_exists, remove_vmm_user, vmm_user_runtime_dir,
+    VMM_USER_UID_UNKNOWN,
+};
+use kata_sys_util::{
+    mount::get_mount_path, netns::remove_netns, spec::load_oci_spec, validate::verify_id,
+};
 use kata_types::{
-    annotations::Annotation, config::default::DEFAULT_GUEST_DNS_FILE, config::TomlConfig,
+    config::{
+        default::DEFAULT_GUEST_DNS_FILE,
+        hypervisor::{RootlessUser, SecurityInfo},
+        Hypervisor, TomlConfig, KATA_PATH,
+    },
+    mount::SHM_DEVICE,
+    prefix_with_rootless_dir,
+    rootless::{is_rootless, rootless_dir, set_rootless},
 };
 #[cfg(feature = "linux")]
 use linux_container::LinuxContainer;
-use netns_rs::NetNs;
+use logging::FILTER_RULE;
+use netns_rs::{DefaultEnv, Env, NetNs};
+use nix::{sys::statfs, unistd::User};
+use oci_spec::runtime as oci;
 use persist::sandbox_persist::Persist;
 use resource::{
     cpu_mem::initial_size::InitialSizeManager,
     network::{dan_config_path, generate_netns_name},
 };
+use runtime_spec as spec;
 use shim_interface::shim_mgmt::ERR_NO_SHIM_SERVER;
+use std::{
+    collections::HashMap,
+    env,
+    ops::Deref,
+    os::unix::fs::chown,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::SystemTime,
+};
 use tokio::fs;
 use tokio::sync::{mpsc::Sender, Mutex, RwLock};
 use tracing::instrument;
@@ -42,6 +73,26 @@ use crate::{
     shim_mgmt::server::MgmtServer,
     tracer::{KataTracer, ROOTSPAN},
 };
+
+fn convert_string_to_slog_level(string_level: &str) -> slog::Level {
+    match string_level {
+        "trace" => slog::Level::Trace,
+        "debug" => slog::Level::Debug,
+        "info" => slog::Level::Info,
+        "warn" => slog::Level::Warning,
+        "error" => slog::Level::Error,
+        "critical" => slog::Level::Critical,
+        _ => slog::Level::Info,
+    }
+}
+
+fn effective_log_level(enable_debug: bool, log_level: &str) -> &str {
+    if enable_debug && log_level == "info" {
+        "debug"
+    } else {
+        log_level
+    }
+}
 
 struct RuntimeHandlerManagerInner {
     id: String,
@@ -73,11 +124,9 @@ impl RuntimeHandlerManagerInner {
     #[instrument]
     async fn init_runtime_handler(
         &mut self,
-        spec: &oci::Spec,
-        state: &oci::State,
-        network_env: SandboxNetworkEnv,
-        dns: Vec<String>,
+        sandbox_config: SandboxConfig,
         config: Arc<TomlConfig>,
+        init_size_manager: InitialSizeManager,
     ) -> Result<()> {
         info!(sl!(), "new runtime handler {}", &config.runtime.name);
         let runtime_handler = match config.runtime.name.as_str() {
@@ -89,10 +138,16 @@ impl RuntimeHandlerManagerInner {
             name if name == VirtContainer::name() || name.is_empty() => {
                 VirtContainer::new_handler()
             }
-            _ => return Err(anyhow!("Unsupported runtime: {}", &config.runtime.name)),
+            _ => return Err(anyhow!("Unsupported runtime: {}", config.runtime.name)),
         };
         let runtime_instance = runtime_handler
-            .new_instance(&self.id, self.msg_sender.clone(), config.clone())
+            .new_instance(
+                &self.id,
+                self.msg_sender.clone(),
+                config.clone(),
+                init_size_manager,
+                sandbox_config,
+            )
             .await
             .context("new runtime instance")?;
 
@@ -109,88 +164,173 @@ impl RuntimeHandlerManagerInner {
             }
         }
 
-        // start sandbox
-        runtime_instance
-            .sandbox
-            .start(dns, spec, state, network_env)
-            .await
-            .context("start sandbox")?;
-        self.runtime_instance = Some(Arc::new(runtime_instance));
+        let instance = Arc::new(runtime_instance);
+        self.runtime_instance = Some(instance.clone());
+
         Ok(())
     }
 
     #[instrument]
     async fn try_init(
         &mut self,
-        spec: &oci::Spec,
-        state: &oci::State,
+        mut sandbox_config: SandboxConfig,
+        spec: Option<&oci::Spec>,
         options: &Option<Vec<u8>>,
     ) -> Result<()> {
-        // return if runtime instance has init
-        if self.runtime_instance.is_some() {
-            return Ok(());
-        }
+        init_runtime_handlers()?;
 
-        let mut dns: Vec<String> = vec![];
+        // The namespace already exists. Hold it across config loading so a
+        // failure here still removes it.
+        let created_netns = CreatedNetnsGuard::new(&sandbox_config.network_env);
+        let (mut config, config_path) =
+            load_config_with_path(&sandbox_config.annotations, options).context("load config")?;
+        sandbox_config.config_path = Some(config_path);
 
-        #[cfg(feature = "linux")]
-        LinuxContainer::init().context("init linux container")?;
-        #[cfg(feature = "wasm")]
-        WasmContainer::init().context("init wasm container")?;
+        // Computed before the hypervisor config is borrowed: it only reads
+        // the runtime section and the OCI spec.
         #[cfg(feature = "virt")]
-        VirtContainer::init().context("init virt container")?;
+        let cgroup_state = resource::cgroups::preview_cgroup_state(&self.id, &config)
+            .context("preview the cgroup state")?;
 
-        for m in &spec.mounts {
-            if m.destination == DEFAULT_GUEST_DNS_FILE {
-                let contents = fs::read_to_string(&m.source).await?;
-                dns = contents.split('\n').map(|e| e.to_string()).collect();
+        let hypervisor_name = &config.runtime.hypervisor_name;
+        let hypervisor = config
+            .hypervisor
+            .get_mut(hypervisor_name)
+            .ok_or_else(|| anyhow!("hypervisor {} not found in config", hypervisor_name))?;
+
+        set_rootless(hypervisor.security_info.rootless);
+        let mut rootless_setup_guard = if is_rootless() {
+            // Record each candidate user before useradd may create it: a
+            // crash in between leaves a user only that record names.
+            let sid = self.id.clone();
+            let network_env = sandbox_config.network_env.clone();
+            let cfg_path = sandbox_config.config_path.clone();
+            let hv_name = hypervisor_name.clone();
+            Some(
+                configure_non_root_hypervisor(&self.id, hypervisor, &mut |candidate| {
+                    #[cfg(feature = "virt")]
+                    save_bootstrap_state(
+                        &sid,
+                        &network_env,
+                        cfg_path.as_deref(),
+                        Some((&hv_name, candidate)),
+                        None,
+                    )?;
+                    #[cfg(not(feature = "virt"))]
+                    let _ = candidate;
+                    Ok(())
+                })
+                .context("configure non-root hypervisor")?,
+            )
+        } else {
+            None
+        };
+
+        if is_rootless() {
+            // When kata-runtime is invoked as rootless by podman with net=none,
+            // the initially created netns (bind-mounted under /var/run/netns) requires root privileges.
+            // This makes it inaccessible to non-root users. We need to create a non-root accessible
+            // netns and replace the original network namespace path in the config.
+            if sandbox_config.network_env.network_created {
+                discard_created_netns(&mut sandbox_config.network_env)?;
+                let ns_name = generate_netns_name();
+                let path = RootlessEnv.persist_dir().join(&ns_name);
+                sandbox_config.network_env.netns = Some(path.display().to_string());
+                // Record the namespace before making it: removing one that
+                // never came to exist is tolerated, while one no record
+                // names is never removed.
+                #[cfg(feature = "virt")]
+                save_bootstrap_state(
+                    &self.id,
+                    &sandbox_config.network_env,
+                    sandbox_config.config_path.as_deref(),
+                    Some((hypervisor_name, hypervisor)),
+                    None,
+                )?;
+                NetNs::new_with_env(ns_name, RootlessEnv)?;
             }
         }
+        // Declare after rootless_setup_guard so this guard drops first and unmounts
+        // the namespace before the runtime directory is removed.
+        let mut created_netns = created_netns;
+        created_netns.track(&sandbox_config.network_env);
+        // The full record: the resource manager will create the cgroups and
+        // the swap directory before the sandbox first saves for itself, so
+        // they have to be named here already.
+        #[cfg(feature = "virt")]
+        save_bootstrap_state(
+            &self.id,
+            &sandbox_config.network_env,
+            sandbox_config.config_path.as_deref(),
+            Some((hypervisor_name, hypervisor)),
+            Some(cgroup_state.clone()),
+        )?;
 
-        let config = load_config(spec, options).context("load config")?;
+        // Sandbox sizing information *may* be provided in two scenarios:
+        //   1. The upper layer runtime (ie, containerd or crio) provide sandbox sizing information as an annotation
+        //	in the 'sandbox container's' spec. This would typically be a scenario where as part of a create sandbox
+        //	request the upper layer runtime receives this information as part of a pod, and makes it available to us
+        //	for sizing purposes.
+        //   2. If this is not a sandbox infrastructure container, but instead a standalone single container (analogous to "docker run..."),
+        //	then the container spec itself will contain appropriate sizing information for the entire sandbox (since it is
+        //	a single container.
+
+        let mut initial_size_manager = if let Some(spec) = spec {
+            InitialSizeManager::new(spec).context("failed to construct static resource manager")?
+        } else {
+            InitialSizeManager::new_from(&sandbox_config.annotations)
+                .context("failed to construct static resource manager")?
+        };
+
+        // For CRI sandboxes, sizing annotations are carried in PodSandboxConfig
+        // and may be absent from the OCI sandbox spec. Fill any missing sizing
+        // values from sandbox annotations before applying static sizing.
+        initial_size_manager
+            .supplement_from_annotations(&sandbox_config.annotations)
+            .context("failed to supplement static resource manager from annotations")?;
+
+        initial_size_manager
+            .setup_config(&mut config)
+            .context("failed to setup static resource mgmt config")?;
+
+        update_component_log_level(&config);
 
         let dan_path = dan_config_path(&config, &self.id);
-        let mut network_created = false;
         // set netns to None if we want no network for the VM
-        let netns = if config.runtime.disable_new_netns {
-            None
-        } else if dan_path.exists() {
-            info!(sl!(), "Do not create a netns due to DAN");
-            None
-        } else {
-            let mut netns_path = None;
-            if let Some(linux) = &spec.linux {
-                for ns in &linux.namespaces {
-                    if ns.r#type.as_str() != oci::NETWORKNAMESPACE {
-                        continue;
-                    }
-                    // get netns path from oci spec
-                    if !ns.path.is_empty() {
-                        netns_path = Some(ns.path.clone());
-                    }
-                    // if we get empty netns from oci spec, we need to create netns for the VM
-                    else {
-                        let ns_name = generate_netns_name();
-                        let netns = NetNs::new(ns_name)?;
-                        let path = PathBuf::from(netns.path()).to_str().map(|s| s.to_string());
-                        info!(sl!(), "the netns path is {:?}", path);
-                        netns_path = path;
-                        network_created = true;
-                    }
-                    break;
-                }
+        if config.runtime.disable_new_netns || dan_path.exists() {
+            discard_created_netns(&mut sandbox_config.network_env)?;
+            sandbox_config.network_env.netns = None;
+            created_netns.track(&sandbox_config.network_env);
+            // The record above still names the renounced namespace; rewrite
+            // it, or a death here would have the cleanup sweep a namespace
+            // this sandbox never touches.
+            #[cfg(feature = "virt")]
+            {
+                let hypervisor_name = &config.runtime.hypervisor_name;
+                let hypervisor = config
+                    .hypervisor
+                    .get(hypervisor_name)
+                    .ok_or_else(|| anyhow!("hypervisor {} not found in config", hypervisor_name))?;
+                save_bootstrap_state(
+                    &self.id,
+                    &sandbox_config.network_env,
+                    sandbox_config.config_path.as_deref(),
+                    Some((hypervisor_name, hypervisor)),
+                    Some(cgroup_state),
+                )?;
             }
-            netns_path
-        };
+        }
 
-        let network_env = SandboxNetworkEnv {
-            netns,
-            network_created,
-        };
-
-        self.init_runtime_handler(spec, state, network_env, dns, Arc::new(config))
+        self.init_runtime_handler(sandbox_config, Arc::new(config), initial_size_manager)
             .await
             .context("init runtime handler")?;
+        created_netns.disarm();
+
+        // Rootless resource ownership now passes to the runtime instance and
+        // its normal teardown paths.
+        if let Some(guard) = rootless_setup_guard.as_mut() {
+            guard.disarm();
+        }
 
         // the sandbox creation can reach here only once and the sandbox is created
         // so we can safely create the shim management socket right now
@@ -216,6 +356,16 @@ impl RuntimeHandlerManagerInner {
     }
 }
 
+/// What [`RuntimeHandlerManager::cleanup`] did with a dead shim's sandbox.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CleanupOutcome {
+    /// Everything the saved state recorded is gone.
+    Done,
+    /// keep_abnormal left the sandbox's resources in place on purpose, and
+    /// the saved state is the only record of them.
+    Skipped,
+}
+
 pub struct RuntimeHandlerManager {
     inner: Arc<RwLock<RuntimeHandlerManagerInner>>,
 }
@@ -236,17 +386,49 @@ impl RuntimeHandlerManager {
         })
     }
 
-    pub async fn cleanup(&self) -> Result<()> {
+    /// Clean up after a shim that is gone. The outcome tells the caller
+    /// whether the sandbox's saved state is still the record of something.
+    pub async fn cleanup(&self) -> Result<CleanupOutcome> {
         let inner = self.inner.read().await;
+        verify_id(&inner.id).context("verify sandbox id")?;
+        // Pod containers share their sandbox's state and have no runtime directory
+        // of their own. Never restore the parent sandbox to clean up such a task.
+        let runtime_dir = Path::new(KATA_PATH).join(&inner.id);
+        if !runtime_dir
+            .try_exists()
+            .context("inspect sandbox runtime directory")?
+        {
+            debug!(
+                sl!(),
+                "no runtime directory for task, skipping sandbox cleanup";
+                "task_id" => &inner.id,
+            );
+            return Ok(CleanupOutcome::Done);
+        }
         let sender = inner.msg_sender.clone();
         let sandbox_state = persist::from_disk::<SandboxState>(&inner.id)
             .context("failed to load the sandbox state")?;
 
-        let config = if let Ok(spec) = load_oci_spec() {
-            load_config(&spec, &None).context("load config")?
-        } else {
-            TomlConfig::default()
-        };
+        // Only try_init() turns rootless mode on, and this process never runs
+        // it. Without it, every rootless path resolves to the rootful one, and
+        // the VMM user and its runtime directory are left behind.
+        if let Some(h) = sandbox_state.hypervisor.as_ref() {
+            if let Some(dir) = rootless_runtime_dir(&h.config.security_info)? {
+                env::set_var("XDG_RUNTIME_DIR", dir);
+                set_rootless(true);
+            }
+        }
+
+        // After the shim disconnects, containerd invokes the shim binary's `delete`
+        // subcommand in a separate process. This path bypasses try_init(), so register
+        // the config plugins here before loading the sandbox configuration.
+        init_runtime_handlers()?;
+
+        let annotations = load_oci_spec()
+            .ok()
+            .and_then(|spec| spec.annotations().clone())
+            .unwrap_or_default();
+        let config = cleanup_config(sandbox_state.config_path.as_deref(), &annotations);
 
         let sandbox_args = SandboxRestoreArgs {
             sid: inner.id.clone(),
@@ -257,33 +439,50 @@ impl RuntimeHandlerManager {
             #[cfg(feature = "linux")]
             name if name == LinuxContainer::name() => {
                 // TODO :support linux container (https://github.com/kata-containers/kata-containers/issues/4905)
-                return Ok(());
+                return Ok(CleanupOutcome::Done);
             }
             #[cfg(feature = "wasm")]
             name if name == WasmContainer::name() => {
                 // TODO :support wasm container (https://github.com/kata-containers/kata-containers/issues/4906)
-                return Ok(());
+                return Ok(CleanupOutcome::Done);
             }
             #[cfg(feature = "virt")]
             name if name == VirtContainer::name() => {
-                if sandbox_args.toml_config.runtime.keep_abnormal {
+                // The state's own record wins: the file can have changed, or
+                // be gone, since the sandbox read it. Only a state saved
+                // before the configuration was read leaves the decision to
+                // the file.
+                let keep_abnormal = sandbox_state
+                    .keep_abnormal
+                    .unwrap_or(sandbox_args.toml_config.runtime.keep_abnormal);
+                if keep_abnormal {
                     info!(sl!(), "skip cleanup for keep_abnormal");
-                    return Ok(());
+                    return Ok(CleanupOutcome::Skipped);
+                }
+                if sandbox_state.is_bootstrap() {
+                    return cleanup_bootstrap(&inner.id, &sandbox_state, sandbox_args.toml_config)
+                        .await
+                        .context("failed to clean up the sandbox setup")
+                        .map(|()| CleanupOutcome::Done);
                 }
                 let sandbox = VirtSandbox::restore(sandbox_args, sandbox_state)
                     .await
                     .context("failed to restore the sandbox")?;
+                sandbox
+                    .confirm_restored_vmm_exit()
+                    .await
+                    .context("failed to stop the restored VMM")?;
                 sandbox
                     .cleanup()
                     .await
                     .context("failed to cleanup the resource")?;
             }
             _ => {
-                return Ok(());
+                return Ok(CleanupOutcome::Done);
             }
         }
 
-        Ok(())
+        Ok(CleanupOutcome::Done)
     }
 
     async fn get_runtime_instance(&self) -> Result<Arc<RuntimeInstance>> {
@@ -298,37 +497,167 @@ impl RuntimeHandlerManager {
         Ok(inner.get_kata_tracer())
     }
 
+    //init the sandbox for the normal task api
     #[instrument]
-    async fn try_init_runtime_instance(
+    async fn task_init_runtime_instance(
         &self,
-        spec: &oci::Spec,
-        state: &oci::State,
+        spec: &mut oci::Spec,
+        state: &spec::State,
         options: &Option<Vec<u8>>,
     ) -> Result<()> {
+        let mut inner: tokio::sync::RwLockWriteGuard<'_, RuntimeHandlerManagerInner> =
+            self.inner.write().await;
+
+        // return if runtime instance has init
+        if inner.runtime_instance.is_some() {
+            return Ok(());
+        }
+
+        let mut dns: Vec<String> = vec![];
+
+        let spec_mounts = spec.mounts().clone().unwrap_or_default();
+        for m in &spec_mounts {
+            if get_mount_path(&Some(m.destination().clone())) == DEFAULT_GUEST_DNS_FILE {
+                let contents = fs::read_to_string(&Path::new(&get_mount_path(m.source()))).await?;
+                dns = contents.split('\n').map(|e| e.to_string()).collect();
+            }
+        }
+
+        let mut network_created = false;
+        let mut netns = None;
+        if let Some(linux) = &spec.linux() {
+            let linux_namespaces = linux.namespaces().clone().unwrap_or_default();
+            for ns in &linux_namespaces {
+                if ns.typ() != oci::LinuxNamespaceType::Network {
+                    continue;
+                }
+                // get netns path from oci spec
+                if ns.path().is_some() {
+                    netns = ns.path().clone().map(|p| p.display().to_string());
+                }
+                // if we get empty netns from oci spec, we need to create netns for the VM
+                else {
+                    let ns_name = generate_netns_name();
+                    let path = DefaultEnv.persist_dir().join(&ns_name);
+                    netns = Some(path.display().to_string());
+                    network_created = true;
+                    // Record the namespace before making it: removing one
+                    // that never came to exist is tolerated, while one no
+                    // record names is never removed.
+                    #[cfg(feature = "virt")]
+                    save_bootstrap_state(
+                        &inner.id,
+                        &SandboxNetworkEnv {
+                            netns: netns.clone(),
+                            network_created,
+                        },
+                        None,
+                        None,
+                        None,
+                    )?;
+                    NetNs::new(ns_name)?;
+                }
+                break;
+            }
+        }
+
+        // When the OCI spec contains a network namespace with path `/proc/0/ns/net`,
+        // it means the task PID was not yet known at spec generation time (PID 0 is a
+        // placeholder).  containerd populates the netns path before the shim returns
+        // a real PID via the Connect RPC.  Treat this as "no netns provided" so the
+        // rescan mechanism can discover the correct namespace later.
+        if netns.as_deref() == Some("/proc/0/ns/net") {
+            netns = None;
+        }
+        // Docker 26+ may not publish the network namespace in `linux.namespaces` at create; use
+        // `libnetwork-setkey` hook args (see Go `DockerNetnsPath` and #9340).
+        if netns.is_none() {
+            if let Some(p) = kata_sys_util::oci_docker::docker_netns_path(spec) {
+                netns = Some(p);
+            }
+        }
+
+        // A nerdctl network namespace to let nerdctl know which namespace to use when calling the
+        // selected CNI plugin.
+        if let Some(netns_path) = &netns {
+            if spec.annotations_mut().is_none() {
+                spec.set_annotations(Some(HashMap::new()));
+            }
+            if let Some(annotations) = spec.annotations_mut().as_mut() {
+                annotations.insert("nerdctl/network-namespace".to_string(), netns_path.clone());
+            }
+        }
+
+        let network_env = SandboxNetworkEnv {
+            netns,
+            network_created,
+        };
+
+        let shm_size = get_shm_size(spec)?;
+
+        let sandbox_config = SandboxConfig {
+            sandbox_id: inner.id.clone(),
+            dns,
+            hostname: spec.hostname().clone().unwrap_or_default(),
+            network_env,
+            annotations: spec.annotations().clone().unwrap_or_default(),
+            hooks: spec.hooks().clone(),
+            state: state.clone(),
+            shm_size,
+            config_path: None,
+        };
+
+        inner.try_init(sandbox_config, Some(spec), options).await
+    }
+
+    //init the sandbox for the sandbox api
+    #[instrument]
+    async fn sandbox_init_runtime_instance(&self, sandbox_config: SandboxConfig) -> Result<()> {
         let mut inner = self.inner.write().await;
-        inner.try_init(spec, state, options).await
+        // return if runtime instance has init
+        if inner.runtime_instance.is_some() {
+            return Ok(());
+        }
+        inner.try_init(sandbox_config, None, &None).await
     }
 
     #[instrument(parent = &*(ROOTSPAN))]
-    pub async fn handler_message(&self, req: Request) -> Result<Response> {
-        if let Request::CreateContainer(container_config) = req {
+    pub async fn handler_sandbox_message(&self, req: SandboxRequest) -> Result<SandboxResponse> {
+        if let SandboxRequest::CreateSandbox(sandbox_config) = req {
+            let config = sandbox_config.deref().clone();
+
+            self.sandbox_init_runtime_instance(config)
+                .await
+                .context("init sandboxed runtime")?;
+
+            Ok(SandboxResponse::CreateSandbox)
+        } else {
+            self.handler_sandbox_request(req)
+                .await
+                .context("handler request")
+        }
+    }
+
+    #[instrument(parent = &*(ROOTSPAN))]
+    pub async fn handler_task_message(&self, req: TaskRequest) -> Result<TaskResponse> {
+        if let TaskRequest::CreateContainer(container_config) = req {
             // get oci spec
             let bundler_path = format!(
                 "{}/{}",
                 container_config.bundle,
-                oci::OCI_SPEC_CONFIG_FILE_NAME
+                spec::OCI_SPEC_CONFIG_FILE_NAME
             );
-            let spec = oci::Spec::load(&bundler_path).context("load spec")?;
-            let state = oci::State {
-                version: spec.version.clone(),
+            let mut spec = oci::Spec::load(&bundler_path).context("load spec")?;
+            let state = spec::State {
+                version: spec.version().clone(),
                 id: container_config.container_id.to_string(),
-                status: oci::ContainerState::Creating,
+                status: spec::ContainerState::Creating,
                 pid: 0,
                 bundle: container_config.bundle.clone(),
-                annotations: spec.annotations.clone(),
+                annotations: spec.annotations().clone().unwrap_or_default(),
             };
 
-            self.try_init_runtime_instance(&spec, &state, &container_config.options)
+            self.task_init_runtime_instance(&mut spec, &state, &container_config.options)
                 .await
                 .context("try init runtime instance")?;
             let instance = self
@@ -336,46 +665,190 @@ impl RuntimeHandlerManager {
                 .await
                 .context("get runtime instance")?;
 
-            let shim_pid = instance
+            instance
+                .sandbox
+                .start()
+                .await
+                .context("start sandbox in task handler")?;
+
+            let bundle = container_config.bundle.clone();
+            let container_id = container_config.container_id.clone();
+            // Creating the container makes host artifacts (block emptyDir
+            // disks) that recovery only removes when the saved state names
+            // them, so the state must name them before they can exist.
+            instance
+                .sandbox
+                .save_container_intents(&spec)
+                .await
+                .context("save container intents")?;
+            let created = instance
                 .container_manager
                 .create_container(container_config, spec)
-                .await
-                .context("create container")?;
+                .await;
+            // Creating a container changes what the sandbox owns on the host,
+            // whether the create succeeded or not, and recovery only cleans up
+            // what the saved state records. Save it after every create.
+            let saved = instance.sandbox.save_state().await;
+            if let (Err(_), Err(e)) = (&created, &saved) {
+                warn!(sl!(), "failed to save the sandbox state: {:#}", e);
+            }
+            let shim_pid = created.context("create container")?;
+            saved.context("save the sandbox state")?;
 
-            Ok(Response::CreateContainer(shim_pid))
+            let container_manager = instance.container_manager.clone();
+            let process_id =
+                ContainerProcess::new(&container_id, "").context("create container process")?;
+            let pid = shim_pid.pid;
+            tokio::spawn(async move {
+                let result = instance
+                    .sandbox
+                    .wait_process(container_manager, process_id, pid)
+                    .await;
+                if let Err(e) = result {
+                    error!(sl!(), "sandbox wait process error: {:?}", e);
+                }
+            });
+
+            let msg_sender = self.inner.read().await.msg_sender.clone();
+            let event = TaskCreate {
+                container_id,
+                bundle,
+                pid,
+                ..Default::default()
+            };
+            let msg = Message::new(Action::Event(Arc::new(event)));
+            msg_sender
+                .send(msg)
+                .await
+                .context("send task create event")?;
+
+            Ok(TaskResponse::CreateContainer(shim_pid))
         } else {
-            self.handler_request(req).await.context("handler request")
+            // A teardown RPC must still make the shim daemon exit even when
+            // the runtime instance was never (fully) created -- e.g. after a
+            // failed CreateContainer.  In that case containerd's follow-up
+            // Shutdown would otherwise hit `get_runtime_instance()`, fail with
+            // "runtime not ready", and the service loop would never receive
+            // `Action::Shutdown`.  Because the shim ignores SIGTERM the daemon
+            // would then be left running and orphaned by containerd.
+            if let TaskRequest::ShutdownContainer(_) = &req {
+                if self.get_runtime_instance().await.is_err() {
+                    warn!(
+                        sl!(),
+                        "shutdown requested but runtime instance is not ready; \
+                         forcing shim exit to avoid an orphaned shim process"
+                    );
+                    let sender = self.inner.read().await.msg_sender.clone();
+                    sender
+                        .send(Message::new(Action::Shutdown))
+                        .await
+                        .context("send shutdown message")?;
+                    return Ok(TaskResponse::ShutdownContainer);
+                }
+            }
+
+            self.handler_task_request(req)
+                .await
+                .context("handler TaskRequest")
+        }
+    }
+
+    pub async fn handler_sandbox_request(&self, req: SandboxRequest) -> Result<SandboxResponse> {
+        let instance = self
+            .get_runtime_instance()
+            .await
+            .context("get runtime instance")?;
+        let sandbox = instance.sandbox.clone();
+
+        match req {
+            SandboxRequest::CreateSandbox(req) => Err(anyhow!("Unreachable request {:?}", req)),
+            SandboxRequest::StartSandbox(_) => {
+                sandbox
+                    .start()
+                    .await
+                    .context("start sandbox in sandbox handler")?;
+                Ok(SandboxResponse::StartSandbox(StartSandboxInfo {
+                    pid: std::process::id(),
+                    create_time: Some(SystemTime::now()),
+                }))
+            }
+            SandboxRequest::Platform(_) => Ok(SandboxResponse::Platform(PlatformInfo {
+                os: std::env::consts::OS.to_string(),
+                architecture: std::env::consts::ARCH.to_string(),
+            })),
+            SandboxRequest::StopSandbox(_) => {
+                sandbox.stop().await.context("stop sandbox")?;
+
+                Ok(SandboxResponse::StopSandbox)
+            }
+            SandboxRequest::WaitSandbox(_) => {
+                let exit_info = sandbox.wait().await.context("wait sandbox")?;
+
+                Ok(SandboxResponse::WaitSandbox(exit_info))
+            }
+            SandboxRequest::SandboxStatus(_) => {
+                let status = sandbox.status().await?;
+
+                Ok(SandboxResponse::SandboxStatus(SandboxStatusInfo {
+                    sandbox_id: status.sandbox_id,
+                    pid: status.pid,
+                    state: status.state,
+                    created_at: status.created_at,
+                    exited_at: None,
+                }))
+            }
+            SandboxRequest::Ping(_) => Ok(SandboxResponse::Ping),
+            SandboxRequest::ShutdownSandbox(_) => {
+                sandbox.shutdown().await.context("shutdown sandbox")?;
+
+                Ok(SandboxResponse::ShutdownSandbox)
+            }
         }
     }
 
     #[instrument(parent = &(*ROOTSPAN))]
-    pub async fn handler_request(&self, req: Request) -> Result<Response> {
+    pub async fn handler_task_request(&self, req: TaskRequest) -> Result<TaskResponse> {
         let instance = self
             .get_runtime_instance()
             .await
             .context("get runtime instance")?;
         let sandbox = instance.sandbox.clone();
         let cm = instance.container_manager.clone();
+        let msg_sender = self.inner.read().await.msg_sender.clone();
 
         match req {
-            Request::CreateContainer(req) => Err(anyhow!("Unreachable request {:?}", req)),
-            Request::CloseProcessIO(process_id) => {
+            TaskRequest::CreateContainer(req) => Err(anyhow!("Unreachable TaskRequest {:?}", req)),
+            TaskRequest::CloseProcessIO(process_id) => {
                 cm.close_process_io(&process_id).await.context("close io")?;
-                Ok(Response::CloseProcessIO)
+                Ok(TaskResponse::CloseProcessIO)
             }
-            Request::DeleteProcess(process_id) => {
+            TaskRequest::DeleteProcess(process_id) => {
                 let resp = cm.delete_process(&process_id).await.context("do delete")?;
-                Ok(Response::DeleteProcess(resp))
+                if process_id.process_type == ProcessType::Container {
+                    let event = TaskDelete {
+                        id: process_id.container_id().to_string(),
+                        pid: resp.pid.pid,
+                        exit_status: resp.exit_status as u32,
+                        ..Default::default()
+                    };
+                    let msg = Message::new(Action::Event(Arc::new(event)));
+                    msg_sender
+                        .send(msg)
+                        .await
+                        .context("send task delete event")?;
+                }
+
+                Ok(TaskResponse::DeleteProcess(resp))
             }
-            Request::ExecProcess(req) => {
+            TaskRequest::ExecProcess(req) => {
                 cm.exec_process(req).await.context("exec")?;
-                Ok(Response::ExecProcess)
+                Ok(TaskResponse::ExecProcess)
             }
-            Request::KillProcess(req) => {
+            TaskRequest::KillProcess(req) => {
                 cm.kill_process(&req).await.context("kill process")?;
-                Ok(Response::KillProcess)
+                Ok(TaskResponse::KillProcess)
             }
-            Request::ShutdownContainer(req) => {
+            TaskRequest::ShutdownContainer(req) => {
                 if cm.need_shutdown_sandbox(&req).await {
                     sandbox.shutdown().await.context("do shutdown")?;
 
@@ -384,59 +857,110 @@ impl RuntimeHandlerManager {
                     let tracer = kata_tracer.lock().await;
                     tracer.trace_end();
                 }
-                Ok(Response::ShutdownContainer)
+                Ok(TaskResponse::ShutdownContainer)
             }
-            Request::WaitProcess(process_id) => {
+            TaskRequest::WaitProcess(process_id) => {
+                // Wait returns when the process exits, as the Go runtime does;
+                // the VM teardown runs in Sandbox::wait_process. containerd
+                // treats the Wait reply as the exit, so for the sandbox
+                // container it must not run ahead of TaskExit, which a
+                // rootless or passthrough sandbox holds until its teardown.
                 let exit_status = cm.wait_process(&process_id).await.context("wait process")?;
                 if cm.is_sandbox_container(&process_id).await {
-                    sandbox.stop().await.context("stop sandbox")?;
+                    sandbox.wait_exit_published().await;
                 }
-                Ok(Response::WaitProcess(exit_status))
+                Ok(TaskResponse::WaitProcess(exit_status))
             }
-            Request::StartProcess(process_id) => {
+            TaskRequest::StartProcess(process_id) => {
+                // Docker 26+ configures the veth between the Create and Start
+                // RPCs.  Rescan now so interfaces are wired before the process
+                // starts.  The rescan uses a lightweight netlink probe during
+                // polling and only does the expensive endpoint setup once
+                // interfaces are detected.
+                // A rescan that finds no network is tolerated inside
+                // rescan_network(); an error out of it means the sandbox
+                // state could not be saved, and starting a workload on
+                // stale recovery state is worse than failing the start.
+                if process_id.process_type == ProcessType::Container {
+                    sandbox
+                        .rescan_network()
+                        .await
+                        .context("record the network rescan")?;
+                }
+
                 let shim_pid = cm
                     .start_process(&process_id)
                     .await
                     .context("start process")?;
-                Ok(Response::StartProcess(shim_pid))
+
+                let pid = shim_pid.pid;
+                let process_type = process_id.process_type;
+                let container_id = process_id.container_id().to_string();
+                // CreateContainer already spawned the container's waiter. A
+                // second one would publish TaskExit twice, and for the sandbox
+                // container it queues behind the first waiter's teardown and
+                // then fails to find the deleted container.
+                if process_type == ProcessType::Exec {
+                    tokio::spawn(async move {
+                        let result = sandbox.wait_process(cm, process_id, pid).await;
+                        if let Err(e) = result {
+                            error!(sl!(), "sandbox wait process error: {:?}", e);
+                        }
+                    });
+                }
+
+                if process_type == ProcessType::Container {
+                    let event = TaskStart {
+                        container_id,
+                        pid,
+                        ..Default::default()
+                    };
+                    let msg = Message::new(Action::Event(Arc::new(event)));
+                    msg_sender
+                        .send(msg)
+                        .await
+                        .context("send task start event")?;
+                }
+
+                Ok(TaskResponse::StartProcess(shim_pid))
             }
 
-            Request::StateProcess(process_id) => {
+            TaskRequest::StateProcess(process_id) => {
                 let state = cm
                     .state_process(&process_id)
                     .await
                     .context("state process")?;
-                Ok(Response::StateProcess(state))
+                Ok(TaskResponse::StateProcess(state))
             }
-            Request::PauseContainer(container_id) => {
+            TaskRequest::PauseContainer(container_id) => {
                 cm.pause_container(&container_id)
                     .await
                     .context("pause container")?;
-                Ok(Response::PauseContainer)
+                Ok(TaskResponse::PauseContainer)
             }
-            Request::ResumeContainer(container_id) => {
+            TaskRequest::ResumeContainer(container_id) => {
                 cm.resume_container(&container_id)
                     .await
                     .context("resume container")?;
-                Ok(Response::ResumeContainer)
+                Ok(TaskResponse::ResumeContainer)
             }
-            Request::ResizeProcessPTY(req) => {
+            TaskRequest::ResizeProcessPTY(req) => {
                 cm.resize_process_pty(&req).await.context("resize pty")?;
-                Ok(Response::ResizeProcessPTY)
+                Ok(TaskResponse::ResizeProcessPTY)
             }
-            Request::StatsContainer(container_id) => {
+            TaskRequest::StatsContainer(container_id) => {
                 let stats = cm
                     .stats_container(&container_id)
                     .await
                     .context("stats container")?;
-                Ok(Response::StatsContainer(stats))
+                Ok(TaskResponse::StatsContainer(stats))
             }
-            Request::UpdateContainer(req) => {
+            TaskRequest::UpdateContainer(req) => {
                 cm.update_container(req).await.context("update container")?;
-                Ok(Response::UpdateContainer)
+                Ok(TaskResponse::UpdateContainer)
             }
-            Request::Pid => Ok(Response::Pid(cm.pid().await.context("pid")?)),
-            Request::ConnectContainer(container_id) => Ok(Response::ConnectContainer(
+            TaskRequest::Pid => Ok(TaskResponse::Pid(cm.pid().await.context("pid")?)),
+            TaskRequest::ConnectContainer(container_id) => Ok(TaskResponse::ConnectContainer(
                 cm.connect_container(&container_id)
                     .await
                     .context("connect")?,
@@ -445,70 +969,895 @@ impl RuntimeHandlerManager {
     }
 }
 
-/// Config override ordering(high to low):
-/// 1. podsandbox annotation
-/// 2. environment variable
-/// 3. shimv2 create task option
-/// 4. If above three are not set, then get default path from DEFAULT_RUNTIME_CONFIGURATIONS
-/// in kata-containers/src/libs/kata-types/src/config/default.rs, in array order.
-#[instrument]
-fn load_config(spec: &oci::Spec, option: &Option<Vec<u8>>) -> Result<TomlConfig> {
-    const KATA_CONF_FILE: &str = "KATA_CONF_FILE";
-    let annotation = Annotation::new(spec.annotations.clone());
-    let config_path = if let Some(path) = annotation.get_sandbox_config_path() {
-        path
-    } else if let Ok(path) = std::env::var(KATA_CONF_FILE) {
-        path
-    } else if let Some(option) = option {
-        // get rid of the special characters in options to get the config path
-        if option.len() > 2 {
-            from_utf8(&option[2..])?.to_string()
-        } else {
-            String::from("")
-        }
-    } else {
-        String::from("")
-    };
-    info!(sl!(), "get config path {:?}", &config_path);
-    let (mut toml_config, _) =
-        TomlConfig::load_from_file(&config_path).context("load toml config")?;
-    annotation.update_config_by_annotation(&mut toml_config)?;
-    update_agent_kernel_params(&mut toml_config)?;
-
-    // validate configuration and return the error
-    toml_config.validate()?;
-
-    // Sandbox sizing information *may* be provided in two scenarios:
-    //   1. The upper layer runtime (ie, containerd or crio) provide sandbox sizing information as an annotation
-    //	in the 'sandbox container's' spec. This would typically be a scenario where as part of a create sandbox
-    //	request the upper layer runtime receives this information as part of a pod, and makes it available to us
-    //	for sizing purposes.
-    //   2. If this is not a sandbox infrastructure container, but instead a standalone single container (analogous to "docker run..."),
-    //	then the container spec itself will contain appropriate sizing information for the entire sandbox (since it is
-    //	a single container.
-    let initial_size_manager =
-        InitialSizeManager::new(spec).context("failed to construct static resource manager")?;
-    initial_size_manager
-        .setup_config(&mut toml_config)
-        .context("failed to setup static resource mgmt config")?;
-
-    info!(sl!(), "get config content {:?}", &toml_config);
-    Ok(toml_config)
-}
-
-// this update the agent-specfic kernel parameters into hypervisor's bootinfo
-// the agent inside the VM will read from file cmdline to get the params and function
-fn update_agent_kernel_params(config: &mut TomlConfig) -> Result<()> {
-    let mut params = vec![];
-    if let Ok(kv) = config.get_agent_kernel_params() {
-        for (k, v) in kv.into_iter() {
-            if let Ok(s) = Param::new(k.as_str(), v.as_str()).to_string() {
-                params.push(s);
-            }
-        }
-        if let Some(h) = config.hypervisor.get_mut(&config.runtime.hypervisor_name) {
-            h.boot_info.add_kernel_params(params);
-        }
+// Remove before replacing the path: no other owner can clean up the old namespace.
+fn discard_created_netns(network_env: &mut SandboxNetworkEnv) -> Result<()> {
+    if let Some(path) = network_env.created_netns() {
+        remove_netns(Path::new(&path)).context("remove unused network namespace")?;
+        network_env.netns = None;
     }
     Ok(())
+}
+
+/// Setup failures occur before a sandbox can take ownership of namespace cleanup.
+struct CreatedNetnsGuard(Option<String>);
+
+impl CreatedNetnsGuard {
+    fn new(network_env: &SandboxNetworkEnv) -> Self {
+        let mut guard = Self(None);
+        guard.track(network_env);
+        guard
+    }
+
+    fn track(&mut self, network_env: &SandboxNetworkEnv) {
+        self.0 = network_env.created_netns();
+    }
+
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for CreatedNetnsGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            if let Err(err) = remove_netns(Path::new(&path)) {
+                warn!(
+                    sl!(),
+                    "failed to remove network namespace {}: {:#}", path, err
+                );
+            }
+        }
+    }
+}
+
+// RootlessEnv implements netns_rs::Env trait to provide the rootless directory path
+// for creating network namespace in rootless mode.
+#[derive(Copy, Clone, Default, Debug)]
+pub struct RootlessEnv;
+
+impl Env for RootlessEnv {
+    fn persist_dir(&self) -> PathBuf {
+        PathBuf::from(rootless_dir()).join("netns")
+    }
+
+    fn init(&self) -> netns_rs::Result<()> {
+        let persist_dir = self.persist_dir();
+        create_dir_all_with_inherit_owner(&persist_dir, 0o750)
+            .map_err(netns_rs::Error::CreateNsDirError)?;
+        Ok(())
+    }
+}
+
+fn init_runtime_handlers() -> Result<()> {
+    #[cfg(feature = "linux")]
+    LinuxContainer::init().context("init linux container")?;
+    #[cfg(feature = "wasm")]
+    WasmContainer::init().context("init wasm container")?;
+    #[cfg(feature = "virt")]
+    VirtContainer::init().context("init virt container")?;
+    Ok(())
+}
+
+/// The shim `delete` subcommand gets no shimv2 options, so it reloads the
+/// configuration the sandbox was created with from its state. A state saved
+/// before the path was recorded falls back to the default configuration.
+///
+/// A config that no longer loads (removed file, missing hypervisor binary)
+/// fails the same way on every retry, while the persisted state alone is
+/// enough to stop the VMM and release resources.
+fn cleanup_config(config_path: Option<&Path>, an: &HashMap<String, String>) -> TomlConfig {
+    let loaded = match config_path {
+        Some(path) => load_config_from(an, path).map(|(config, _)| config),
+        None => load_config(an, &None),
+    };
+    loaded.unwrap_or_else(|e| {
+        warn!(
+            sl!(),
+            "failed to load the sandbox config, cleaning up with the default: {:#}", e
+        );
+        TomlConfig::default()
+    })
+}
+
+// this update the log_level of three component: agent, hypervisor, runtime
+// according to the settings read from configuration file
+fn update_component_log_level(config: &TomlConfig) {
+    // Retrieve the log-levels set in configuration file, modify the FILTER_RULE accordingly
+    let default_level = "info";
+    let agent_level = if let Some(agent_config) = config.agent.get(&config.runtime.agent_name) {
+        effective_log_level(agent_config.debug, &agent_config.log_level)
+    } else {
+        default_level
+    };
+    let hypervisor_level =
+        if let Some(hypervisor_config) = config.hypervisor.get(&config.runtime.hypervisor_name) {
+            effective_log_level(
+                hypervisor_config.debug_info.enable_debug,
+                &hypervisor_config.debug_info.log_level,
+            )
+        } else {
+            default_level
+        };
+    let runtime_level = effective_log_level(config.runtime.debug, &config.runtime.log_level);
+
+    // Update FILTER_RULE to apply changes
+    FILTER_RULE.rcu(|inner| {
+        let mut updated_inner = HashMap::new();
+        updated_inner.clone_from(inner);
+        updated_inner.insert(
+            "runtimes".to_string(),
+            convert_string_to_slog_level(runtime_level),
+        );
+        updated_inner.insert(
+            "agent".to_string(),
+            convert_string_to_slog_level(agent_level),
+        );
+        updated_inner.insert(
+            "hypervisor".to_string(),
+            convert_string_to_slog_level(hypervisor_level),
+        );
+        updated_inner
+    });
+}
+
+fn get_shm_size(spec: &oci::Spec) -> Result<u64> {
+    let mut shm_size = DEFAULT_SHM_SIZE;
+
+    if let Some(mounts) = spec.mounts() {
+        for m in mounts {
+            if m.destination().as_path() != Path::new(SHM_DEVICE) {
+                continue;
+            }
+
+            if m.typ().eq(&Some("bind".to_string()))
+                && !m.source().eq(&Some(PathBuf::from(SHM_DEVICE)))
+            {
+                if let Some(src) = m.source() {
+                    let statfs = statfs::statfs(src)?;
+                    shm_size = statfs.blocks() * statfs.block_size() as u64;
+                }
+            }
+        }
+    }
+
+    Ok(shm_size)
+}
+
+struct RootlessSetupGuard {
+    user_name: Option<String>,
+    user_tmp_dir: Option<PathBuf>,
+    armed: bool,
+}
+
+impl RootlessSetupGuard {
+    fn new(user_name: String) -> Self {
+        Self {
+            user_name: Some(user_name),
+            user_tmp_dir: None,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RootlessSetupGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+
+        if let Some(path) = self.user_tmp_dir.as_ref() {
+            if let Err(err) = remove_dir_all_if_exists(path) {
+                warn!(
+                    sl!(),
+                    "failed to remove rootless runtime directory {}: {}",
+                    path.display(),
+                    err
+                );
+            }
+        }
+
+        if let Some(user_name) = self.user_name.as_ref() {
+            if let Err(err) = remove_vmm_user(user_name) {
+                warn!(
+                    sl!(),
+                    "failed to remove rootless user {}: {}", user_name, err
+                );
+            }
+        }
+    }
+}
+
+/// Until the sandbox saves its state, this is the only record of what the
+/// shim made on the host for it.
+#[cfg(feature = "virt")]
+fn save_bootstrap_state(
+    sid: &str,
+    network_env: &SandboxNetworkEnv,
+    config_path: Option<&Path>,
+    hypervisor: Option<(&str, &Hypervisor)>,
+    cgroup_state: Option<resource::cgroups::cgroup_persist::CgroupState>,
+) -> Result<()> {
+    let state = SandboxState::bootstrap(network_env, config_path, hypervisor, cgroup_state);
+    persist::to_disk(&state, sid).context("save the sandbox setup state")
+}
+
+/// Remove what the shim made on the host before the sandbox existed.
+#[cfg(feature = "virt")]
+async fn cleanup_bootstrap(sid: &str, state: &SandboxState, toml_config: TomlConfig) -> Result<()> {
+    // A death mid-construction left Kata-named links in the recorded
+    // namespace. A created namespace takes its links with it below, and its
+    // record may name a path that never became a namespace, so only a
+    // caller's namespace, which outlives the sandbox, is swept.
+    if let Some(netns_path) = state
+        .resource
+        .as_ref()
+        .and_then(|r| r.netns_path.as_deref())
+        .filter(|netns_path| state.created_netns.as_deref() != Some(*netns_path))
+    {
+        // The sweep enters the namespace per thread; keep it off the
+        // multi-threaded runtime's workers, as the recovered path does.
+        let netns = netns_path.to_string();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let sweep = || -> Result<()> {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_io()
+                    .build()?;
+                rt.block_on(resource::network::remove_kata_links(&netns))
+            };
+            let _ = tx.send(sweep());
+        });
+        rx.await
+            .unwrap_or_else(|e| Err(e.into()))
+            .context("remove the kata links")?;
+    }
+    if let Some(path) = state.created_netns.as_deref() {
+        remove_netns(Path::new(path)).context("remove the network namespace")?;
+    }
+    // What the resource manager created before the sandbox could save for
+    // itself: the cgroups the record named ahead of time, and the swap
+    // directory, whose path the recorded hypervisor config determines.
+    if let Some(cgroup_state) = state
+        .resource
+        .as_ref()
+        .and_then(|r| r.cgroup_state.as_ref())
+    {
+        resource::cgroups::delete_cgroups_from_state(sid, toml_config, cgroup_state.clone())
+            .await
+            .context("remove the cgroups")?;
+    }
+    if let Some(h) = state.hypervisor.as_ref() {
+        if h.config.memory_info.enable_guest_swap {
+            let mut path = PathBuf::from(&h.config.memory_info.guest_swap_path);
+            path.push(sid);
+            remove_dir_all_if_exists(path).context("remove the swap directory")?;
+        }
+    }
+    // The sandbox writes its initdata image while preparing, before its
+    // first save, so a death there leaves the image to this cleanup. Only
+    // a sandbox configured with initdata has one.
+    if state
+        .hypervisor
+        .as_ref()
+        .is_some_and(|h| !h.config.security_info.initdata.is_empty())
+    {
+        resource::coco_data::initdata::remove_initdata_dir(sid)
+            .context("remove the initdata directory")?;
+    }
+    let Some(user) = state
+        .hypervisor
+        .as_ref()
+        .and_then(|h| h.config.security_info.rootless_user.as_ref())
+    else {
+        return Ok(());
+    };
+    // Once the user is gone its UID can belong to another sandbox's, and so
+    // can the runtime directory named after it.
+    match find_user(&user.user_name)? {
+        Some(found) if is_recorded_vmm_user(user.uid, &found, sid) => {
+            remove_dir_all_if_exists(vmm_user_runtime_dir(found.uid.as_raw()))
+                .context("remove the rootless runtime directory")?;
+            remove_vmm_user(&user.user_name).context("remove the VMM user")
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Runtime directory configure_non_root_hypervisor() gave the VMM user of a
+/// rootless sandbox. The user comes from the root-owned state.json, which
+/// the VMM user cannot replace.
+fn rootless_runtime_dir(security: &SecurityInfo) -> Result<Option<PathBuf>> {
+    if !security.rootless {
+        return Ok(None);
+    }
+    let user = security
+        .rootless_user
+        .as_ref()
+        .ok_or_else(|| anyhow!("rootless sandbox state has no VMM user"))?;
+    Ok(Some(vmm_user_runtime_dir(user.uid)))
+}
+
+fn configure_non_root_hypervisor(
+    sid: &str,
+    config: &mut Hypervisor,
+    record_candidate_user: &mut dyn FnMut(&Hypervisor) -> Result<()>,
+) -> Result<RootlessSetupGuard> {
+    let vmm_user_name = {
+        let mut record = |name: &str| {
+            let mut candidate = config.clone();
+            candidate.security_info.rootless_user = Some(RootlessUser {
+                uid: VMM_USER_UID_UNKNOWN,
+                gid: VMM_USER_UID_UNKNOWN,
+                groups: Vec::new(),
+                user_name: name.to_string(),
+            });
+            record_candidate_user(&candidate)
+        };
+        create_vmm_user(sid, &mut record).context("failed to create vmm user")?
+    };
+    let mut guard = RootlessSetupGuard::new(vmm_user_name.clone());
+
+    let user = User::from_name(&vmm_user_name)?.ok_or_else(|| {
+        anyhow!(
+            "failed to get user by name {}, user not found",
+            vmm_user_name
+        )
+    })?;
+
+    let uid = user.uid.as_raw();
+    let gid = user.gid.as_raw();
+
+    let user_tmp_dir = vmm_user_runtime_dir(uid);
+    guard.user_tmp_dir = Some(user_tmp_dir.clone());
+
+    std::fs::create_dir_all(&user_tmp_dir)
+        .with_context(|| format!("create user tmp dir {}", user_tmp_dir.display()))?;
+    chown(&user_tmp_dir, Some(uid), Some(gid))
+        .with_context(|| format!("chown user tmp dir {}", user_tmp_dir.display()))?;
+    info!(
+        sl!(),
+        "chown user tmp dir {} to uid {}, gid {}",
+        user_tmp_dir.display(),
+        uid,
+        gid
+    );
+
+    env::set_var("XDG_RUNTIME_DIR", user_tmp_dir);
+
+    // Establish the rootless runtime hierarchy before VMM and resource setup so
+    // newly created directories inherit the temporary VMM user's ownership.
+    let runtime_root = PathBuf::from(prefix_with_rootless_dir(KATA_PATH));
+    create_dir_all_with_inherit_owner(&runtime_root, 0o750)
+        .with_context(|| format!("create rootless runtime root {}", runtime_root.display()))?;
+
+    // Update the rootless dir prefix for guest_swap_path
+    config.memory_info.guest_swap_path = prefix_with_rootless_dir("/run/kata-containers/swap");
+
+    let mut rootless_vmm_credentials = RootlessUser {
+        uid,
+        gid,
+        groups: Vec::new(),
+        user_name: vmm_user_name,
+    };
+    // The VMM opens /dev/kvm after dropping credentials. QEMU inherits vhost
+    // network and vsock FDs at exec; Cloud Hypervisor receives network tap FDs
+    // over its API.
+    authorize_rootless_device(Path::new("/dev/kvm"), &mut rootless_vmm_credentials, 0o6)?;
+
+    config.security_info.rootless_user = Some(rootless_vmm_credentials);
+
+    Ok(guard)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use common::types::ShutdownRequest;
+    use protobuf::Message as ProtobufMessage;
+    use rstest::rstest;
+    use tokio::sync::mpsc::channel;
+
+    #[tokio::test]
+    async fn test_cleanup_without_sandbox_runtime_directory() {
+        let id = format!(
+            "absent-task-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        assert!(!Path::new(KATA_PATH).join(&id).try_exists().unwrap());
+        let (sender, _receiver) = channel(1);
+        let handler = RuntimeHandlerManager::new(&id, sender).unwrap();
+
+        assert_eq!(handler.cleanup().await.unwrap(), CleanupOutcome::Done);
+        assert_eq!(handler.cleanup().await.unwrap(), CleanupOutcome::Done);
+        assert!(!Path::new(KATA_PATH).join(&id).try_exists().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_rejects_invalid_sandbox_id() {
+        for id in ["", "../sandbox", "/sandbox"] {
+            let (sender, _receiver) = channel(1);
+            let handler = RuntimeHandlerManager::new(id, sender).unwrap();
+            let err = handler
+                .cleanup()
+                .await
+                .expect_err("invalid sandbox id was accepted");
+            assert!(err.to_string().contains("verify sandbox id"));
+        }
+    }
+
+    #[rstest]
+    #[case::armed_guard_removes_runtime_dir(false, false)]
+    #[case::disarmed_guard_keeps_runtime_dir(true, true)]
+    fn test_rootless_setup_guard_runtime_dir(
+        #[case] disarm_guard: bool,
+        #[case] runtime_dir_survives: bool,
+    ) {
+        let parent = tempfile::tempdir().unwrap();
+        let runtime_dir = parent.path().join("runtime");
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+
+        let mut guard = RootlessSetupGuard {
+            user_name: None,
+            user_tmp_dir: Some(runtime_dir.clone()),
+            armed: true,
+        };
+        if disarm_guard {
+            guard.disarm();
+        }
+        drop(guard);
+
+        assert_eq!(runtime_dir.exists(), runtime_dir_survives);
+    }
+
+    #[test]
+    fn test_created_netns_guard() {
+        let created = |netns: Option<&str>| SandboxNetworkEnv {
+            netns: netns.map(String::from),
+            network_created: true,
+        };
+
+        let mut guard = CreatedNetnsGuard::new(&SandboxNetworkEnv {
+            netns: Some("/run/netns/from-spec".to_string()),
+            network_created: false,
+        });
+        assert_eq!(guard.0, None);
+
+        guard.track(&created(Some("/run/netns/created")));
+        assert_eq!(guard.0.as_deref(), Some("/run/netns/created"));
+
+        guard.track(&created(Some("/run/user/1001/netns/created")));
+        assert_eq!(guard.0.as_deref(), Some("/run/user/1001/netns/created"));
+        guard.track(&created(None));
+        assert_eq!(guard.0, None);
+
+        guard.track(&created(Some("/run/netns/created")));
+        guard.disarm();
+        assert_eq!(guard.0, None);
+    }
+
+    #[test]
+    fn test_discard_created_netns_keeps_path_on_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().display().to_string();
+
+        let mut network_env = SandboxNetworkEnv {
+            netns: Some(path.clone()),
+            network_created: true,
+        };
+        assert!(discard_created_netns(&mut network_env).is_err());
+        assert_eq!(network_env.netns, Some(path.clone()));
+
+        let mut network_env = SandboxNetworkEnv {
+            netns: Some(path.clone()),
+            network_created: false,
+        };
+        discard_created_netns(&mut network_env).unwrap();
+        assert_eq!(network_env.netns, Some(path));
+        assert!(dir.path().exists());
+    }
+
+    // A ShutdownContainer RPC that arrives before any runtime instance was
+    // created (e.g. after a failed CreateContainer) must still drive the shim
+    // daemon to exit, otherwise the process is orphaned.  Verify it returns
+    // ShutdownContainer and emits Action::Shutdown on the service channel.
+    #[tokio::test]
+    async fn test_shutdown_without_runtime_instance_forces_exit() {
+        let (sender, mut receiver) = channel::<Message>(8);
+        let manager = RuntimeHandlerManager::new("test-sid", sender).unwrap();
+
+        let resp = manager
+            .handler_task_message(TaskRequest::ShutdownContainer(ShutdownRequest {
+                container_id: "test-sid".to_string(),
+                is_now: true,
+            }))
+            .await
+            .expect("shutdown should succeed even without a runtime instance");
+
+        assert!(matches!(resp, TaskResponse::ShutdownContainer));
+
+        let msg = receiver
+            .try_recv()
+            .expect("an Action::Shutdown message must be sent to stop the daemon");
+        assert!(matches!(msg.action, Action::Shutdown));
+    }
+
+    // Records every process a waiter is spawned for.
+    struct WaiterRecordingSandbox {
+        waiters: tokio::sync::mpsc::UnboundedSender<ContainerProcess>,
+    }
+
+    #[async_trait::async_trait]
+    impl Sandbox for WaiterRecordingSandbox {
+        async fn start(&self) -> Result<()> {
+            unimplemented!()
+        }
+        async fn start_template(&self) -> Result<()> {
+            unimplemented!()
+        }
+        async fn stop(&self) -> Result<()> {
+            unimplemented!()
+        }
+        async fn cleanup(&self) -> Result<()> {
+            unimplemented!()
+        }
+        async fn shutdown(&self) -> Result<()> {
+            unimplemented!()
+        }
+        async fn status(&self) -> Result<common::types::SandboxStatus> {
+            unimplemented!()
+        }
+        async fn wait(&self) -> Result<common::types::SandboxExitInfo> {
+            unimplemented!()
+        }
+        async fn save_state(&self) -> Result<()> {
+            unimplemented!()
+        }
+        async fn set_iptables(&self, _is_ipv6: bool, _data: Vec<u8>) -> Result<Vec<u8>> {
+            unimplemented!()
+        }
+        async fn get_iptables(&self, _is_ipv6: bool) -> Result<Vec<u8>> {
+            unimplemented!()
+        }
+        async fn direct_volume_stats(&self, _volume_path: &str) -> Result<String> {
+            unimplemented!()
+        }
+        async fn direct_volume_resize(&self, _req: agent::ResizeVolumeRequest) -> Result<()> {
+            unimplemented!()
+        }
+        async fn agent_sock(&self) -> Result<String> {
+            unimplemented!()
+        }
+        async fn wait_process(
+            &self,
+            _cm: Arc<dyn common::ContainerManager>,
+            process_id: ContainerProcess,
+            _shim_pid: u32,
+        ) -> Result<()> {
+            self.waiters.send(process_id).unwrap();
+            Ok(())
+        }
+        async fn wait_exit_published(&self) {}
+        async fn rescan_network(&self) -> Result<()> {
+            Ok(())
+        }
+        async fn save_container_intents(&self, _spec: &oci::Spec) -> Result<()> {
+            Ok(())
+        }
+        async fn agent_metrics(&self) -> Result<String> {
+            unimplemented!()
+        }
+        async fn hypervisor_metrics(&self) -> Result<String> {
+            unimplemented!()
+        }
+        async fn set_policy(&self, _policy: &str) -> Result<()> {
+            unimplemented!()
+        }
+    }
+
+    struct StartingContainerManager;
+
+    #[async_trait::async_trait]
+    impl common::ContainerManager for StartingContainerManager {
+        async fn create_container(
+            &self,
+            _config: common::types::ContainerConfig,
+            _spec: oci::Spec,
+        ) -> Result<common::types::PID> {
+            unimplemented!()
+        }
+        async fn pause_container(&self, _id: &common::types::ContainerID) -> Result<()> {
+            unimplemented!()
+        }
+        async fn resume_container(&self, _id: &common::types::ContainerID) -> Result<()> {
+            unimplemented!()
+        }
+        async fn stats_container(
+            &self,
+            _id: &common::types::ContainerID,
+        ) -> Result<common::types::StatsInfo> {
+            unimplemented!()
+        }
+        async fn update_container(&self, _req: common::types::UpdateRequest) -> Result<()> {
+            unimplemented!()
+        }
+        async fn connect_container(
+            &self,
+            _id: &common::types::ContainerID,
+        ) -> Result<common::types::PID> {
+            unimplemented!()
+        }
+        async fn close_process_io(&self, _process_id: &ContainerProcess) -> Result<()> {
+            unimplemented!()
+        }
+        async fn delete_process(
+            &self,
+            _process_id: &ContainerProcess,
+        ) -> Result<common::types::ProcessStateInfo> {
+            unimplemented!()
+        }
+        async fn exec_process(&self, _req: common::types::ExecProcessRequest) -> Result<()> {
+            unimplemented!()
+        }
+        async fn kill_process(&self, _req: &common::types::KillRequest) -> Result<()> {
+            unimplemented!()
+        }
+        async fn resize_process_pty(&self, _req: &common::types::ResizePTYRequest) -> Result<()> {
+            unimplemented!()
+        }
+        async fn start_process(
+            &self,
+            _process_id: &ContainerProcess,
+        ) -> Result<common::types::PID> {
+            Ok(common::types::PID::new(42))
+        }
+        async fn state_process(
+            &self,
+            _process_id: &ContainerProcess,
+        ) -> Result<common::types::ProcessStateInfo> {
+            unimplemented!()
+        }
+        async fn wait_process(
+            &self,
+            _process_id: &ContainerProcess,
+        ) -> Result<common::types::ProcessExitStatus> {
+            unimplemented!()
+        }
+        async fn pid(&self) -> Result<common::types::PID> {
+            unimplemented!()
+        }
+        async fn need_shutdown_sandbox(&self, _req: &ShutdownRequest) -> bool {
+            unimplemented!()
+        }
+        async fn is_sandbox_container(&self, _process_id: &ContainerProcess) -> bool {
+            false
+        }
+    }
+
+    // CreateContainer already spawns the waiter for a container, so a second
+    // one from StartProcess would publish TaskExit twice, and for the sandbox
+    // container fail to find it once DeleteProcess has removed it. Execs never
+    // go through CreateContainer and rely on the StartProcess waiter.
+    #[rstest]
+    #[case::container_has_no_second_waiter("", false)]
+    #[case::exec_gets_its_waiter("exec-1", true)]
+    #[tokio::test]
+    async fn test_start_process_spawns_waiter_only_for_exec(
+        #[case] exec_id: &str,
+        #[case] waiter_expected: bool,
+    ) {
+        let (sender, _receiver) = channel::<Message>(8);
+        let manager = RuntimeHandlerManager::new("test-sid", sender).unwrap();
+        let (waiters_tx, mut waiters_rx) = tokio::sync::mpsc::unbounded_channel();
+        manager.inner.write().await.runtime_instance = Some(Arc::new(RuntimeInstance {
+            sandbox: Arc::new(WaiterRecordingSandbox {
+                waiters: waiters_tx,
+            }),
+            container_manager: Arc::new(StartingContainerManager),
+        }));
+
+        let process_id = ContainerProcess::new("test-cid", exec_id).unwrap();
+        let resp = manager
+            .handler_task_request(TaskRequest::StartProcess(process_id))
+            .await
+            .unwrap();
+        assert!(matches!(resp, TaskResponse::StartProcess(pid) if pid.pid == 42));
+
+        let waiter = tokio::time::timeout(std::time::Duration::from_millis(500), waiters_rx.recv())
+            .await
+            .ok()
+            .flatten();
+        match (waiter, waiter_expected) {
+            (Some(waited), true) => assert_eq!(waited.exec_id(), exec_id),
+            (None, false) => {}
+            (waited, _) => panic!(
+                "exec id {:?}: expected a waiter: {}, got {:?}",
+                exec_id, waiter_expected, waited
+            ),
+        }
+    }
+
+    #[test]
+    fn test_effective_log_level() {
+        assert_eq!(effective_log_level(false, "info"), "info");
+        assert_eq!(effective_log_level(false, "debug"), "debug");
+        assert_eq!(effective_log_level(true, "info"), "debug");
+        assert_eq!(effective_log_level(true, "trace"), "trace");
+        assert_eq!(effective_log_level(true, "warn"), "warn");
+    }
+
+    #[test]
+    fn test_load_config_in_fresh_process() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let path = tmpdir.path().join("configuration.toml");
+        std::fs::write(
+            &path,
+            "[hypervisor.qemu]\npath = \"/bin/sh\"\nkernel = \"/bin/sh\"\nimage = \"/bin/sh\"\n\
+             [agent.kata]\n[runtime]\nname = \"virt_container\"\nhypervisor_name = \"qemu\"\n\
+             agent_name = \"kata\"\n",
+        )
+        .unwrap();
+        let options = protocols::runtimeoptions::Options {
+            config_path: path.to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        let options = Some(options.write_to_bytes().unwrap());
+
+        init_runtime_handlers().unwrap();
+        let config = load_config(&HashMap::new(), &options).unwrap();
+        assert_eq!(config.runtime.hypervisor_name, "qemu");
+    }
+
+    fn write_qemu_config(path: &Path, hypervisor_path: &str) {
+        std::fs::write(
+            path,
+            format!(
+                "[hypervisor.qemu]\npath = \"{hypervisor_path}\"\nkernel = \"/bin/sh\"\n\
+                 image = \"/bin/sh\"\n[agent.kata]\n[runtime]\nname = \"virt_container\"\n\
+                 hypervisor_name = \"qemu\"\nagent_name = \"kata\"\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_cleanup_uses_the_config_the_sandbox_was_created_with() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let path = tmpdir.path().join("configuration-qemu.toml");
+        write_qemu_config(&path, "/bin/sh");
+        let options = protocols::runtimeoptions::Options {
+            config_path: path.to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        let options = Some(options.write_to_bytes().unwrap());
+
+        init_runtime_handlers().unwrap();
+        let (_, loaded_path) = load_config_with_path(&HashMap::new(), &options).unwrap();
+        assert_eq!(loaded_path, std::fs::canonicalize(&path).unwrap());
+
+        // The shim `delete` subcommand gets no shimv2 options, only the path
+        // saved in the sandbox state.
+        let config = cleanup_config(Some(&loaded_path), &HashMap::new());
+        assert_eq!(config.runtime.hypervisor_name, "qemu");
+    }
+
+    #[rstest]
+    #[case::missing_hypervisor_binary(true)]
+    #[case::removed_config_file(false)]
+    fn test_cleanup_falls_back_to_default_config(#[case] config_file_exists: bool) {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let path = tmpdir.path().join("configuration-qemu.toml");
+        if config_file_exists {
+            write_qemu_config(&path, "/nonexistent/qemu-system");
+        }
+
+        init_runtime_handlers().unwrap();
+        assert!(load_config_from(&HashMap::new(), &path).is_err());
+        let config = cleanup_config(Some(&path), &HashMap::new());
+        assert!(config.runtime.hypervisor_name.is_empty());
+        assert!(!config.runtime.keep_abnormal);
+    }
+
+    #[rstest]
+    #[case::rootful(false, None, Some(None))]
+    #[case::rootless(true, Some(1001), Some(Some("/run/user/1001")))]
+    #[case::rootless_without_user(true, None, None)]
+    fn test_rootless_runtime_dir_comes_from_the_saved_user(
+        #[case] rootless: bool,
+        #[case] uid: Option<u32>,
+        #[case] expected: Option<Option<&str>>,
+    ) {
+        let security = SecurityInfo {
+            rootless,
+            rootless_user: uid.map(|uid| RootlessUser {
+                uid,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let dir = rootless_runtime_dir(&security).ok();
+        assert_eq!(dir, expected.map(|d| d.map(PathBuf::from)));
+    }
+
+    #[test]
+    fn test_rootless_runtime_dir_from_a_state_saved_before_this_change() {
+        let state: SandboxState =
+            serde_json::from_str(include_str!("../virt_container/testdata/legacy-state.json"))
+                .unwrap();
+        let security = state.hypervisor.unwrap().config.security_info;
+        assert_eq!(
+            rootless_runtime_dir(&security).unwrap(),
+            Some(PathBuf::from("/run/user/1001"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_setup_whose_vmm_user_is_gone_cleans_up_without_touching_its_uid() {
+        let mut config = Hypervisor::default();
+        config.security_info.rootless_user = Some(RootlessUser {
+            uid: 0,
+            user_name: "kata-no-such-user".to_string(),
+            ..Default::default()
+        });
+        let state = SandboxState::bootstrap(
+            &SandboxNetworkEnv::default(),
+            None,
+            Some(("qemu", &config)),
+            None,
+        );
+        cleanup_bootstrap("test-sid", &state, TomlConfig::default())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_setup_recorded_before_useradd_cleans_up_by_name() {
+        // The record of a user that was never created carries no UID; the
+        // cleanup must match it by name and find nothing to remove.
+        let mut config = Hypervisor::default();
+        config.security_info.rootless_user = Some(RootlessUser {
+            uid: VMM_USER_UID_UNKNOWN,
+            user_name: "kata-0123abcd-9999".to_string(),
+            ..Default::default()
+        });
+        let state = SandboxState::bootstrap(
+            &SandboxNetworkEnv::default(),
+            None,
+            Some(("qemu", &config)),
+            None,
+        );
+        cleanup_bootstrap("test-sid", &state, TomlConfig::default())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_recorded_name_belonging_to_someone_else_is_left_alone() {
+        // A candidate record carries no UID. When its name matches an
+        // account that does not carry the VMM user comment, the recorded
+        // useradd did not create that account, so it must survive.
+        let mut config = Hypervisor::default();
+        config.security_info.rootless_user = Some(RootlessUser {
+            uid: VMM_USER_UID_UNKNOWN,
+            user_name: "root".to_string(),
+            ..Default::default()
+        });
+        let state = SandboxState::bootstrap(
+            &SandboxNetworkEnv::default(),
+            None,
+            Some(("qemu", &config)),
+            None,
+        );
+        cleanup_bootstrap("test-sid", &state, TomlConfig::default())
+            .await
+            .unwrap();
+        assert!(find_user("root").unwrap().is_some());
+    }
 }

@@ -5,12 +5,15 @@ use dbs_virtio_devices as virtio;
 use serde_derive::{Deserialize, Serialize};
 use slog::{error, info};
 use virtio::balloon::{Balloon, BalloonConfig};
-use virtio::Error as VirtIoError;
+use virtio::Error as VirtioError;
 
 use crate::address_space_manager::GuestAddressSpaceImpl;
+#[cfg(target_arch = "x86_64")]
+use crate::api::v1::ConfidentialVmType;
 use crate::config_manager::{ConfigItem, DeviceConfigInfo, DeviceConfigInfos};
 use crate::device_manager::DbsMmioV2Device;
 use crate::device_manager::{DeviceManager, DeviceMgrError, DeviceOpContext};
+use crate::metric::METRICS;
 
 // The flag of whether to use the shared irq.
 const USE_SHARED_IRQ: bool = true;
@@ -30,7 +33,7 @@ pub enum BalloonDeviceError {
 
     /// guest memory error
     #[error("failed to access guest memory, {0}")]
-    GuestMemoryError(#[source] vm_memory::mmap::Error),
+    GuestMemoryError(#[source] vm_memory::GuestMemoryError),
 
     /// create balloon device error
     #[error("failed to create virtio-balloon device, {0}")]
@@ -50,7 +53,7 @@ pub enum BalloonDeviceError {
 
     /// resize balloon device error
     #[error("failure while resizing virtio-balloon device, {0}")]
-    ResizeFailed(#[source] VirtIoError),
+    ResizeFailed(#[source] VirtioError),
 
     /// The balloon device id doesn't exist.
     #[error("invalid balloon device id '{0}'")]
@@ -164,6 +167,11 @@ impl BalloonDeviceMgr {
                 return Ok(());
             }
 
+            #[cfg(not(target_arch = "x86_64"))]
+            let f_access_platform = false;
+            #[cfg(target_arch = "x86_64")]
+            let f_access_platform = ctx.get_confidential_vm_type() == Some(ConfidentialVmType::TDX);
+
             info!(ctx.logger(), "hotplug balloon device: {}", balloon_cfg.balloon_id; "subsystem" => "balloon_dev_mgr");
             let device = Box::new(
                 virtio::balloon::Balloon::new(
@@ -172,9 +180,15 @@ impl BalloonDeviceMgr {
                         f_deflate_on_oom: balloon_cfg.f_deflate_on_oom,
                         f_reporting: balloon_cfg.f_reporting,
                     },
+                    f_access_platform,
                 )
                 .map_err(BalloonDeviceError::CreateBalloonDevice)?,
             );
+            METRICS
+                .write()
+                .unwrap()
+                .balloon
+                .insert(balloon_cfg.balloon_id.clone(), device.metrics());
 
             let mmio_dev =
                 DeviceManager::create_mmio_virtio_device_with_device_change_notification(
@@ -212,14 +226,25 @@ impl BalloonDeviceMgr {
         for info in self.info_list.iter_mut() {
             info!(ctx.logger(), "attach balloon device: {}", info.config.balloon_id; "subsystem" => "balloon_dev_mgr");
 
+            #[cfg(not(target_arch = "x86_64"))]
+            let f_access_platform = false;
+            #[cfg(target_arch = "x86_64")]
+            let f_access_platform = ctx.get_confidential_vm_type() == Some(ConfidentialVmType::TDX);
+
             let device = Balloon::new(
                 epoll_mgr.clone(),
                 BalloonConfig {
                     f_deflate_on_oom: info.config.f_deflate_on_oom,
                     f_reporting: info.config.f_reporting,
                 },
+                f_access_platform,
             )
             .map_err(BalloonDeviceError::CreateBalloonDevice)?;
+            METRICS
+                .write()
+                .unwrap()
+                .balloon
+                .insert(info.config.balloon_id.clone(), device.metrics());
             let mmio_dev =
                 DeviceManager::create_mmio_virtio_device_with_device_change_notification(
                     Box::new(device),
@@ -242,7 +267,7 @@ impl BalloonDeviceMgr {
         let device = self.info_list[index]
             .device
             .as_ref()
-            .ok_or_else(|| BalloonDeviceError::NotExist)?;
+            .ok_or(BalloonDeviceError::NotExist)?;
         if let Some(mmio_dev) = device.as_any().downcast_ref::<DbsMmioV2Device>() {
             let guard = mmio_dev.state();
             let inner_dev = guard.get_inner_device();
@@ -275,10 +300,19 @@ impl Default for BalloonDeviceMgr {
     }
 }
 
+impl Drop for BalloonDeviceMgr {
+    // todo: move METIRCS oprations to remove_device. issue #8207.
+    fn drop(&mut self) {
+        METRICS.write().unwrap().balloon.clear();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::device_manager::tests::create_address_space;
     use crate::test_utils::tests::create_vm_for_test;
+    use test_utils::skip_if_kvm_unaccessable;
 
     impl Default for BalloonDeviceConfigInfo {
         fn default() -> Self {
@@ -311,6 +345,7 @@ mod tests {
 
     #[test]
     fn test_balloon_insert_or_update_device() {
+        skip_if_kvm_unaccessable!();
         //Init vm for test.
         let mut vm = create_vm_for_test();
 
@@ -335,13 +370,14 @@ mod tests {
 
     #[test]
     fn test_balloon_attach_device() {
+        skip_if_kvm_unaccessable!();
         //Init vm and insert balloon config for test.
         let mut vm = create_vm_for_test();
         let device_op_ctx = DeviceOpContext::new(
             Some(vm.epoll_manager().clone()),
             vm.device_manager(),
             Some(vm.vm_as().unwrap().clone()),
-            None,
+            Some(create_address_space()),
             false,
             Some(vm.vm_config().clone()),
             vm.shared_info().clone(),
@@ -359,7 +395,7 @@ mod tests {
             Some(vm.epoll_manager().clone()),
             vm.device_manager(),
             Some(vm.vm_as().unwrap().clone()),
-            None,
+            Some(create_address_space()),
             false,
             Some(vm.vm_config().clone()),
             vm.shared_info().clone(),
@@ -374,13 +410,14 @@ mod tests {
 
     #[test]
     fn test_balloon_update_device() {
+        skip_if_kvm_unaccessable!();
         //Init vm for test.
         let mut vm = create_vm_for_test();
         let device_op_ctx = DeviceOpContext::new(
             Some(vm.epoll_manager().clone()),
             vm.device_manager(),
             Some(vm.vm_as().unwrap().clone()),
-            None,
+            Some(create_address_space()),
             false,
             Some(vm.vm_config().clone()),
             vm.shared_info().clone(),
@@ -397,7 +434,7 @@ mod tests {
             Some(vm.epoll_manager().clone()),
             vm.device_manager(),
             Some(vm.vm_as().unwrap().clone()),
-            None,
+            Some(create_address_space()),
             false,
             Some(vm.vm_config().clone()),
             vm.shared_info().clone(),

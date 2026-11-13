@@ -10,43 +10,52 @@
 //! to detect K8S EmptyDir medium type from `oci::spec::Mount` objects.
 
 use kata_types::mount;
-use oci::Spec;
+use oci_spec::runtime::{Mount, Spec};
 
 use crate::mount::get_linux_mount_info;
 
 pub use kata_types::k8s::is_empty_dir;
 
-/// Check whether the given path is a kubernetes ephemeral volume.
-///
-/// This method depends on a specific path used by k8s to detect if it's type of ephemeral.
-/// As of now, this is a very k8s specific solution that works but in future there should be a
-/// better way for this method to determine if the path is for ephemeral volume type.
-pub fn is_ephemeral_volume(path: &str) -> bool {
-    if is_empty_dir(path) {
-        if let Ok(info) = get_linux_mount_info(path) {
-            if info.fs_type == "tmpfs" {
-                return true;
-            }
-        }
-    }
+/// Returns true for tmpfs-backed emptyDirs (medium: Memory).
+pub fn is_tmpfs_empty_dir(mount: &Mount) -> bool {
+    matches!(
+        (
+            mount.typ().as_deref(),
+            mount.source().as_deref().and_then(|s| s.to_str()),
+            mount.destination(),
 
-    false
+        ),
+        (
+            Some("bind"),
+            Some(source),
+            _dest,
+        )
+        if is_empty_dir(source) && get_linux_mount_info(source).is_ok_and(|info| info.fs_type == "tmpfs")
+    )
 }
 
-/// Check whether the given path is a kubernetes empty-dir volume of medium "default".
-///
-/// K8s `EmptyDir` volumes are directories on the host. If the fs type is tmpfs, it's a ephemeral
-/// volume instead of a `EmptyDir` volume.
-pub fn is_host_empty_dir(path: &str) -> bool {
-    if is_empty_dir(path) {
-        if let Ok(info) = get_linux_mount_info(path) {
-            if info.fs_type != "tmpfs" {
-                return true;
-            }
-        }
+/// Returns true for non-tmpfs-backed emptyDirs.
+/// This includes disk-backed (medium: "", default) and hugepage-backed (medium: HugePages).
+pub fn is_non_tmpfs_empty_dir(path: &str) -> bool {
+    if !is_empty_dir(path) {
+        return false;
     }
 
-    false
+    match get_linux_mount_info(path) {
+        Ok(info) => info.fs_type != "tmpfs",
+        Err(crate::mount::Error::NoMountEntry(_)) => true,
+        Err(_) => false,
+    }
+}
+
+/// Returns true for hugepage-backed emptyDirs (medium: HugePages).
+pub fn is_hugepage_empty_dir(path: &str) -> bool {
+    is_empty_dir(path) && get_linux_mount_info(path).is_ok_and(|info| info.fs_type == "hugetlbfs")
+}
+
+/// Returns true for disk-backed emptyDirs (medium: "", default).
+pub fn is_disk_empty_dir(path: &str) -> bool {
+    is_non_tmpfs_empty_dir(path) && !is_hugepage_empty_dir(path)
 }
 
 // update_ephemeral_storage_type sets the mount type to 'ephemeral'
@@ -55,17 +64,17 @@ pub fn is_host_empty_dir(path: &str) -> bool {
 // backed by tmpfs inside the VM. For successive containers
 // of the same pod the already existing volume is reused.
 pub fn update_ephemeral_storage_type(oci_spec: &mut Spec) {
-    for m in oci_spec.mounts.iter_mut() {
-        if mount::is_kata_guest_mount_volume(&m.r#type) {
-            continue;
-        }
+    if let Some(mounts) = oci_spec.mounts_mut() {
+        for m in mounts.iter_mut() {
+            if let Some(typ) = &m.typ() {
+                if mount::is_kata_guest_mount_volume(typ) {
+                    continue;
+                }
+            }
 
-        if is_ephemeral_volume(&m.source) {
-            m.r#type = String::from(mount::KATA_EPHEMERAL_VOLUME_TYPE);
-        } else if is_host_empty_dir(&m.source) {
-            // FIXME support disable_guest_empty_dir
-            // https://github.com/kata-containers/kata-containers/blob/02a51e75a7e0c6fce5e8abe3b991eeac87e09645/src/runtime/pkg/katautils/create.go#L105
-            m.r#type = String::from(mount::KATA_HOST_DIR_VOLUME_TYPE);
+            if is_tmpfs_empty_dir(m) {
+                m.set_typ(Some(String::from(mount::KATA_EPHEMERAL_VOLUME_TYPE)));
+            }
         }
     }
 }

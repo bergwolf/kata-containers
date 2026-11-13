@@ -17,6 +17,14 @@ pub enum CapabilityBits {
     MultiQueueSupport,
     /// hypervisor supports filesystem share
     FsSharingSupport,
+    /// hypervisor supports hybrid-vsock
+    HybridVsockSupport,
+    /// hypervisor supports memory hotplug probe interface
+    GuestMemoryProbe,
+    /// hypervisor supports exposing block discard/unmap to the guest
+    BlockDeviceDiscardSupport,
+    /// hypervisor supports network device hotplug
+    NetworkDeviceHotplugSupport,
 }
 
 /// Capabilities describe a virtcontainers hypervisor capabilities through a bit mask.
@@ -45,24 +53,50 @@ impl Capabilities {
         self.flags = flags;
     }
 
-    /// is_block_device_supported tells if an hypervisor supports block devices.
+    /// add CapabilityBits
+    pub fn add(&mut self, flags: CapabilityBits) {
+        self.flags |= flags;
+    }
+
+    /// is_block_device_supported tells if the hypervisor supports block devices.
     pub fn is_block_device_supported(&self) -> bool {
         self.flags.and(CapabilityBits::BlockDeviceSupport) != 0
     }
 
-    /// is_block_device_hotplug_supported tells if an hypervisor supports block devices.
+    /// is_block_device_hotplug_supported tells if the hypervisor supports block devices.
     pub fn is_block_device_hotplug_supported(&self) -> bool {
         self.flags.and(CapabilityBits::BlockDeviceHotplugSupport) != 0
     }
 
-    /// is_multi_queue_supported tells if an hypervisor supports device multi queue support.
+    /// is_multi_queue_supported tells if the hypervisor supports device multi queue support.
     pub fn is_multi_queue_supported(&self) -> bool {
         self.flags.and(CapabilityBits::MultiQueueSupport) != 0
+    }
+
+    /// is_hybrid_vsock_supported tells if an hypervisor supports hybrid-vsock support.
+    pub fn is_hybrid_vsock_supported(&self) -> bool {
+        self.flags.and(CapabilityBits::HybridVsockSupport) != 0
     }
 
     /// is_fs_sharing_supported tells if an hypervisor supports host filesystem sharing.
     pub fn is_fs_sharing_supported(&self) -> bool {
         self.flags.and(CapabilityBits::FsSharingSupport) != 0
+    }
+
+    /// is_mem_hotplug_probe_supported tells if the hypervisor supports hotplug probe interface
+    pub fn is_mem_hotplug_probe_supported(&self) -> bool {
+        self.flags.and(CapabilityBits::GuestMemoryProbe) != 0
+    }
+
+    /// is_block_device_discard_supported tells if the hypervisor exposes
+    /// block discard/unmap support to the guest.
+    pub fn is_block_device_discard_supported(&self) -> bool {
+        self.flags.and(CapabilityBits::BlockDeviceDiscardSupport) != 0
+    }
+
+    /// is_network_device_hotplug_supported tells if the hypervisor supports network hotplug.
+    pub fn is_network_device_hotplug_supported(&self) -> bool {
+        self.flags.and(CapabilityBits::NetworkDeviceHotplugSupport) != 0
     }
 }
 
@@ -76,6 +110,10 @@ mod tests {
     fn test_set_hypervisor_capabilities() {
         let mut cap = Capabilities::new();
         assert!(!cap.is_block_device_supported());
+        assert!(!cap.is_network_device_hotplug_supported());
+
+        // test legacy vsock support
+        assert!(!cap.is_hybrid_vsock_supported());
 
         // test set block device support
         cap.set(CapabilityBits::BlockDeviceSupport);
@@ -102,6 +140,20 @@ mod tests {
                 | CapabilityBits::MultiQueueSupport
                 | CapabilityBits::FsSharingSupport,
         );
-        assert!(cap.is_fs_sharing_supported())
+        assert!(cap.is_fs_sharing_supported());
+
+        // test set hybrid-vsock support
+        cap.add(CapabilityBits::HybridVsockSupport);
+        assert!(cap.is_hybrid_vsock_supported());
+        // test append capabilities
+        cap.add(CapabilityBits::GuestMemoryProbe);
+        assert!(cap.is_mem_hotplug_probe_supported());
+        assert!(cap.is_fs_sharing_supported());
+        // test block discard capability
+        cap.add(CapabilityBits::BlockDeviceDiscardSupport);
+        assert!(cap.is_block_device_discard_supported());
+        // test network device hotplug capability
+        cap.add(CapabilityBits::NetworkDeviceHotplugSupport);
+        assert!(cap.is_network_device_hotplug_supported());
     }
 }

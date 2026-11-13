@@ -5,14 +5,14 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
+load "${BATS_TEST_DIRNAME}/lib.sh"
 load "${BATS_TEST_DIRNAME}/../../common.bash"
 load "${BATS_TEST_DIRNAME}/tests_common.sh"
 
 setup() {
 	pod_name="footubuntu"
 	config_name="ssh-config-map"
-	get_pod_config_dir
-
+	setup_common || die "setup_common failed"
 	# Creates ssh-key
 	key_path=$(mktemp --tmpdir)
 	public_key_path="${key_path}.pub"
@@ -23,6 +23,10 @@ setup() {
 	sed -e "/\${ssh_key}/r ${public_key_path}" -e "/\${ssh_key}/d" \
 		"${pod_config_dir}/footloose-configmap.yaml" > "$configmap_yaml"
 	sed -i 's/ssh-rsa/      ssh-rsa/' "$configmap_yaml"
+
+	# Add an "allow all" policy to the pod yaml file.
+	pod_yaml="${pod_config_dir}/pod-footloose.yaml"
+	add_allow_all_policy_to_yaml "${pod_yaml}"
 }
 
 @test "Footloose pod" {
@@ -33,7 +37,7 @@ setup() {
 	kubectl create -f "$configmap_yaml"
 
 	# Create pod
-	kubectl create -f "${pod_config_dir}/pod-footloose.yaml"
+	kubectl create -f "${pod_yaml}"
 
 	# Check pod creation
 	kubectl wait --for=condition=Ready --timeout=$timeout pod "$pod_name"
@@ -55,4 +59,5 @@ teardown() {
 	sudo rm -rf "$public_key_path"
 	sudo rm -rf "$key_path"
 	sudo rm -rf "$configmap_yaml"
+	teardown_common "${node}" "${node_start_time:-}"
 }

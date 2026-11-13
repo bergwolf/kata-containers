@@ -26,6 +26,8 @@ paths:
       responses:
         "204":
           description: The VMM successfully shutdown.
+        "409":
+          description: The operation conflicts with the current state of the VM.
       summary: Shuts the cloud-hypervisor VMM.
   /vm.info:
     get:
@@ -36,6 +38,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/VmInfo'
           description: The VM information
+        "404":
+          description: The VM information is not available because the VM is not created.
       summary: Returns general information about the cloud-hypervisor Virtual Machine
         (VM) instance.
   /vm.counters:
@@ -47,7 +51,24 @@ paths:
               schema:
                 $ref: '#/components/schemas/VmCounters'
           description: The VM counters
+        "409":
+          description: The operation conflicts with the current state of the VM.
       summary: Get counters from the VM
+  /vm.balloon-stats:
+    get:
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BalloonStatsResponse'
+          description: Most recently reported virtio-balloon statistics
+        "409":
+          description: The operation conflicts with the current state of the VM.
+        "500":
+          description: The statistics could not be retrieved, e.g. the statistics
+            feature was not negotiated with the guest driver.
+      summary: Get cached statistics from the virtio-balloon device
   /vm.create:
     put:
       operationId: createVM
@@ -61,6 +82,8 @@ paths:
       responses:
         "204":
           description: The VM instance was successfully created.
+        "409":
+          description: The operation conflicts with the current state of the VM.
       summary: Create the cloud-hypervisor Virtual Machine (VM) instance. The instance
         is not booted, only created.
   /vm.delete:
@@ -69,6 +92,8 @@ paths:
       responses:
         "204":
           description: The VM instance was successfully deleted.
+        "409":
+          description: The operation conflicts with the current state of the VM.
       summary: Delete the cloud-hypervisor Virtual Machine (VM) instance.
   /vm.boot:
     put:
@@ -78,6 +103,8 @@ paths:
           description: The VM instance successfully booted.
         "404":
           description: The VM instance could not boot because it is not created yet
+        "409":
+          description: The operation conflicts with the current state of the VM.
       summary: Boot the previously created VM instance.
   /vm.pause:
     put:
@@ -89,6 +116,8 @@ paths:
           description: The VM instance could not pause because it is not created yet
         "405":
           description: The VM instance could not pause because it is not booted.
+        "409":
+          description: The operation conflicts with the current state of the VM.
       summary: Pause a previously booted VM instance.
   /vm.resume:
     put:
@@ -100,6 +129,8 @@ paths:
           description: The VM instance could not resume because it is not booted yet
         "405":
           description: The VM instance could not resume because it is not paused.
+        "409":
+          description: The operation conflicts with the current state of the VM.
       summary: Resume a previously paused VM instance.
   /vm.shutdown:
     put:
@@ -111,6 +142,8 @@ paths:
           description: The VM instance could not shut down because is not created.
         "405":
           description: The VM instance could not shut down because it is not started.
+        "409":
+          description: The operation conflicts with the current state of the VM.
       summary: Shut the VM instance down.
   /vm.reboot:
     put:
@@ -122,6 +155,8 @@ paths:
           description: The VM instance could not reboot because it is not created.
         "405":
           description: The VM instance could not reboot because it is not booted.
+        "409":
+          description: The operation conflicts with the current state of the VM.
       summary: Reboot the VM instance.
   /vm.power-button:
     put:
@@ -134,6 +169,8 @@ paths:
             yet
         "405":
           description: The button could not be triggered because it is not booted.
+        "409":
+          description: The operation conflicts with the current state of the VM.
       summary: Trigger a power button in the VM
   /vm.resize:
     put:
@@ -149,7 +186,32 @@ paths:
           description: The VM instance was successfully resized.
         "404":
           description: The VM instance could not be resized because it is not created.
+        "409":
+          description: The operation conflicts with the current state of the VM.
+        "429":
+          description: The VM instance could not be resized because a cpu removal
+            is still pending.
       summary: Resize the VM
+  /vm.resize-disk:
+    put:
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VmResizeDisk'
+        description: Resizes a disk attached to the VM
+        required: true
+      responses:
+        "204":
+          description: The disk was successfully resized.
+        "404":
+          description: The disk could not be resized because the VM is not created,
+            or no disk with the given identifier exists.
+        "409":
+          description: The operation conflicts with the current state of the VM.
+        "500":
+          description: The disk could not be resized.
+      summary: Resize a disk
   /vm.resize-zone:
     put:
       requestBody:
@@ -162,6 +224,11 @@ paths:
       responses:
         "204":
           description: The memory zone was successfully resized.
+        "404":
+          description: The memory zone could not be resized because the VM is not
+            created.
+        "409":
+          description: The operation conflicts with the current state of the VM.
         "500":
           description: The memory zone could not be resized.
       summary: Resize a memory zone
@@ -183,8 +250,15 @@ paths:
           description: The new device was successfully added to the VM instance.
         "204":
           description: The new device was successfully (cold) added to the VM instance.
+        "400":
+          description: The new device could not be added because the configuration
+            is not valid.
         "404":
           description: The new device could not be added to the VM instance.
+        "409":
+          description: The new device could not be added because a device with the
+            same identifier or path already exists, or because the operation conflicts
+            with the current state of the VM.
       summary: Add a new device to the VM
   /vm.remove-device:
     put:
@@ -199,7 +273,10 @@ paths:
         "204":
           description: The device was successfully removed from the VM instance.
         "404":
-          description: The device could not be removed from the VM instance.
+          description: The device could not be removed because the VM is not created,
+            or no device with the given identifier exists.
+        "409":
+          description: The operation conflicts with the current state of the VM.
       summary: Remove a device from the VM
   /vm.add-disk:
     put:
@@ -219,6 +296,15 @@ paths:
           description: The new disk was successfully added to the VM instance.
         "204":
           description: The new disk was successfully (cold) added to the VM instance.
+        "400":
+          description: The new disk could not be added because the configuration is
+            not valid.
+        "404":
+          description: The new disk could not be added because the VM is not created.
+        "409":
+          description: The new disk could not be added because a device with the same
+            identifier already exists, or because the operation conflicts with the
+            current state of the VM.
         "500":
           description: The new disk could not be added to the VM instance.
       summary: Add a new disk to the VM
@@ -240,9 +326,48 @@ paths:
           description: The new device was successfully added to the VM instance.
         "204":
           description: The new device was successfully (cold) added to the VM instance.
+        "400":
+          description: The new device could not be added because the configuration
+            is not valid.
+        "404":
+          description: The new device could not be added because the VM is not created.
+        "409":
+          description: The new device could not be added because a device with the
+            same identifier already exists, or because the operation conflicts with
+            the current state of the VM.
         "500":
           description: The new device could not be added to the VM instance.
       summary: Add a new virtio-fs device to the VM
+  /vm.add-generic-vhost-user:
+    put:
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GenericVhostUserConfig'
+        description: The details of the new generic vhost-user device
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PciDeviceInfo'
+          description: The new device was successfully added to the VM instance.
+        "204":
+          description: The new device was successfully (cold) added to the VM instance.
+        "400":
+          description: The new device could not be added because the configuration
+            is not valid.
+        "404":
+          description: The new device could not be added because the VM is not created.
+        "409":
+          description: The new device could not be added because a device with the
+            same identifier already exists, or because the operation conflicts with
+            the current state of the VM.
+        "500":
+          description: The new device could not be added to the VM instance.
+      summary: Add a new generic vhost-user device to the VM
   /vm.add-pmem:
     put:
       requestBody:
@@ -261,6 +386,15 @@ paths:
           description: The new device was successfully added to the VM instance.
         "204":
           description: The new device was successfully (cold) added to the VM instance.
+        "400":
+          description: The new device could not be added because the configuration
+            is not valid.
+        "404":
+          description: The new device could not be added because the VM is not created.
+        "409":
+          description: The new device could not be added because a device with the
+            same identifier already exists, or because the operation conflicts with
+            the current state of the VM.
         "500":
           description: The new device could not be added to the VM instance.
       summary: Add a new pmem device to the VM
@@ -282,6 +416,15 @@ paths:
           description: The new device was successfully added to the VM instance.
         "204":
           description: The new device was successfully (cold) added to the VM instance.
+        "400":
+          description: The new device could not be added because the configuration
+            is not valid.
+        "404":
+          description: The new device could not be added because the VM is not created.
+        "409":
+          description: The new device could not be added because a device with the
+            same identifier already exists, or because the operation conflicts with
+            the current state of the VM.
         "500":
           description: The new device could not be added to the VM instance.
       summary: Add a new network device to the VM
@@ -303,6 +446,15 @@ paths:
           description: The new device was successfully added to the VM instance.
         "204":
           description: The new device was successfully (cold) added to the VM instance.
+        "400":
+          description: The new device could not be added because the configuration
+            is not valid.
+        "404":
+          description: The new device could not be added because the VM is not created.
+        "409":
+          description: The new device could not be added because a device with the
+            same identifier already exists, or because the operation conflicts with
+            the current state of the VM.
         "500":
           description: The new device could not be added to the VM instance.
       summary: Add a new vsock device to the VM
@@ -325,9 +477,47 @@ paths:
         "204":
           description: The new vDPA device was successfully (cold) added to the VM
             instance.
+        "400":
+          description: The new vDPA device could not be added because the configuration
+            is not valid.
+        "404":
+          description: The new vDPA device could not be added because the VM is not
+            created.
+        "409":
+          description: The new vDPA device could not be added because a device with
+            the same identifier already exists, or because the operation conflicts
+            with the current state of the VM.
         "500":
           description: The new vDPA device could not be added to the VM instance.
       summary: Add a new vDPA device to the VM
+  /vm.add-user-device:
+    put:
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VmAddUserDevice'
+        description: The path of the new device
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PciDeviceInfo'
+          description: The new device was successfully added to the VM instance.
+        "204":
+          description: The new device was successfully (cold) added to the VM instance.
+        "400":
+          description: The new device could not be added because the configuration
+            is not valid.
+        "409":
+          description: The new device could not be added because a device with the
+            same identifier already exists, or because the operation conflicts with
+            the current state of the VM.
+        "404":
+          description: The new device could not be added to the VM instance.
+      summary: Add a new userspace device to the VM
   /vm.snapshot:
     put:
       requestBody:
@@ -346,6 +536,8 @@ paths:
         "405":
           description: The VM instance could not be snapshotted because it is not
             booted.
+        "409":
+          description: The operation conflicts with the current state of the VM.
       summary: Returns a VM snapshot.
   /vm.coredump:
     put:
@@ -363,7 +555,17 @@ paths:
           description: The VM instance could not be coredumped because it is not created.
         "405":
           description: The VM instance could not be coredumped because it is not booted.
+        "409":
+          description: The operation conflicts with the current state of the VM.
       summary: Takes a VM coredump.
+  /vm.nmi:
+    put:
+      responses:
+        "204":
+          description: The NMI successfully injected.
+        "409":
+          description: The operation conflicts with the current state of the VM.
+      summary: Inject an NMI.
   /vm.restore:
     put:
       requestBody:
@@ -376,9 +578,16 @@ paths:
       responses:
         "204":
           description: The VM instance was successfully restored.
+        "400":
+          description: The VM could not be restored because the restore configuration
+            is not valid.
         "404":
           description: The VM instance could not be restored because it is already
             created.
+        "409":
+          description: The VM could not be restored because a device with the same
+            identifier or path already exists, or because the operation conflicts
+            with the current state of the VM.
       summary: Restore a VM from a snapshot.
   /vm.receive-migration:
     put:
@@ -392,6 +601,8 @@ paths:
       responses:
         "204":
           description: The VM migration was successfully received.
+        "409":
+          description: The operation conflicts with the current state of the VMM.
         "500":
           description: The VM migration could not be received.
       summary: Receive a VM migration from URL
@@ -407,14 +618,30 @@ paths:
       responses:
         "204":
           description: The VM migration was successfully sent.
+        "409":
+          description: The operation conflicts with the current state of the VMM.
         "500":
           description: The VM migration could not be sent.
       summary: Send a VM migration to URL
+  /vm.cancel-migration:
+    put:
+      description: |
+        Requests the cancellation of an ongoing migration on a best effort basis. A successful response only indicates that the request was accepted, not that the migration was actually cancelled: The migration may have progressed too far to be stopped. The actual outcome must be observed externally via the event monitor.
+      responses:
+        "204":
+          description: The cancellation request was successfully submitted.
+        "500":
+          description: The cancellation request could not be submitted because there
+            is no ongoing migration.
+      summary: Cancel an ongoing VM migration
 components:
   schemas:
     VmmPingResponse:
       description: Virtual Machine Monitor information
       example:
+        features:
+        - features
+        - features
         build_version: build_version
         pid: 0
         version: version
@@ -426,23 +653,35 @@ components:
         pid:
           format: int64
           type: integer
+        features:
+          items:
+            type: string
+          type: array
       required:
       - version
       type: object
+    VmState:
+      enum:
+      - Created
+      - Running
+      - Shutdown
+      - Paused
+      - BreakPoint
+      type: string
     VmInfo:
       description: Virtual Machine information
       example:
-        memory_actual_size: 7
-        state: Created
+        memory_actual_size: 9
         config:
-          console:
-            mode: "false"
-            file: file
-            iommu: false
-          balloon:
-            size: 1
-            deflate_on_oom: false
-            free_page_reporting: false
+          user_devices:
+          - pci_segment: 9
+            socket: socket
+            id: id
+            pci_device_id: 0
+          - pci_segment: 9
+            socket: socket
+            id: id
+            pci_device_id: 0
           memory:
             hugepages: false
             shared: false
@@ -451,6 +690,7 @@ components:
             mergeable: false
             size: 2
             hotplugged_size: 7
+            reserve: false
             zones:
             - hugepages: false
               shared: false
@@ -460,6 +700,7 @@ components:
               file: file
               size: 1
               hotplugged_size: 1
+              reserve: false
               host_numa_node: 6
               id: id
               hotplug_size: 7
@@ -471,6 +712,7 @@ components:
               file: file
               size: 1
               hotplugged_size: 1
+              reserve: false
               host_numa_node: 6
               id: id
               hotplug_size: 7
@@ -478,16 +720,11 @@ components:
             hotplug_method: Acpi
             thp: true
           disks:
-          - pci_segment: 8
-            path: path
-            num_queues: 4
-            readonly: false
-            iommu: false
-            queue_size: 5
-            vhost_socket: vhost_socket
-            serial: serial
-            vhost_user: false
+          - num_queues: 9
+            rate_limit_group: rate_limit_group
+            queue_size: 6
             direct: false
+            backing_files: false
             rate_limiter_config:
               ops:
                 size: 0
@@ -497,17 +734,30 @@ components:
                 size: 0
                 one_time_burst: 0
                 refill_time: 0
-            id: id
-          - pci_segment: 8
+            pci_device_id: 9
+            queue_affinity:
+            - host_cpus:
+              - 3
+              - 3
+              queue_index: 6
+            - host_cpus:
+              - 3
+              - 3
+              queue_index: 6
+            pci_segment: 8
             path: path
-            num_queues: 4
             readonly: false
-            iommu: false
-            queue_size: 5
             vhost_socket: vhost_socket
             serial: serial
+            sparse: true
             vhost_user: false
+            guest_block_size: 6
+            id: id
+          - num_queues: 9
+            rate_limit_group: rate_limit_group
+            queue_size: 6
             direct: false
+            backing_files: false
             rate_limiter_config:
               ops:
                 size: 0
@@ -517,7 +767,201 @@ components:
                 size: 0
                 one_time_burst: 0
                 refill_time: 0
+            pci_device_id: 9
+            queue_affinity:
+            - host_cpus:
+              - 3
+              - 3
+              queue_index: 6
+            - host_cpus:
+              - 3
+              - 3
+              queue_index: 6
+            pci_segment: 8
+            path: path
+            readonly: false
+            vhost_socket: vhost_socket
+            serial: serial
+            sparse: true
+            vhost_user: false
+            guest_block_size: 6
             id: id
+          fs:
+          - pci_segment: 0
+            num_queues: 7
+            queue_size: 6
+            tag: tag
+            socket: socket
+            id: id
+            pci_device_id: 4
+          - pci_segment: 0
+            num_queues: 7
+            queue_size: 6
+            tag: tag
+            socket: socket
+            id: id
+            pci_device_id: 4
+          vsock:
+            pci_segment: 4
+            socket: socket
+            id: id
+            cid: 3
+            pci_device_id: 6
+          platform:
+            iommu_segments:
+            - 1
+            - 1
+            vfio_p2p_dma: true
+            num_pci_segments: 9
+            system_manufacturer: system_manufacturer
+            iommu_address_width_bits: 3
+            system_serial_number: system_serial_number
+            iommufd: false
+            tdx: false
+            serial_number: serial_number
+            system_family: system_family
+            chassis_asset_tag: chassis_asset_tag
+            system_uuid: system_uuid
+            sev_snp: false
+            uuid: uuid
+            system_product_name: system_product_name
+            system_sku_number: system_sku_number
+            oem_strings:
+            - oem_strings
+            - oem_strings
+            system_version: system_version
+          pmem:
+          - pci_segment: 5
+            file: file
+            size: 7
+            id: id
+            discard_writes: false
+            pci_device_id: 3
+          - pci_segment: 5
+            file: file
+            size: 7
+            id: id
+            discard_writes: false
+            pci_device_id: 3
+          payload:
+            cmdline: cmdline
+            igvm: igvm
+            kernel: kernel
+            host_data: host_data
+            initramfs: initramfs
+            firmware: firmware
+          generic_vhost_user:
+          - queue_sizes:
+            - 8
+            - 8
+            pci_segment: 7
+            device_type: 3
+            socket: socket
+            id: id
+            pci_device_id: 3
+          - queue_sizes:
+            - 8
+            - 8
+            pci_segment: 7
+            device_type: 3
+            socket: socket
+            id: id
+            pci_device_id: 3
+          rate_limit_groups:
+          - id: id
+            rate_limiter_config:
+              ops:
+                size: 0
+                one_time_burst: 0
+                refill_time: 0
+              bandwidth:
+                size: 0
+                one_time_burst: 0
+                refill_time: 0
+          - id: id
+            rate_limiter_config:
+              ops:
+                size: 0
+                one_time_burst: 0
+                refill_time: 0
+              bandwidth:
+                size: 0
+                one_time_burst: 0
+                refill_time: 0
+          debug_console:
+            iobase: 6
+            file: file
+          net:
+          - tap: tap
+            host_mac: host_mac
+            num_queues: 2
+            offload_ufo: false
+            queue_size: 6
+            offload_csum: false
+            ip: 192.168.249.1
+            rate_limiter_config:
+              ops:
+                size: 0
+                one_time_burst: 0
+                refill_time: 0
+              bandwidth:
+                size: 0
+                one_time_burst: 0
+                refill_time: 0
+            mac: mac
+            mtu: 1
+            pci_device_id: 5
+            pci_segment: 6
+            offload_tso: false
+            vhost_mode: Client
+            vhost_socket: vhost_socket
+            vhost_user: false
+            id: id
+            mask: 255.255.255.0
+          - tap: tap
+            host_mac: host_mac
+            num_queues: 2
+            offload_ufo: false
+            queue_size: 6
+            offload_csum: false
+            ip: 192.168.249.1
+            rate_limiter_config:
+              ops:
+                size: 0
+                one_time_burst: 0
+                refill_time: 0
+              bandwidth:
+                size: 0
+                one_time_burst: 0
+                refill_time: 0
+            mac: mac
+            mtu: 1
+            pci_device_id: 5
+            pci_segment: 6
+            offload_tso: false
+            vhost_mode: Client
+            vhost_socket: vhost_socket
+            vhost_user: false
+            id: id
+            mask: 255.255.255.0
+          pvpanic: false
+          rtc:
+            pci_segment: 1
+            id: id
+            pci_device_id: 8
+          console:
+            pci_segment: 4
+            file: file
+            socket: socket
+            id: id
+            pci_device_id: 0
+          balloon:
+            pci_segment: 3
+            size: 0
+            deflate_on_oom: false
+            id: id
+            free_page_reporting: false
+            pci_device_id: 7
           cpus:
             features:
               amx: true
@@ -530,6 +974,7 @@ components:
             max_phys_bits: 7
             boot_vcpus: 1
             max_vcpus: 1
+            nested: false
             affinity:
             - vcpu: 9
               host_cpus:
@@ -540,169 +985,90 @@ components:
               - 3
               - 3
           devices:
-          - pci_segment: 3
+          - pci_segment: 4
             path: path
-            iommu: false
+            x_nv_gpudirect_clique: 4
             id: id
-          - pci_segment: 3
+            x_exclude_mmap_bars:
+            - 7
+            - 7
+            pci_device_id: 1
+          - pci_segment: 4
             path: path
-            iommu: false
+            x_nv_gpudirect_clique: 4
             id: id
+            x_exclude_mmap_bars:
+            - 7
+            - 7
+            pci_device_id: 1
           vdpa:
-          - pci_segment: 7
+          - pci_segment: 0
             path: path
-            num_queues: 3
-            iommu: false
+            num_queues: 9
             id: id
-          - pci_segment: 7
+            pci_device_id: 7
+          - pci_segment: 0
             path: path
-            num_queues: 3
-            iommu: false
+            num_queues: 9
             id: id
+            pci_device_id: 7
           numa:
           - distances:
-            - distance: 7
-              destination: 8
-            - distance: 7
-              destination: 8
+            - distance: 0
+              destination: 3
+            - distance: 0
+              destination: 3
+            pci_segments:
+            - 2
+            - 2
+            device_id: device_id
             cpus:
             - 4
             - 4
-            sgx_epc_sections:
-            - sgx_epc_sections
-            - sgx_epc_sections
             memory_zones:
             - memory_zones
             - memory_zones
-            guest_numa_id: 0
+            guest_numa_id: 8
           - distances:
-            - distance: 7
-              destination: 8
-            - distance: 7
-              destination: 8
+            - distance: 0
+              destination: 3
+            - distance: 0
+              destination: 3
+            pci_segments:
+            - 2
+            - 2
+            device_id: device_id
             cpus:
             - 4
             - 4
-            sgx_epc_sections:
-            - sgx_epc_sections
-            - sgx_epc_sections
             memory_zones:
             - memory_zones
             - memory_zones
-            guest_numa_id: 0
+            guest_numa_id: 8
           rng:
-            iommu: false
-            src: /dev/urandom
-          sgx_epc:
-          - prefault: false
-            size: 6
+            pci_segment: 6
+            src: src
             id: id
-          - prefault: false
-            size: 6
-            id: id
-          fs:
-          - pci_segment: 6
-            num_queues: 2
-            queue_size: 6
-            tag: tag
-            socket: socket
-            id: id
-          - pci_segment: 6
-            num_queues: 2
-            queue_size: 6
-            tag: tag
-            socket: socket
-            id: id
-          vsock:
-            pci_segment: 7
-            iommu: false
-            socket: socket
-            id: id
-            cid: 3
-          platform:
-            iommu_segments:
-            - 3
-            - 3
-            num_pci_segments: 3
-            oem_strings:
-            - oem_strings
-            - oem_strings
-            tdx: false
-            serial_number: serial_number
-            uuid: uuid
+            pci_device_id: 3
           tpm:
             socket: socket
-          pmem:
-          - pci_segment: 6
-            file: file
-            size: 5
-            iommu: false
-            id: id
-            discard_writes: false
-          - pci_segment: 6
-            file: file
-            size: 5
-            iommu: false
-            id: id
-            discard_writes: false
           watchdog: false
-          iommu: false
-          payload:
-            cmdline: cmdline
-            kernel: kernel
-            initramfs: initramfs
-            firmware: firmware
+          pci_segments:
+          - pci_segment: 6
+            mmio32_aperture_weight: 4
+            mmio64_aperture_weight: 8
+          - pci_segment: 6
+            mmio32_aperture_weight: 4
+            mmio64_aperture_weight: 8
+          landlock_enable: false
           serial:
-            mode: "false"
             file: file
-            iommu: false
-          net:
-          - tap: tap
-            host_mac: host_mac
-            num_queues: 6
-            queue_size: 3
-            ip: 192.168.249.1
-            rate_limiter_config:
-              ops:
-                size: 0
-                one_time_burst: 0
-                refill_time: 0
-              bandwidth:
-                size: 0
-                one_time_burst: 0
-                refill_time: 0
-            mac: mac
-            mtu: 9
-            pci_segment: 6
-            vhost_mode: Client
-            iommu: false
-            vhost_socket: vhost_socket
-            vhost_user: false
-            id: id
-            mask: 255.255.255.0
-          - tap: tap
-            host_mac: host_mac
-            num_queues: 6
-            queue_size: 3
-            ip: 192.168.249.1
-            rate_limiter_config:
-              ops:
-                size: 0
-                one_time_burst: 0
-                refill_time: 0
-              bandwidth:
-                size: 0
-                one_time_burst: 0
-                refill_time: 0
-            mac: mac
-            mtu: 9
-            pci_segment: 6
-            vhost_mode: Client
-            iommu: false
-            vhost_socket: vhost_socket
-            vhost_user: false
-            id: id
-            mask: 255.255.255.0
+            socket: socket
+          landlock_rules:
+          - path: path
+            access: access
+          - path: path
+            access: access
         device_tree:
           key:
             children:
@@ -717,12 +1083,7 @@ components:
         config:
           $ref: '#/components/schemas/VmConfig'
         state:
-          enum:
-          - Created
-          - Running
-          - Shutdown
-          - Paused
-          type: string
+          $ref: '#/components/schemas/VmState'
         memory_actual_size:
           format: int64
           type: integer
@@ -765,6 +1126,128 @@ components:
           type: integer
         type: object
       type: object
+    BalloonStatsResponse:
+      example:
+        balloon_actual: 0
+        stats:
+          oom_kills: 1
+          direct_reclaims: 1
+          major_faults: 5
+          disk_caches: 2
+          minor_faults: 2
+          free_memory: 7
+          swap_out: 5
+          direct_scans: 6
+          hugetlb_allocations: 4
+          total_memory: 9
+          async_scans: 1
+          hugetlb_failures: 7
+          swap_in: 1
+          available_memory: 3
+          alloc_stalls: 1
+          async_reclaims: 7
+        last_update: 6
+      properties:
+        balloon_actual:
+          description: Current balloon size in bytes
+          format: int64
+          type: integer
+        last_update:
+          description: Host UNIX timestamp in milliseconds when statistics were last
+            updated, or zero before the first sample
+          format: int64
+          type: integer
+        stats:
+          $ref: '#/components/schemas/BalloonStats'
+      required:
+      - balloon_actual
+      - last_update
+      - stats
+      type: object
+    BalloonStats:
+      example:
+        oom_kills: 1
+        direct_reclaims: 1
+        major_faults: 5
+        disk_caches: 2
+        minor_faults: 2
+        free_memory: 7
+        swap_out: 5
+        direct_scans: 6
+        hugetlb_allocations: 4
+        total_memory: 9
+        async_scans: 1
+        hugetlb_failures: 7
+        swap_in: 1
+        available_memory: 3
+        alloc_stalls: 1
+        async_reclaims: 7
+      properties:
+        swap_in:
+          description: Memory swapped into the guest in bytes
+          format: int64
+          type: integer
+        swap_out:
+          description: Memory swapped out by the guest in bytes
+          format: int64
+          type: integer
+        major_faults:
+          description: Number of major page faults
+          format: int64
+          type: integer
+        minor_faults:
+          description: Number of minor page faults
+          format: int64
+          type: integer
+        free_memory:
+          description: Unused guest memory in bytes
+          format: int64
+          type: integer
+        total_memory:
+          description: Total guest memory in bytes
+          format: int64
+          type: integer
+        available_memory:
+          description: Guest memory available without swapping in bytes
+          format: int64
+          type: integer
+        disk_caches:
+          description: Reclaimable guest disk caches in bytes
+          format: int64
+          type: integer
+        hugetlb_allocations:
+          description: Number of successful hugetlb allocations
+          format: int64
+          type: integer
+        hugetlb_failures:
+          description: Number of failed hugetlb allocations
+          format: int64
+          type: integer
+        oom_kills:
+          description: Number of guest OOM kills reported by Linux
+          format: int64
+          type: integer
+        alloc_stalls:
+          description: Number of guest memory allocation stalls reported by Linux
+          format: int64
+          type: integer
+        async_scans:
+          description: Memory scanned asynchronously by Linux in bytes
+          format: int64
+          type: integer
+        direct_scans:
+          description: Memory scanned directly by Linux in bytes
+          format: int64
+          type: integer
+        async_reclaims:
+          description: Memory reclaimed asynchronously by Linux in bytes
+          format: int64
+          type: integer
+        direct_reclaims:
+          description: Memory reclaimed directly by Linux in bytes
+          format: int64
+          type: integer
+      type: object
     PciDeviceInfo:
       description: Information about a PCI device
       example:
@@ -783,7 +1266,9 @@ components:
       description: Payloads to boot in guest
       example:
         cmdline: cmdline
+        igvm: igvm
         kernel: kernel
+        host_data: host_data
         initramfs: initramfs
         firmware: firmware
       properties:
@@ -795,18 +1280,23 @@ components:
           type: string
         initramfs:
           type: string
+        igvm:
+          type: string
+        host_data:
+          type: string
       type: object
     VmConfig:
       description: Virtual machine configuration
       example:
-        console:
-          mode: "false"
-          file: file
-          iommu: false
-        balloon:
-          size: 1
-          deflate_on_oom: false
-          free_page_reporting: false
+        user_devices:
+        - pci_segment: 9
+          socket: socket
+          id: id
+          pci_device_id: 0
+        - pci_segment: 9
+          socket: socket
+          id: id
+          pci_device_id: 0
         memory:
           hugepages: false
           shared: false
@@ -815,6 +1305,7 @@ components:
           mergeable: false
           size: 2
           hotplugged_size: 7
+          reserve: false
           zones:
           - hugepages: false
             shared: false
@@ -824,6 +1315,7 @@ components:
             file: file
             size: 1
             hotplugged_size: 1
+            reserve: false
             host_numa_node: 6
             id: id
             hotplug_size: 7
@@ -835,6 +1327,7 @@ components:
             file: file
             size: 1
             hotplugged_size: 1
+            reserve: false
             host_numa_node: 6
             id: id
             hotplug_size: 7
@@ -842,16 +1335,11 @@ components:
           hotplug_method: Acpi
           thp: true
         disks:
-        - pci_segment: 8
-          path: path
-          num_queues: 4
-          readonly: false
-          iommu: false
-          queue_size: 5
-          vhost_socket: vhost_socket
-          serial: serial
-          vhost_user: false
+        - num_queues: 9
+          rate_limit_group: rate_limit_group
+          queue_size: 6
           direct: false
+          backing_files: false
           rate_limiter_config:
             ops:
               size: 0
@@ -861,17 +1349,30 @@ components:
               size: 0
               one_time_burst: 0
               refill_time: 0
-          id: id
-        - pci_segment: 8
+          pci_device_id: 9
+          queue_affinity:
+          - host_cpus:
+            - 3
+            - 3
+            queue_index: 6
+          - host_cpus:
+            - 3
+            - 3
+            queue_index: 6
+          pci_segment: 8
           path: path
-          num_queues: 4
           readonly: false
-          iommu: false
-          queue_size: 5
           vhost_socket: vhost_socket
           serial: serial
+          sparse: true
           vhost_user: false
+          guest_block_size: 6
+          id: id
+        - num_queues: 9
+          rate_limit_group: rate_limit_group
+          queue_size: 6
           direct: false
+          backing_files: false
           rate_limiter_config:
             ops:
               size: 0
@@ -881,7 +1382,201 @@ components:
               size: 0
               one_time_burst: 0
               refill_time: 0
+          pci_device_id: 9
+          queue_affinity:
+          - host_cpus:
+            - 3
+            - 3
+            queue_index: 6
+          - host_cpus:
+            - 3
+            - 3
+            queue_index: 6
+          pci_segment: 8
+          path: path
+          readonly: false
+          vhost_socket: vhost_socket
+          serial: serial
+          sparse: true
+          vhost_user: false
+          guest_block_size: 6
           id: id
+        fs:
+        - pci_segment: 0
+          num_queues: 7
+          queue_size: 6
+          tag: tag
+          socket: socket
+          id: id
+          pci_device_id: 4
+        - pci_segment: 0
+          num_queues: 7
+          queue_size: 6
+          tag: tag
+          socket: socket
+          id: id
+          pci_device_id: 4
+        vsock:
+          pci_segment: 4
+          socket: socket
+          id: id
+          cid: 3
+          pci_device_id: 6
+        platform:
+          iommu_segments:
+          - 1
+          - 1
+          vfio_p2p_dma: true
+          num_pci_segments: 9
+          system_manufacturer: system_manufacturer
+          iommu_address_width_bits: 3
+          system_serial_number: system_serial_number
+          iommufd: false
+          tdx: false
+          serial_number: serial_number
+          system_family: system_family
+          chassis_asset_tag: chassis_asset_tag
+          system_uuid: system_uuid
+          sev_snp: false
+          uuid: uuid
+          system_product_name: system_product_name
+          system_sku_number: system_sku_number
+          oem_strings:
+          - oem_strings
+          - oem_strings
+          system_version: system_version
+        pmem:
+        - pci_segment: 5
+          file: file
+          size: 7
+          id: id
+          discard_writes: false
+          pci_device_id: 3
+        - pci_segment: 5
+          file: file
+          size: 7
+          id: id
+          discard_writes: false
+          pci_device_id: 3
+        payload:
+          cmdline: cmdline
+          igvm: igvm
+          kernel: kernel
+          host_data: host_data
+          initramfs: initramfs
+          firmware: firmware
+        generic_vhost_user:
+        - queue_sizes:
+          - 8
+          - 8
+          pci_segment: 7
+          device_type: 3
+          socket: socket
+          id: id
+          pci_device_id: 3
+        - queue_sizes:
+          - 8
+          - 8
+          pci_segment: 7
+          device_type: 3
+          socket: socket
+          id: id
+          pci_device_id: 3
+        rate_limit_groups:
+        - id: id
+          rate_limiter_config:
+            ops:
+              size: 0
+              one_time_burst: 0
+              refill_time: 0
+            bandwidth:
+              size: 0
+              one_time_burst: 0
+              refill_time: 0
+        - id: id
+          rate_limiter_config:
+            ops:
+              size: 0
+              one_time_burst: 0
+              refill_time: 0
+            bandwidth:
+              size: 0
+              one_time_burst: 0
+              refill_time: 0
+        debug_console:
+          iobase: 6
+          file: file
+        net:
+        - tap: tap
+          host_mac: host_mac
+          num_queues: 2
+          offload_ufo: false
+          queue_size: 6
+          offload_csum: false
+          ip: 192.168.249.1
+          rate_limiter_config:
+            ops:
+              size: 0
+              one_time_burst: 0
+              refill_time: 0
+            bandwidth:
+              size: 0
+              one_time_burst: 0
+              refill_time: 0
+          mac: mac
+          mtu: 1
+          pci_device_id: 5
+          pci_segment: 6
+          offload_tso: false
+          vhost_mode: Client
+          vhost_socket: vhost_socket
+          vhost_user: false
+          id: id
+          mask: 255.255.255.0
+        - tap: tap
+          host_mac: host_mac
+          num_queues: 2
+          offload_ufo: false
+          queue_size: 6
+          offload_csum: false
+          ip: 192.168.249.1
+          rate_limiter_config:
+            ops:
+              size: 0
+              one_time_burst: 0
+              refill_time: 0
+            bandwidth:
+              size: 0
+              one_time_burst: 0
+              refill_time: 0
+          mac: mac
+          mtu: 1
+          pci_device_id: 5
+          pci_segment: 6
+          offload_tso: false
+          vhost_mode: Client
+          vhost_socket: vhost_socket
+          vhost_user: false
+          id: id
+          mask: 255.255.255.0
+        pvpanic: false
+        rtc:
+          pci_segment: 1
+          id: id
+          pci_device_id: 8
+        console:
+          pci_segment: 4
+          file: file
+          socket: socket
+          id: id
+          pci_device_id: 0
+        balloon:
+          pci_segment: 3
+          size: 0
+          deflate_on_oom: false
+          id: id
+          free_page_reporting: false
+          pci_device_id: 7
         cpus:
           features:
             amx: true
@@ -894,6 +1589,7 @@ components:
           max_phys_bits: 7
           boot_vcpus: 1
           max_vcpus: 1
+          nested: false
           affinity:
           - vcpu: 9
             host_cpus:
@@ -904,169 +1600,90 @@ components:
             - 3
             - 3
         devices:
-        - pci_segment: 3
+        - pci_segment: 4
           path: path
-          iommu: false
+          x_nv_gpudirect_clique: 4
           id: id
-        - pci_segment: 3
+          x_exclude_mmap_bars:
+          - 7
+          - 7
+          pci_device_id: 1
+        - pci_segment: 4
           path: path
-          iommu: false
+          x_nv_gpudirect_clique: 4
           id: id
+          x_exclude_mmap_bars:
+          - 7
+          - 7
+          pci_device_id: 1
         vdpa:
-        - pci_segment: 7
+        - pci_segment: 0
           path: path
-          num_queues: 3
-          iommu: false
+          num_queues: 9
           id: id
-        - pci_segment: 7
+          pci_device_id: 7
+        - pci_segment: 0
           path: path
-          num_queues: 3
-          iommu: false
+          num_queues: 9
           id: id
+          pci_device_id: 7
         numa:
         - distances:
-          - distance: 7
-            destination: 8
-          - distance: 7
-            destination: 8
+          - distance: 0
+            destination: 3
+          - distance: 0
+            destination: 3
+          pci_segments:
+          - 2
+          - 2
+          device_id: device_id
           cpus:
           - 4
           - 4
-          sgx_epc_sections:
-          - sgx_epc_sections
-          - sgx_epc_sections
           memory_zones:
           - memory_zones
           - memory_zones
-          guest_numa_id: 0
+          guest_numa_id: 8
         - distances:
-          - distance: 7
-            destination: 8
-          - distance: 7
-            destination: 8
+          - distance: 0
+            destination: 3
+          - distance: 0
+            destination: 3
+          pci_segments:
+          - 2
+          - 2
+          device_id: device_id
           cpus:
           - 4
           - 4
-          sgx_epc_sections:
-          - sgx_epc_sections
-          - sgx_epc_sections
           memory_zones:
           - memory_zones
           - memory_zones
-          guest_numa_id: 0
+          guest_numa_id: 8
         rng:
-          iommu: false
-          src: /dev/urandom
-        sgx_epc:
-        - prefault: false
-          size: 6
+          pci_segment: 6
+          src: src
           id: id
-        - prefault: false
-          size: 6
-          id: id
-        fs:
-        - pci_segment: 6
-          num_queues: 2
-          queue_size: 6
-          tag: tag
-          socket: socket
-          id: id
-        - pci_segment: 6
-          num_queues: 2
-          queue_size: 6
-          tag: tag
-          socket: socket
-          id: id
-        vsock:
-          pci_segment: 7
-          iommu: false
-          socket: socket
-          id: id
-          cid: 3
-        platform:
-          iommu_segments:
-          - 3
-          - 3
-          num_pci_segments: 3
-          oem_strings:
-          - oem_strings
-          - oem_strings
-          tdx: false
-          serial_number: serial_number
-          uuid: uuid
+          pci_device_id: 3
         tpm:
           socket: socket
-        pmem:
-        - pci_segment: 6
-          file: file
-          size: 5
-          iommu: false
-          id: id
-          discard_writes: false
-        - pci_segment: 6
-          file: file
-          size: 5
-          iommu: false
-          id: id
-          discard_writes: false
         watchdog: false
-        iommu: false
-        payload:
-          cmdline: cmdline
-          kernel: kernel
-          initramfs: initramfs
-          firmware: firmware
+        pci_segments:
+        - pci_segment: 6
+          mmio32_aperture_weight: 4
+          mmio64_aperture_weight: 8
+        - pci_segment: 6
+          mmio32_aperture_weight: 4
+          mmio64_aperture_weight: 8
+        landlock_enable: false
         serial:
-          mode: "false"
           file: file
-          iommu: false
-        net:
-        - tap: tap
-          host_mac: host_mac
-          num_queues: 6
-          queue_size: 3
-          ip: 192.168.249.1
-          rate_limiter_config:
-            ops:
-              size: 0
-              one_time_burst: 0
-              refill_time: 0
-            bandwidth:
-              size: 0
-              one_time_burst: 0
-              refill_time: 0
-          mac: mac
-          mtu: 9
-          pci_segment: 6
-          vhost_mode: Client
-          iommu: false
-          vhost_socket: vhost_socket
-          vhost_user: false
-          id: id
-          mask: 255.255.255.0
-        - tap: tap
-          host_mac: host_mac
-          num_queues: 6
-          queue_size: 3
-          ip: 192.168.249.1
-          rate_limiter_config:
-            ops:
-              size: 0
-              one_time_burst: 0
-              refill_time: 0
-            bandwidth:
-              size: 0
-              one_time_burst: 0
-              refill_time: 0
-          mac: mac
-          mtu: 9
-          pci_segment: 6
-          vhost_mode: Client
-          iommu: false
-          vhost_socket: vhost_socket
-          vhost_user: false
-          id: id
-          mask: 255.255.255.0
+          socket: socket
+        landlock_rules:
+        - path: path
+          access: access
+        - path: path
+          access: access
       properties:
         cpus:
           $ref: '#/components/schemas/CpusConfig'
@@ -1074,6 +1691,10 @@ components:
           $ref: '#/components/schemas/MemoryConfig'
         payload:
           $ref: '#/components/schemas/PayloadConfig'
+        rate_limit_groups:
+          items:
+            $ref: '#/components/schemas/RateLimitGroupConfig'
+          type: array
         disks:
           items:
             $ref: '#/components/schemas/DiskConfig'
@@ -1090,17 +1711,27 @@ components:
           items:
             $ref: '#/components/schemas/FsConfig'
           type: array
+        generic_vhost_user:
+          items:
+            $ref: '#/components/schemas/GenericVhostUserConfig'
+          type: array
         pmem:
           items:
             $ref: '#/components/schemas/PmemConfig'
           type: array
         serial:
-          $ref: '#/components/schemas/ConsoleConfig'
+          $ref: '#/components/schemas/SerialConfig'
         console:
           $ref: '#/components/schemas/ConsoleConfig'
+        debug_console:
+          $ref: '#/components/schemas/DebugConsoleConfig'
         devices:
           items:
             $ref: '#/components/schemas/DeviceConfig'
+          type: array
+        user_devices:
+          items:
+            $ref: '#/components/schemas/UserDeviceConfig'
           type: array
         vdpa:
           items:
@@ -1108,24 +1739,33 @@ components:
           type: array
         vsock:
           $ref: '#/components/schemas/VsockConfig'
-        sgx_epc:
-          items:
-            $ref: '#/components/schemas/SgxEpcConfig'
-          type: array
         numa:
           items:
             $ref: '#/components/schemas/NumaConfig'
           type: array
-        iommu:
-          default: false
-          type: boolean
         watchdog:
           default: false
           type: boolean
+        rtc:
+          $ref: '#/components/schemas/RtcConfig'
+        pvpanic:
+          default: false
+          type: boolean
+        pci_segments:
+          items:
+            $ref: '#/components/schemas/PciSegmentConfig'
+          type: array
         platform:
           $ref: '#/components/schemas/PlatformConfig'
         tpm:
           $ref: '#/components/schemas/TpmConfig'
+        landlock_enable:
+          default: false
+          type: boolean
+        landlock_rules:
+          items:
+            $ref: '#/components/schemas/LandlockConfig'
+          type: array
       required:
       - payload
       type: object
@@ -1169,6 +1809,13 @@ components:
         packages:
           type: integer
       type: object
+    CoreSchedulingMode:
+      default: Vm
+      enum:
+      - Vm
+      - Vcpu
+      - "Off"
+      type: string
     CpusConfig:
       example:
         features:
@@ -1182,6 +1829,7 @@ components:
         max_phys_bits: 7
         boot_vcpus: 1
         max_vcpus: 1
+        nested: false
         affinity:
         - vcpu: 9
           host_cpus:
@@ -1193,11 +1841,9 @@ components:
           - 3
       properties:
         boot_vcpus:
-          default: 1
           minimum: 1
           type: integer
         max_vcpus:
-          default: 1
           minimum: 1
           type: integer
         topology:
@@ -1207,28 +1853,71 @@ components:
           type: boolean
         max_phys_bits:
           type: integer
+        nested:
+          default: false
+          type: boolean
         affinity:
           items:
             $ref: '#/components/schemas/CpuAffinity'
           type: array
         features:
           $ref: '#/components/schemas/CpuFeatures'
+        core_scheduling:
+          $ref: '#/components/schemas/CoreSchedulingMode'
       required:
       - boot_vcpus
       - max_vcpus
       type: object
+    PciSegmentConfig:
+      example:
+        pci_segment: 6
+        mmio32_aperture_weight: 4
+        mmio64_aperture_weight: 8
+      properties:
+        pci_segment:
+          format: int16
+          type: integer
+        mmio32_aperture_weight:
+          format: int32
+          type: integer
+        mmio64_aperture_weight:
+          format: int32
+          type: integer
+      required:
+      - pci_segment
+      type: object
+    IommuType:
+      default: "Off"
+      description: Virtual IOMMU the device is attached to.
+      enum:
+      - "Off"
+      - Virtio
+      - Smmuv3
+      type: string
     PlatformConfig:
       example:
         iommu_segments:
-        - 3
-        - 3
-        num_pci_segments: 3
+        - 1
+        - 1
+        vfio_p2p_dma: true
+        num_pci_segments: 9
+        system_manufacturer: system_manufacturer
+        iommu_address_width_bits: 3
+        system_serial_number: system_serial_number
+        iommufd: false
+        tdx: false
+        serial_number: serial_number
+        system_family: system_family
+        chassis_asset_tag: chassis_asset_tag
+        system_uuid: system_uuid
+        sev_snp: false
+        uuid: uuid
+        system_product_name: system_product_name
+        system_sku_number: system_sku_number
         oem_strings:
         - oem_strings
         - oem_strings
-        tdx: false
-        serial_number: serial_number
-        uuid: uuid
+        system_version: system_version
       properties:
         num_pci_segments:
           format: int16
@@ -1238,16 +1927,46 @@ components:
             format: int16
             type: integer
           type: array
+        iommu_address_width_bits:
+          format: uint8
+          type: integer
+        system_serial_number:
+          type: string
         serial_number:
+          deprecated: true
+          type: string
+        system_uuid:
           type: string
         uuid:
+          deprecated: true
           type: string
         oem_strings:
           items:
             type: string
           type: array
+        system_manufacturer:
+          type: string
+        system_product_name:
+          type: string
+        system_version:
+          type: string
+        system_family:
+          type: string
+        system_sku_number:
+          type: string
+        chassis_asset_tag:
+          type: string
         tdx:
           default: false
+          type: boolean
+        sev_snp:
+          default: false
+          type: boolean
+        iommufd:
+          default: false
+          type: boolean
+        vfio_p2p_dma:
+          default: true
           type: boolean
       type: object
     MemoryZoneConfig:
@@ -1260,6 +1979,7 @@ components:
         file: file
         size: 1
         hotplugged_size: 1
+        reserve: false
         host_numa_node: 6
         id: id
         hotplug_size: 7
@@ -1295,6 +2015,9 @@ components:
         prefault:
           default: false
           type: boolean
+        reserve:
+          default: false
+          type: boolean
       required:
       - id
       - size
@@ -1308,6 +2031,7 @@ components:
         mergeable: false
         size: 2
         hotplugged_size: 7
+        reserve: false
         zones:
         - hugepages: false
           shared: false
@@ -1317,6 +2041,7 @@ components:
           file: file
           size: 1
           hotplugged_size: 1
+          reserve: false
           host_numa_node: 6
           id: id
           hotplug_size: 7
@@ -1328,6 +2053,7 @@ components:
           file: file
           size: 1
           hotplugged_size: 1
+          reserve: false
           host_numa_node: 6
           id: id
           hotplug_size: 7
@@ -1360,6 +2086,9 @@ components:
           format: int64
           type: integer
         prefault:
+          default: false
+          type: boolean
+        reserve:
           default: false
           type: boolean
         thp:
@@ -1424,18 +2153,9 @@ components:
         ops:
           $ref: '#/components/schemas/TokenBucket'
       type: object
-    DiskConfig:
+    RateLimitGroupConfig:
       example:
-        pci_segment: 8
-        path: path
-        num_queues: 4
-        readonly: false
-        iommu: false
-        queue_size: 5
-        vhost_socket: vhost_socket
-        serial: serial
-        vhost_user: false
-        direct: false
+        id: id
         rate_limiter_config:
           ops:
             size: 0
@@ -1445,6 +2165,82 @@ components:
             size: 0
             one_time_burst: 0
             refill_time: 0
+      properties:
+        id:
+          type: string
+        rate_limiter_config:
+          $ref: '#/components/schemas/RateLimiterConfig'
+      required:
+      - id
+      - rate_limiter_config
+      type: object
+    VirtQueueAffinity:
+      example:
+        host_cpus:
+        - 3
+        - 3
+        queue_index: 6
+      properties:
+        queue_index:
+          type: integer
+        host_cpus:
+          items:
+            type: integer
+          type: array
+      required:
+      - host_cpus
+      - queue_index
+      type: object
+    ImageType:
+      description: Unknown is only valid for vhost-user disks.
+      enum:
+      - FlatVmdk
+      - FixedVhd
+      - Qcow2
+      - Raw
+      - Vhdx
+      - Unknown
+      type: string
+    LockGranularity:
+      default: ByteRange
+      enum:
+      - ByteRange
+      - Full
+      type: string
+    DiskConfig:
+      example:
+        num_queues: 9
+        rate_limit_group: rate_limit_group
+        queue_size: 6
+        direct: false
+        backing_files: false
+        rate_limiter_config:
+          ops:
+            size: 0
+            one_time_burst: 0
+            refill_time: 0
+          bandwidth:
+            size: 0
+            one_time_burst: 0
+            refill_time: 0
+        pci_device_id: 9
+        queue_affinity:
+        - host_cpus:
+          - 3
+          - 3
+          queue_index: 6
+        - host_cpus:
+          - 3
+          - 3
+          queue_index: 6
+        pci_segment: 8
+        path: path
+        readonly: false
+        vhost_socket: vhost_socket
+        serial: serial
+        sparse: true
+        vhost_user: false
+        guest_block_size: 6
         id: id
       properties:
         path:
@@ -1456,8 +2252,7 @@ components:
           default: false
           type: boolean
         iommu:
-          default: false
-          type: boolean
+          $ref: '#/components/schemas/IommuType'
         num_queues:
           default: 1
           type: integer
@@ -1474,19 +2269,40 @@ components:
         pci_segment:
           format: int16
           type: integer
+        pci_device_id:
+          format: uint8
+          type: integer
         id:
           type: string
         serial:
           type: string
-      required:
-      - path
+        rate_limit_group:
+          type: string
+        queue_affinity:
+          items:
+            $ref: '#/components/schemas/VirtQueueAffinity'
+          type: array
+        backing_files:
+          default: false
+          type: boolean
+        sparse:
+          default: true
+          type: boolean
+        image_type:
+          $ref: '#/components/schemas/ImageType'
+        lock_granularity:
+          $ref: '#/components/schemas/LockGranularity'
+        guest_block_size:
+          type: integer
       type: object
     NetConfig:
       example:
         tap: tap
         host_mac: host_mac
-        num_queues: 6
-        queue_size: 3
+        num_queues: 2
+        offload_ufo: false
+        queue_size: 6
+        offload_csum: false
         ip: 192.168.249.1
         rate_limiter_config:
           ops:
@@ -1498,10 +2314,11 @@ components:
             one_time_burst: 0
             refill_time: 0
         mac: mac
-        mtu: 9
+        mtu: 1
+        pci_device_id: 5
         pci_segment: 6
+        offload_tso: false
         vhost_mode: Client
-        iommu: false
         vhost_socket: vhost_socket
         vhost_user: false
         id: id
@@ -1511,9 +2328,12 @@ components:
           type: string
         ip:
           default: 192.168.249.1
+          description: IPv4 or IPv6 address
           type: string
         mask:
           default: 255.255.255.0
+          description: Must be a valid IPv4 netmask if ip is an IPv4 address or a
+            valid IPv6 netmask if ip is an IPv6 address.
           type: string
         mac:
           type: string
@@ -1522,8 +2342,7 @@ components:
         mtu:
           type: integer
         iommu:
-          default: false
-          type: boolean
+          $ref: '#/components/schemas/IommuType'
         num_queues:
           default: 2
           type: integer
@@ -1543,29 +2362,79 @@ components:
         pci_segment:
           format: int16
           type: integer
+        pci_device_id:
+          format: uint8
+          type: integer
         rate_limiter_config:
           $ref: '#/components/schemas/RateLimiterConfig'
+        offload_tso:
+          default: false
+          type: boolean
+        offload_ufo:
+          default: false
+          type: boolean
+        offload_csum:
+          default: false
+          type: boolean
       type: object
     RngConfig:
       example:
-        iommu: false
-        src: /dev/urandom
+        pci_segment: 6
+        src: src
+        id: id
+        pci_device_id: 3
       properties:
-        src:
-          default: /dev/urandom
+        id:
           type: string
+        pci_segment:
+          format: int16
+          type: integer
+        pci_device_id:
+          format: uint8
+          type: integer
         iommu:
-          default: false
-          type: boolean
+          $ref: '#/components/schemas/IommuType'
+        src:
+          type: string
       required:
       - src
       type: object
+    RtcConfig:
+      example:
+        pci_segment: 1
+        id: id
+        pci_device_id: 8
+      properties:
+        id:
+          type: string
+        pci_segment:
+          format: int16
+          type: integer
+        pci_device_id:
+          format: uint8
+          type: integer
+        iommu:
+          $ref: '#/components/schemas/IommuType'
+      type: object
     BalloonConfig:
       example:
-        size: 1
+        pci_segment: 3
+        size: 0
         deflate_on_oom: false
+        id: id
         free_page_reporting: false
+        pci_device_id: 7
       properties:
+        id:
+          type: string
+        pci_segment:
+          format: int16
+          type: integer
+        pci_device_id:
+          format: uint8
+          type: integer
+        iommu:
+          $ref: '#/components/schemas/IommuType'
         size:
           format: int64
           type: integer
@@ -1582,12 +2451,13 @@ components:
       type: object
     FsConfig:
       example:
-        pci_segment: 6
-        num_queues: 2
+        pci_segment: 0
+        num_queues: 7
         queue_size: 6
         tag: tag
         socket: socket
         id: id
+        pci_device_id: 4
       properties:
         tag:
           type: string
@@ -1602,6 +2472,9 @@ components:
         pci_segment:
           format: int16
           type: integer
+        pci_device_id:
+          format: uint8
+          type: integer
         id:
           type: string
       required:
@@ -1610,14 +2483,48 @@ components:
       - socket
       - tag
       type: object
+    GenericVhostUserConfig:
+      example:
+        queue_sizes:
+        - 8
+        - 8
+        pci_segment: 7
+        device_type: 3
+        socket: socket
+        id: id
+        pci_device_id: 3
+      properties:
+        socket:
+          type: string
+        queue_sizes:
+          items:
+            format: uint16
+            type: integer
+          type: array
+        pci_segment:
+          format: int16
+          type: integer
+        pci_device_id:
+          format: uint8
+          type: integer
+        id:
+          type: string
+        device_type:
+          format: uint32
+          type: integer
+      required:
+      - device_type
+      - queue_sizes
+      - socket
+      type: object
     PmemConfig:
       example:
-        pci_segment: 6
+        pci_segment: 5
         file: file
-        size: 5
-        iommu: false
+        size: 7
         id: id
         discard_writes: false
+        pci_device_id: 3
       properties:
         file:
           type: string
@@ -1625,60 +2532,141 @@ components:
           format: int64
           type: integer
         iommu:
-          default: false
-          type: boolean
+          $ref: '#/components/schemas/IommuType'
         discard_writes:
           default: false
           type: boolean
         pci_segment:
           format: int16
           type: integer
+        pci_device_id:
+          format: uint8
+          type: integer
         id:
           type: string
       required:
       - file
       type: object
+    ConsoleMode:
+      enum:
+      - "Off"
+      - Pty
+      - Tty
+      - File
+      - Socket
+      - "Null"
+      type: string
     ConsoleConfig:
       example:
-        mode: "false"
+        pci_segment: 4
         file: file
-        iommu: false
+        socket: socket
+        id: id
+        pci_device_id: 0
+      properties:
+        file:
+          type: string
+        socket:
+          type: string
+        mode:
+          $ref: '#/components/schemas/ConsoleMode'
+        iommu:
+          $ref: '#/components/schemas/IommuType'
+        id:
+          type: string
+        pci_segment:
+          format: int16
+          type: integer
+        pci_device_id:
+          format: uint8
+          type: integer
+      required:
+      - mode
+      type: object
+    SerialConfig:
+      example:
+        file: file
+        socket: socket
+      properties:
+        file:
+          type: string
+        socket:
+          type: string
+        mode:
+          $ref: '#/components/schemas/ConsoleMode'
+      required:
+      - mode
+      type: object
+    DebugConsoleConfig:
+      example:
+        iobase: 6
+        file: file
       properties:
         file:
           type: string
         mode:
-          enum:
-          - "false"
-          - Pty
-          - Tty
-          - File
-          - null
-          type: string
-        iommu:
-          default: false
-          type: boolean
+          $ref: '#/components/schemas/ConsoleMode'
+        iobase:
+          type: integer
       required:
       - mode
       type: object
     DeviceConfig:
       example:
-        pci_segment: 3
+        pci_segment: 4
         path: path
-        iommu: false
+        x_nv_gpudirect_clique: 4
         id: id
+        x_exclude_mmap_bars:
+        - 7
+        - 7
+        pci_device_id: 1
       properties:
         path:
+          description: |
+            Sysfs path of the VFIO device. Exactly one of `path` or an
+            externally-opened cdev FD must be supplied; an FD is passed
+            out of band via SCM_RIGHTS on the UNIX domain socket, never
+            in this body.
           type: string
         iommu:
-          default: false
-          type: boolean
+          $ref: '#/components/schemas/IommuType'
         pci_segment:
           format: int16
           type: integer
+        pci_device_id:
+          format: uint8
+          type: integer
         id:
           type: string
+        x_nv_gpudirect_clique:
+          format: int8
+          type: integer
+        x_exclude_mmap_bars:
+          items:
+            format: int64
+            type: integer
+          type: array
+      type: object
+    UserDeviceConfig:
+      example:
+        pci_segment: 9
+        socket: socket
+        id: id
+        pci_device_id: 0
+      properties:
+        socket:
+          type: string
+        id:
+          type: string
+        pci_segment:
+          format: int16
+          type: integer
+        pci_device_id:
+          format: uint8
+          type: integer
       required:
-      - path
+      - socket
       type: object
     TpmConfig:
       example:
@@ -1691,11 +2679,11 @@ components:
       type: object
     VdpaConfig:
       example:
-        pci_segment: 7
+        pci_segment: 0
         path: path
-        num_queues: 3
-        iommu: false
+        num_queues: 9
         id: id
+        pci_device_id: 7
       properties:
         path:
           type: string
@@ -1703,10 +2691,12 @@ components:
           default: 1
           type: integer
         iommu:
-          default: false
-          type: boolean
+          $ref: '#/components/schemas/IommuType'
         pci_segment:
           format: int16
+          type: integer
+        pci_device_id:
+          format: uint8
           type: integer
         id:
           type: string
@@ -1716,11 +2706,11 @@ components:
       type: object
     VsockConfig:
       example:
-        pci_segment: 7
-        iommu: false
+        pci_segment: 4
         socket: socket
         id: id
         cid: 3
+        pci_device_id: 6
       properties:
         cid:
           description: Guest Vsock CID
@@ -1731,10 +2721,12 @@ components:
           description: Path to UNIX domain socket, used to proxy vsock connections.
           type: string
         iommu:
-          default: false
-          type: boolean
+          $ref: '#/components/schemas/IommuType'
         pci_segment:
           format: int16
+          type: integer
+        pci_device_id:
+          format: uint8
           type: integer
         id:
           type: string
@@ -1742,28 +2734,10 @@ components:
       - cid
       - socket
       type: object
-    SgxEpcConfig:
-      example:
-        prefault: false
-        size: 6
-        id: id
-      properties:
-        id:
-          type: string
-        size:
-          format: int64
-          type: integer
-        prefault:
-          default: false
-          type: boolean
-      required:
-      - id
-      - size
-      type: object
     NumaDistance:
       example:
-        distance: 7
-        destination: 8
+        distance: 0
+        destination: 3
       properties:
         destination:
           format: int32
@@ -1778,20 +2752,21 @@ components:
     NumaConfig:
       example:
         distances:
-        - distance: 7
-          destination: 8
-        - distance: 7
-          destination: 8
+        - distance: 0
+          destination: 3
+        - distance: 0
+          destination: 3
+        pci_segments:
+        - 2
+        - 2
+        device_id: device_id
         cpus:
         - 4
         - 4
-        sgx_epc_sections:
-        - sgx_epc_sections
-        - sgx_epc_sections
         memory_zones:
         - memory_zones
         - memory_zones
-        guest_numa_id: 0
+        guest_numa_id: 8
       properties:
         guest_numa_id:
           format: int32
@@ -1809,10 +2784,13 @@ components:
           items:
             type: string
           type: array
-        sgx_epc_sections:
+        pci_segments:
           items:
-            type: string
+            format: int32
+            type: integer
           type: array
+        device_id:
+          type: string
       required:
       - guest_numa_id
       type: object
@@ -1831,6 +2809,19 @@ components:
           type: integer
         desired_balloon:
           description: desired balloon size in bytes
+          format: int64
+          type: integer
+      type: object
+    VmResizeDisk:
+      example:
+        desired_size: 0
+        id: id
+      properties:
+        id:
+          description: disk identifier
+          type: string
+        desired_size:
+          description: desired disk size in bytes
           format: int64
           type: integer
       type: object
@@ -1867,8 +2858,21 @@ components:
         destination_url:
           type: string
       type: object
+    MemoryRestoreMode:
+      default: Copy
+      enum:
+      - Copy
+      - OnDemand
+      - CopyOnWrite
+      type: string
     RestoreConfig:
       example:
+        resume: true
+        zone_updates:
+        - host_numa_node: 0
+          id: id
+        - host_numa_node: 0
+          id: id
         prefault: true
         source_url: source_url
       properties:
@@ -1876,27 +2880,161 @@ components:
           type: string
         prefault:
           type: boolean
+        memory_restore_mode:
+          $ref: '#/components/schemas/MemoryRestoreMode'
+        resume:
+          type: boolean
+        zone_updates:
+          items:
+            $ref: '#/components/schemas/VmMemoryZoneUpdateData'
+          type: array
       required:
       - source_url
       type: object
     ReceiveMigrationData:
       example:
+        zone_updates:
+        - host_numa_node: 0
+          id: id
+        - host_numa_node: 0
+          id: id
+        tls_dir: tls_dir
+        background_fetch_pages: true
         receiver_url: receiver_url
       properties:
         receiver_url:
           type: string
+        tls_dir:
+          description: |
+            Directory containing the TLS server certificate (server-cert.pem), the TLS server key (server-key.pem), and the client TLS root CA certificate (ca-cert.pem). TLS is only supported with tcp:<host>:<port> receiver URLs. Recommended for all TCP migrations. Omitting it is only intended for development and testing, as TCP migration is then unencrypted and unauthenticated.
+          type: string
+        zone_updates:
+          items:
+            $ref: '#/components/schemas/VmMemoryZoneUpdateData'
+          type: array
+        background_fetch_pages:
+          default: true
+          description: Enable the background thread for faulting all remaining pages.
+          type: boolean
       required:
       - receiver_url
       type: object
+    MigrationMode:
+      default: Precopy
+      description: |
+        Memory transfer mode. MemFDs passes the guest memory backing file descriptors to the destination over a UNIX socket. MemFDs requires every guest memory region to use shared memory or hugepage backing. Precopy transfers all guest memory before the destination resumes. Postcopy resumes the destination first and faults guest pages in on demand.
+      enum:
+      - MemFDs
+      - Precopy
+      - Postcopy
+      type: string
+    VmMemoryZoneUpdateData:
+      example:
+        host_numa_node: 0
+        id: id
+      properties:
+        id:
+          minLength: 1
+          type: string
+        host_numa_node:
+          format: uint32
+          minimum: 0
+          type: integer
+      required:
+      - host_numa_node
+      - id
+      type: object
+    TimeoutStrategy:
+      default: Cancel
+      description: |
+        The strategy to apply when the migration timeout is reached. Cancel will abort the migration and keep the VM running on the source. Ignore will proceed with the migration regardless of the downtime requirement.
+      enum:
+      - Cancel
+      - Ignore
+      type: string
     SendMigrationData:
       example:
+        timeout_s: 1
+        tls_dir: tls_dir
         destination_url: destination_url
-        local: true
+        downtime_ms: 1
+        preserve_source: false
+        local: false
+        connections: 19
       properties:
         destination_url:
           type: string
         local:
+          default: false
+          deprecated: true
+          description: |
+            Deprecated: set memory_mode to "MemFDs" instead. If true, the request is treated as if memory_mode were "MemFDs".
           type: boolean
+        preserve_source:
+          default: false
+          description: |
+            Keep the source VM alive in a paused state after migration completes. This is only supported when memory_mode is "MemFDs" or the deprecated local property is true.
+          type: boolean
+        downtime_ms:
+          default: 300
+          description: |
+            The maximum downtime the migration aims for, in milliseconds. Defaults to 300ms.
+          format: int64
+          minimum: 1
+          type: integer
+        timeout_s:
+          default: 3600
+          description: |
+            The timeout for the migration (maximum total duration), in seconds. Defaults to 3600s (one hour).
+          format: int64
+          minimum: 1
+          type: integer
+        timeout_strategy:
+          $ref: '#/components/schemas/TimeoutStrategy'
+        connections:
+          default: 1
+          description: |
+            The number of parallel TCP connections to use for migration. Must be between 1 and 128. Multiple connections are not supported with UNIX domain socket migration.
+          format: int64
+          maximum: 128
+          minimum: 1
+          type: integer
+        tls_dir:
+          description: |
+            Directory containing the TLS root CA certificate (ca-cert.pem), the TLS client certificate (client-cert.pem), and TLS client key (client-key.pem). TLS is only supported with tcp:<host>:<port> destination URLs. Recommended for all TCP migrations. Omitting it is only intended for development and testing, as TCP migration is then unencrypted and unauthenticated.
+          type: string
+        memory_mode:
+          $ref: '#/components/schemas/MigrationMode'
       required:
       - destination_url
+      type: object
+    VmAddUserDevice:
+      example:
+        pci_segment: 0
+        socket: socket
+        pci_device_id: 6
+      properties:
+        socket:
+          type: string
+        pci_segment:
+          format: int16
+          type: integer
+        pci_device_id:
+          format: uint8
+          type: integer
+      required:
+      - socket
+      type: object
+    LandlockConfig:
+      example:
+        path: path
+        access: access
+      properties:
+        path:
+          type: string
+        access:
+          type: string
+      required:
+      - access
+      - path
       type: object

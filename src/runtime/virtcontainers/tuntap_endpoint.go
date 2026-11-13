@@ -26,6 +26,7 @@ var tuntapTrace = getNetworkTrace(TuntapEndpointType)
 type TuntapEndpoint struct {
 	EndpointType       EndpointType
 	PCIPath            vcTypes.PciPath
+	CCWDevice          *vcTypes.CcwDevice
 	TuntapInterface    TuntapInterface
 	EndpointProperties NetworkInfo
 	NetPair            NetworkInterfacePair
@@ -61,6 +62,16 @@ func (endpoint *TuntapEndpoint) PciPath() vcTypes.PciPath {
 // SetPciPath sets the PCI path of the endpoint.
 func (endpoint *TuntapEndpoint) SetPciPath(pciPath vcTypes.PciPath) {
 	endpoint.PCIPath = pciPath
+}
+
+// CcwDevice returns the CCW device of the endpoint.
+func (endpoint *TuntapEndpoint) CcwDevice() *vcTypes.CcwDevice {
+	return endpoint.CCWDevice
+}
+
+// SetCcwDevice sets the CCW device of the endpoint.
+func (endpoint *TuntapEndpoint) SetCcwDevice(ccwDev vcTypes.CcwDevice) {
+	endpoint.CCWDevice = &ccwDev
 }
 
 // NetworkPair returns the network pair of the endpoint.
@@ -103,13 +114,14 @@ func (endpoint *TuntapEndpoint) Detach(ctx context.Context, netNsCreated bool, n
 }
 
 // HotAttach for the tun/tap endpoint uses hot plug device
-func (endpoint *TuntapEndpoint) HotAttach(ctx context.Context, h Hypervisor) error {
+func (endpoint *TuntapEndpoint) HotAttach(ctx context.Context, s *Sandbox) error {
 	networkLogger().Info("Hot attaching tun/tap endpoint")
 
 	span, ctx := tuntapTrace(ctx, "HotAttach", endpoint)
 	defer span.End()
 
-	if err := tuntapNetwork(endpoint, h.HypervisorConfig().NumVCPUs, h.HypervisorConfig().DisableVhostNet); err != nil {
+	h := s.hypervisor
+	if err := tuntapNetwork(endpoint, h.HypervisorConfig().NumVCPUs(), h.HypervisorConfig().DisableVhostNet); err != nil {
 		networkLogger().WithError(err).Error("Error bridging tun/tap ep")
 		return err
 	}
@@ -122,7 +134,7 @@ func (endpoint *TuntapEndpoint) HotAttach(ctx context.Context, h Hypervisor) err
 }
 
 // HotDetach for the tun/tap endpoint uses hot pull device
-func (endpoint *TuntapEndpoint) HotDetach(ctx context.Context, h Hypervisor, netNsCreated bool, netNsPath string) error {
+func (endpoint *TuntapEndpoint) HotDetach(ctx context.Context, s *Sandbox, netNsCreated bool, netNsPath string) error {
 	networkLogger().Info("Hot detaching tun/tap endpoint")
 
 	span, ctx := tuntapTrace(ctx, "HotDetach", endpoint)
@@ -134,6 +146,7 @@ func (endpoint *TuntapEndpoint) HotDetach(ctx context.Context, h Hypervisor, net
 		networkLogger().WithError(err).Warn("Error un-bridging tun/tap ep")
 	}
 
+	h := s.hypervisor
 	if _, err := h.HotplugRemoveDevice(ctx, endpoint, NetDev); err != nil {
 		networkLogger().WithError(err).Error("Error detach tun/tap ep")
 		return err
@@ -157,7 +170,7 @@ func createTuntapNetworkEndpoint(idx int, ifName string, hwName net.HardwareAddr
 			Name: fmt.Sprintf("eth%d", idx),
 			TAPIface: NetworkInterface{
 				Name:     fmt.Sprintf("tap%d_kata", idx),
-				HardAddr: fmt.Sprintf("%s", hwName), //nolint:gosimple
+				HardAddr: hwName.String(),
 			},
 		},
 		EndpointType: TuntapEndpointType,

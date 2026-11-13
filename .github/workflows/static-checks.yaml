@@ -5,6 +5,9 @@ on:
       - edited
       - reopened
       - synchronize
+  workflow_dispatch:
+
+permissions: {}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -12,19 +15,30 @@ concurrency:
 
 name: Static checks
 jobs:
+  skipper:
+    uses: ./.github/workflows/gatekeeper-skipper.yaml
+    with:
+      commit-hash: ${{ github.event.pull_request.head.sha }}
+      target-branch: ${{ github.event.pull_request.base.ref }}
+
   check-kernel-config-version:
-    runs-on: ubuntu-latest
+    name: check-kernel-config-version
+    needs: skipper
+    if: ${{ needs.skipper.outputs.skip_static != 'yes' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - name: Checkout the code
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
       - name: Ensure the kernel config version has been updated
         run: |
           kernel_dir="tools/packaging/kernel/"
           kernel_version_file="${kernel_dir}kata_config_version"
-          modified_files=$(git diff --name-only origin/$GITHUB_BASE_REF..HEAD)
-          if git diff --name-only origin/$GITHUB_BASE_REF..HEAD "${kernel_dir}" | grep "${kernel_dir}"; then
+          modified_files=$(git diff --name-only origin/"$GITHUB_BASE_REF"..HEAD)
+          if git diff --name-only origin/"$GITHUB_BASE_REF"..HEAD "${kernel_dir}" | grep "${kernel_dir}"; then
             echo "Kernel directory has changed, checking if $kernel_version_file has been updated"
             if echo "$modified_files" | grep -v "README.md" | grep "${kernel_dir}" >>"/dev/null"; then
               echo "$modified_files" | grep "$kernel_version_file" >>/dev/null || ( echo "Please bump version in $kernel_version_file" && exit 1)
@@ -35,95 +49,18 @@ jobs:
           fi
 
   build-checks:
-    runs-on: ubuntu-20.04
-    strategy:
-      fail-fast: false
-      matrix:
-        component:
-          - agent
-          - dragonball
-          - runtime
-          - runtime-rs
-          - agent-ctl
-          - kata-ctl
-          - log-parser-rs
-          - runk
-          - trace-forwarder
-        command:
-          - "make vendor"
-          - "make check"
-          - "make test"
-          - "sudo -E PATH=\"$PATH\" make test"
-        include:
-          - component: agent
-            component-path: src/agent
-          - component: dragonball
-            component-path: src/dragonball
-          - component: runtime
-            component-path: src/runtime
-          - component: runtime-rs
-            component-path: src/runtime-rs
-          - component: agent-ctl
-            component-path: src/tools/agent-ctl
-          - component: kata-ctl
-            component-path: src/tools/kata-ctl
-          - component: log-parser-rs
-            component-path: src/tools/log-parser-rs
-          - component: runk
-            component-path: src/tools/runk
-          - component: trace-forwarder
-            component-path: src/tools/trace-forwarder
-          - install-libseccomp: no
-          - component: agent
-            install-libseccomp: yes
-          - component: runk
-            install-libseccomp: yes
-    steps:
-      - name: Checkout the code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Install yq
-        run: |
-          ./ci/install_yq.sh
-        env:
-          INSTALL_IN_GOPATH: false
-      - name: Install golang
-        if: ${{ matrix.component == 'runtime' }}
-        run: |
-          ./tests/install_go.sh -f -p
-          echo "/usr/local/go/bin" >> $GITHUB_PATH
-      - name: Install rust
-        if: ${{ matrix.component != 'runtime' }}
-        run: |
-          ./tests/install_rust.sh
-          echo "${HOME}/.cargo/bin" >> $GITHUB_PATH
-      - name: Install musl-tools
-        if: ${{ matrix.component != 'runtime' }}
-        run: sudo apt-get -y install musl-tools
-      - name: Install libseccomp
-        if: ${{ matrix.command != 'make vendor'  &&  matrix.command != 'make check' &&  matrix.install-libseccomp == 'yes' }}
-        run: |
-          libseccomp_install_dir=$(mktemp -d -t libseccomp.XXXXXXXXXX)
-          gperf_install_dir=$(mktemp -d -t gperf.XXXXXXXXXX)
-          ./ci/install_libseccomp.sh "${libseccomp_install_dir}" "${gperf_install_dir}"
-          echo "Set environment variables for the libseccomp crate to link the libseccomp library statically"
-          echo "LIBSECCOMP_LINK_TYPE=static" >> $GITHUB_ENV
-          echo "LIBSECCOMP_LIB_PATH=${libseccomp_install_dir}/lib" >> $GITHUB_ENV
-      - name: Setup XDG_RUNTIME_DIR for the `runtime` tests
-        if: ${{ matrix.command != 'make vendor' && matrix.command != 'make check' && matrix.component == 'runtime' }}
-        run: |
-          XDG_RUNTIME_DIR=$(mktemp -d /tmp/kata-tests-$USER.XXX | tee >(xargs chmod 0700))
-          echo "XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}" >> $GITHUB_ENV
-      - name: Running `${{ matrix.command }}` for ${{ matrix.component }}
-        run: |
-          cd ${{ matrix.component-path }}
-          ${{ matrix.command }}
-        env:
-          RUST_BACKTRACE: "1"
+    needs: skipper
+    if: ${{ needs.skipper.outputs.skip_static != 'yes' }}
+    uses: ./.github/workflows/build-checks.yaml
+    with:
+      instance: ubuntu-24.04
 
   build-checks-depending-on-kvm:
-    runs-on: garm-ubuntu-2004-smaller
+    name: build-checks-depending-on-kvm
+    runs-on: ubuntu-24.04
+    timeout-minutes: 130
+    needs: skipper
+    if: ${{ needs.skipper.outputs.skip_static != 'yes' }}
     strategy:
       fail-fast: false
       matrix:
@@ -136,12 +73,13 @@ jobs:
             component-path: src/dragonball
     steps:
       - name: Checkout the code
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
       - name: Install system deps
         run: |
-          sudo apt-get install -y build-essential musl-tools
+          sudo apt-get update && sudo apt-get install -y build-essential musl-tools
       - name: Install yq
         run: |
           sudo -E ./ci/install_yq.sh
@@ -154,13 +92,45 @@ jobs:
       - name: Running `${{ matrix.command }}` for ${{ matrix.component }}
         run: |
           export PATH="$PATH:${HOME}/.cargo/bin"
-          cd ${{ matrix.component-path }}
-          ${{ matrix.command }}
+          cd "${COMPONENT_PATH}"
+          eval "${COMMAND}"
         env:
+          COMMAND: ${{ matrix.command }}
+          COMPONENT_PATH: ${{ matrix.component-path }}
           RUST_BACKTRACE: "1"
+          RUST_LIB_BACKTRACE: "0"
+
+  kata-deploy-binary-build-check:
+    name: kata-deploy-binary-build-check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    needs: skipper
+    if: ${{ needs.skipper.outputs.skip_static != 'yes' }}
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install rust
+        run: |
+          export PATH="$PATH:/usr/local/bin"
+          ./tests/install_rust.sh
+      - name: Run kata-deploy rust checks
+        run: |
+          export PATH="$PATH:${HOME}/.cargo/bin"
+          cargo fmt -p kata-deploy --check
+          cargo clippy -p kata-deploy --all-targets --all-features -- -D warnings
+          RUSTFLAGS="-D warnings" cargo test -p kata-deploy -- --test-threads=1
 
   static-checks:
-    runs-on: ubuntu-20.04
+    name: static-checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    needs: skipper
+    if: ${{ needs.skipper.outputs.skip_static != 'yes' }}
     strategy:
       fail-fast: false
       matrix:
@@ -168,27 +138,255 @@ jobs:
           - "make static-checks"
     env:
       GOPATH: ${{ github.workspace }}
+    permissions:
+      contents: read  # for checkout
+      packages: write # for push to ghcr.io
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
           path: ./src/github.com/${{ github.repository }}
       - name: Install yq
         run: |
-          cd ${GOPATH}/src/github.com/${{ github.repository }}
+          cd "${GOPATH}/src/github.com/${GITHUB_REPOSITORY}"
           ./ci/install_yq.sh
         env:
           INSTALL_IN_GOPATH: false
-      - name: Install golang
+      - name: Read properties from versions.yaml
         run: |
-          cd ${GOPATH}/src/github.com/${{ github.repository }}
-          ./tests/install_go.sh -f -p
-          echo "/usr/local/go/bin" >> $GITHUB_PATH
+          cd "${GOPATH}/src/github.com/${GITHUB_REPOSITORY}"
+          go_version="$(yq '.languages.golang.version' versions.yaml)"
+          [ -n "$go_version" ]
+          echo "GO_VERSION=${go_version}" >> "$GITHUB_ENV"
+          oras_version="$(yq '.externals.oras.version' versions.yaml)"
+          [ -n "$oras_version" ]
+          echo "ORAS_VERSION=${oras_version}" >> "$GITHUB_ENV"
+      - name: Setup Golang version ${{ env.GO_VERSION }}
+        uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6.2.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
       - name: Install system dependencies
         run: |
-          sudo apt-get -y install moreutils hunspell pandoc
-      - name: Run check
+          sudo apt-get update && sudo apt-get -y install moreutils
+      - name: Install oras
+        uses: oras-project/setup-oras@5e2f2482b30b0cb3e14e67f89a80c88c659a7c63 # v2.0.3
+        with:
+          version: ${{ env.ORAS_VERSION }}
+      - name: Install open-policy-agent
         run: |
-          export PATH=${PATH}:${GOPATH}/bin
-          cd ${GOPATH}/src/github.com/${{ github.repository }} && ${{ matrix.cmd }}
+          cd "${GOPATH}/src/github.com/${GITHUB_REPOSITORY}"
+          ./tests/install_opa.sh
+      - name: Install regorus
+        env:
+          ARTEFACT_REPOSITORY: "${{ github.repository }}"
+          ARTEFACT_REGISTRY_USERNAME: "${{ github.actor }}"
+          ARTEFACT_REGISTRY_PASSWORD: "${{ secrets.GITHUB_TOKEN }}"
+        run: |
+          "${GOPATH}/src/github.com/${GITHUB_REPOSITORY}/tests/install_regorus.sh"
+      - name: Run check
+        env:
+          CMD: ${{ matrix.cmd }}
+        run: |
+          export PATH="${PATH}:${GOPATH}/bin"
+          cd "${GOPATH}/src/github.com/${GITHUB_REPOSITORY}" && ${CMD}
+
+  govulncheck:
+    needs: skipper
+    if: ${{ needs.skipper.outputs.skip_static != 'yes' }}
+    uses: ./.github/workflows/govulncheck.yaml
+
+  codegen:
+    name: codegen
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    needs: skipper
+    if: ${{ needs.skipper.outputs.skip_static != 'yes' }}
+    permissions:
+      contents: read  # for checkout
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: generate
+        run: make -C src/agent generate-protocols
+      - name: check for diff
+        run: |
+          diff=$(git diff)
+          if [[ -z "${diff}" ]]; then
+            echo "No diff detected."
+            exit 0
+          fi
+
+          cat << EOF >> "${GITHUB_STEP_SUMMARY}"
+          Run \`make -C src/agent generate-protocols\` to update protobuf bindings.
+
+          \`\`\`diff
+          ${diff}
+          \`\`\`
+          EOF
+
+          echo "::error::Golang protobuf bindings need to be regenerated (see Github step summary for diff)."
+          exit 1
+
+  go-mod-tidy:
+    name: go-mod-tidy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    needs: skipper
+    if: ${{ needs.skipper.outputs.skip_static != 'yes' }}
+    permissions:
+      contents: read  # for checkout
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check if Go-related files changed
+        id: check_go_changes
+        run: |
+          if [[ -z "${GITHUB_BASE_REF}" ]]; then
+            echo "run_go_mod_tidy=true" >> "${GITHUB_OUTPUT}"
+            echo "Called from workflow_dispatch, will run go mod tidy check"
+            exit 0
+          fi
+          modified_files=$(git diff --name-only origin/"${GITHUB_BASE_REF}"..HEAD)
+          if echo "${modified_files}" | grep -E '\.(go|mod|sum)$|^versions\.yaml$' > /dev/null; then
+            echo "run_go_mod_tidy=true" >> "${GITHUB_OUTPUT}"
+            echo "Go-related files changed, will run go mod tidy check"
+          else
+            echo "run_go_mod_tidy=false" >> "${GITHUB_OUTPUT}"
+            echo "No Go-related files changed, skipping go mod tidy check"
+          fi
+      - name: Install yq
+        if: steps.check_go_changes.outputs.run_go_mod_tidy == 'true'
+        run: ./ci/install_yq.sh
+        env:
+          INSTALL_IN_GOPATH: false
+      - name: Read properties from versions.yaml
+        if: steps.check_go_changes.outputs.run_go_mod_tidy == 'true'
+        run: |
+          go_version="$(yq '.languages.golang.version' versions.yaml)"
+          [ -n "${go_version}" ]
+          echo "GO_VERSION=${go_version}" >> "${GITHUB_ENV}"
+      - name: Setup Golang version ${{ env.GO_VERSION }}
+        if: steps.check_go_changes.outputs.run_go_mod_tidy == 'true'
+        uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6.2.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Run go mod tidy
+        if: steps.check_go_changes.outputs.run_go_mod_tidy == 'true'
+        run: |
+          # Run go mod tidy in all directories with go.mod files
+          mapfile -t go_mod_dirs < <(find . -name 'go.mod' -exec dirname {} \;)
+          for dir in "${go_mod_dirs[@]}"; do
+            echo "Running go mod tidy in ${dir}"
+            (cd "${dir}" && go mod tidy)
+          done
+      - name: Check for diff
+        if: steps.check_go_changes.outputs.run_go_mod_tidy == 'true'
+        run: |
+          diff=$(git diff)
+          if [[ -z "${diff}" ]]; then
+            echo "No diff detected."
+            exit 0
+          fi
+
+          cat << EOF >> "${GITHUB_STEP_SUMMARY}"
+          Run \`go mod tidy\` in the affected modules to update go.mod and go.sum files.
+
+          \`\`\`diff
+          ${diff}
+          \`\`\`
+          EOF
+
+          echo "::error::Go modules are not up-to-date (see Github step summary for diff)."
+          exit 1
+
+  check-agent-policy-coverage:
+    name: check-agent-policy-coverage
+    needs: skipper
+    if: ${{ needs.skipper.outputs.skip_static != 'yes' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout the code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check agent policy coverage
+        run: bash ci/check_agent_policy_coverage.sh
+
+  check-broken-symlinks:
+    name: check-broken-symlinks
+    needs: skipper
+    if: ${{ needs.skipper.outputs.skip_static != 'yes' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout the code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check for broken symbolic links
+        run: bash ci/check_broken_symlinks.sh
+
+  check-nvrc-is-released:
+    name: check-nvrc-is-released
+    needs: skipper
+    if: ${{ needs.skipper.outputs.skip_static != 'yes' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout the code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Ensure NVRC is pinned to a published release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash ci/check_nvrc_is_released.sh
+
+  msrv-check:
+    name: msrv-check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    needs: skipper
+    if: ${{ needs.skipper.outputs.skip_static != 'yes' }}
+    steps:
+      - name: Checkout the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get -y install build-essential clang libdevmapper-dev libseccomp-dev libssl-dev protobuf-compiler
+      - name: Read MSRV from Cargo.toml
+        run: |
+          msrv="$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)"
+          [ -n "${msrv}" ]
+          echo "MSRV=${msrv}" >> "$GITHUB_ENV"
+      - name: Install Rust ${{ env.MSRV }}
+        run: rustup toolchain install "${MSRV}" --profile minimal
+      # These sources are generated from *.in templates by the component
+      # Makefiles and are not checked in, so cargo cannot build without them.
+      - name: Generate sources
+        run: |
+          make -C src/agent src/version.rs
+          make -C src/runtime-rs crates/shim/src/config.rs
+          make -C src/tools/genpolicy src/version.rs
+          make -C src/tools/kata-ctl src/ops/version.rs
+      - name: Cargo check with Rust ${{ env.MSRV }}
+        run: |
+          rustc --version
+          cargo check --workspace --all-targets --locked
+        env:
+          RUSTUP_TOOLCHAIN: ${{ env.MSRV }}

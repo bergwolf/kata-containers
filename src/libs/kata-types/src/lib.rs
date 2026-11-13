@@ -6,6 +6,7 @@
 //! Constants and Data Types shared by Kata Containers components.
 
 #![deny(missing_docs)]
+
 #[macro_use]
 extern crate slog;
 #[macro_use]
@@ -23,6 +24,12 @@ pub mod container;
 /// Constants and data types related to CPU.
 pub mod cpu;
 
+/// Contants and data types related to device.
+pub mod device;
+
+/// Constants and data types related to handler.
+pub mod handler;
+
 /// Constants and data types related to Kubernetes/kubelet.
 pub mod k8s;
 
@@ -33,6 +40,33 @@ pub(crate) mod utils;
 
 /// hypervisor capabilities
 pub mod capabilities;
+
+/// Filesystem-related constants
+pub mod fs;
+
+/// The Initdata specification defines the key data structures and algorithms for injecting
+/// any well-defined data from an untrusted host into a TEE (Trusted Execution Environment).
+pub mod initdata;
+
+/// rootless vmm
+pub mod rootless;
+
+/// machine type
+pub mod machine_type;
+
+/// GPT (GUID Partition Table) disk layout and metadata generation.
+pub mod gpt_disk;
+
+/// dm-verity related constants and data types.
+#[cfg(feature = "devicemapper")]
+pub mod dmverity;
+
+/// VMDK (Virtual Machine Disk) types and utilities
+pub mod vmdk;
+
+use std::path::Path;
+
+use crate::rootless::{is_rootless, rootless_dir};
 
 /// Common error codes.
 #[derive(thiserror::Error, Debug)]
@@ -50,25 +84,13 @@ macro_rules! sl {
     };
 }
 
-/// Helper to create std::io::Error(std::io::ErrorKind::Other)
-#[macro_export]
-macro_rules! eother {
-    () => (std::io::Error::new(std::io::ErrorKind::Other, ""));
-    ($fmt:expr) => ({
-        std::io::Error::new(std::io::ErrorKind::Other, format!($fmt))
-    });
-    ($fmt:expr, $($arg:tt)*) => ({
-        std::io::Error::new(std::io::ErrorKind::Other, format!($fmt, $($arg)*))
-    });
-}
-
 /// Resolve a path to its final value.
 #[macro_export]
 macro_rules! resolve_path {
     ($field:expr, $fmt:expr) => {{
         if !$field.is_empty() {
             match Path::new(&$field).canonicalize() {
-                Err(e) => Err(eother!($fmt, &$field, e)),
+                Err(e) => Err(std::io::Error::other(format!($fmt, &$field, e))),
                 Ok(path) => {
                     $field = path.to_string_lossy().to_string();
                     Ok(())
@@ -87,10 +109,30 @@ macro_rules! validate_path {
         if !$field.is_empty() {
             Path::new(&$field)
                 .canonicalize()
-                .map_err(|e| eother!($fmt, &$field, e))
+                .map_err(|e| std::io::Error::other(format!($fmt, &$field, e)))
                 .map(|_| ())
         } else {
             Ok(())
         }
     }};
+}
+
+/// Prefix a path with the VMM's rootless runtime directory.
+///
+/// The path is returned unchanged when the VMM is not running rootless.
+pub fn prefix_with_rootless_dir(path: &str) -> String {
+    if is_rootless() {
+        let path = Path::new(path);
+        let path = if path.is_absolute() {
+            path.strip_prefix("/").unwrap_or(path)
+        } else {
+            path
+        };
+        Path::new(&rootless_dir())
+            .join(path)
+            .to_string_lossy()
+            .to_string()
+    } else {
+        path.to_string()
+    }
 }

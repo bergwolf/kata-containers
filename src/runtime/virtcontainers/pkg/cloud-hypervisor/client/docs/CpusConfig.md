@@ -4,13 +4,15 @@
 
 Name | Type | Description | Notes
 ------------ | ------------- | ------------- | -------------
-**BootVcpus** | **int32** |  | [default to 1]
-**MaxVcpus** | **int32** |  | [default to 1]
+**BootVcpus** | **int32** |  | 
+**MaxVcpus** | **int32** |  | 
 **Topology** | Pointer to [**CpuTopology**](CpuTopology.md) |  | [optional] 
 **KvmHyperv** | Pointer to **bool** |  | [optional] [default to false]
 **MaxPhysBits** | Pointer to **int32** |  | [optional] 
+**Nested** | Pointer to **bool** |  | [optional] [default to false]
 **Affinity** | Pointer to [**[]CpuAffinity**](CpuAffinity.md) |  | [optional] 
 **Features** | Pointer to [**CpuFeatures**](CpuFeatures.md) |  | [optional] 
+**CoreScheduling** | Pointer to [**CoreSchedulingMode**](CoreSchedulingMode.md) |  | [optional] [default to CORESCHEDULINGMODE_VM]
 
 ## Methods
 
@@ -146,6 +148,31 @@ SetMaxPhysBits sets MaxPhysBits field to given value.
 
 HasMaxPhysBits returns a boolean if a field has been set.
 
+### GetNested
+
+`func (o *CpusConfig) GetNested() bool`
+
+GetNested returns the Nested field if non-nil, zero value otherwise.
+
+### GetNestedOk
+
+`func (o *CpusConfig) GetNestedOk() (*bool, bool)`
+
+GetNestedOk returns a tuple with the Nested field if it's non-nil, zero value otherwise
+and a boolean to check if the value has been set.
+
+### SetNested
+
+`func (o *CpusConfig) SetNested(v bool)`
+
+SetNested sets Nested field to given value.
+
+### HasNested
+
+`func (o *CpusConfig) HasNested() bool`
+
+HasNested returns a boolean if a field has been set.
+
 ### GetAffinity
 
 `func (o *CpusConfig) GetAffinity() []CpuAffinity`
@@ -195,6 +222,31 @@ SetFeatures sets Features field to given value.
 `func (o *CpusConfig) HasFeatures() bool`
 
 HasFeatures returns a boolean if a field has been set.
+
+### GetCoreScheduling
+
+`func (o *CpusConfig) GetCoreScheduling() CoreSchedulingMode`
+
+GetCoreScheduling returns the CoreScheduling field if non-nil, zero value otherwise.
+
+### GetCoreSchedulingOk
+
+`func (o *CpusConfig) GetCoreSchedulingOk() (*CoreSchedulingMode, bool)`
+
+GetCoreSchedulingOk returns a tuple with the CoreScheduling field if it's non-nil, zero value otherwise
+and a boolean to check if the value has been set.
+
+### SetCoreScheduling
+
+`func (o *CpusConfig) SetCoreScheduling(v CoreSchedulingMode)`
+
+SetCoreScheduling sets CoreScheduling field to given value.
+
+### HasCoreScheduling
+
+`func (o *CpusConfig) HasCoreScheduling() bool`
+
+HasCoreScheduling returns a boolean if a field has been set.
 
 
 [[Back to Model list]](../README.md#documentation-for-models) [[Back to API list]](../README.md#documentation-for-api-endpoints) [[Back to README]](../README.md)

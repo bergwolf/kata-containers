@@ -14,18 +14,19 @@ mod log_forwarder;
 mod sock;
 pub mod types;
 pub use types::{
-    ARPNeighbor, ARPNeighbors, AddArpNeighborRequest, BlkioStatsEntry, CheckRequest,
-    CloseStdinRequest, ContainerID, ContainerProcessID, CopyFileRequest, CreateContainerRequest,
-    CreateSandboxRequest, Empty, ExecProcessRequest, GetGuestDetailsRequest, GetIPTablesRequest,
-    GetIPTablesResponse, GuestDetailsResponse, HealthCheckResponse, IPAddress, IPFamily, Interface,
-    Interfaces, ListProcessesRequest, MemHotplugByProbeRequest, MetricsResponse,
-    OnlineCPUMemRequest, OomEventResponse, ReadStreamRequest, ReadStreamResponse,
-    RemoveContainerRequest, ReseedRandomDevRequest, ResizeVolumeRequest, Route, Routes,
-    SetGuestDateTimeRequest, SetIPTablesRequest, SetIPTablesResponse, SignalProcessRequest,
-    StatsContainerResponse, Storage, TtyWinResizeRequest, UpdateContainerRequest,
-    UpdateInterfaceRequest, UpdateRoutesRequest, VersionCheckResponse, VolumeStatsRequest,
-    VolumeStatsResponse, WaitProcessRequest, WaitProcessResponse, WriteStreamRequest,
-    WriteStreamResponse,
+    ARPNeighbor, ARPNeighbors, AddArpNeighborRequest, AddSwapPathRequest, AddSwapRequest,
+    BlkioStatsEntry, CheckRequest, CloseStdinRequest, ContainerID, ContainerProcessID,
+    CopyFileRequest, CreateContainerRequest, CreateSandboxRequest, Empty, ExecProcessRequest,
+    FSGroup, FSGroupChangePolicy, GetDiagnosticDataRequest, GetDiagnosticDataResponse,
+    GetGuestDetailsRequest, GetIPTablesRequest, GetIPTablesResponse, GuestDetailsResponse,
+    HealthCheckResponse, IPAddress, IPFamily, Interface, Interfaces, ListProcessesRequest,
+    MemHotplugByProbeRequest, MetricsResponse, OnlineCPUMemRequest, OomEventResponse,
+    ReadStreamRequest, ReadStreamResponse, RemoveContainerRequest, ReseedRandomDevRequest,
+    ResizeVolumeRequest, Route, Routes, SetGuestDateTimeRequest, SetIPTablesRequest,
+    SetIPTablesResponse, SignalProcessRequest, StatsContainerResponse, Storage,
+    TtyWinResizeRequest, UpdateContainerRequest, UpdateInterfaceRequest, UpdateRoutesRequest,
+    VersionCheckResponse, VolumeStatsRequest, VolumeStatsResponse, WaitProcessRequest,
+    WaitProcessResponse, WriteStreamRequest, WriteStreamResponse,
 };
 
 use anyhow::Result;
@@ -33,12 +34,15 @@ use async_trait::async_trait;
 
 use kata_types::config::Agent as AgentConfig;
 
+use crate::types::SetPolicyRequest;
+
 pub const AGENT_KATA: &str = "kata";
 
 #[async_trait]
 pub trait AgentManager: Send + Sync {
     async fn start(&self, address: &str) -> Result<()>;
     async fn stop(&self);
+    async fn disconnect(&self) -> Result<()>;
 
     async fn agent_sock(&self) -> Result<String>;
     async fn agent_config(&self) -> AgentConfig;
@@ -56,6 +60,8 @@ pub trait Agent: AgentManager + HealthService + Send + Sync {
     async fn create_sandbox(&self, req: CreateSandboxRequest) -> Result<Empty>;
     async fn destroy_sandbox(&self, req: Empty) -> Result<Empty>;
     async fn online_cpu_mem(&self, req: OnlineCPUMemRequest) -> Result<Empty>;
+    async fn reseed_random_dev(&self, req: ReseedRandomDevRequest) -> Result<Empty>;
+    async fn set_guest_date_time(&self, req: SetGuestDateTimeRequest) -> Result<Empty>;
 
     // network
     async fn add_arp_neighbors(&self, req: AddArpNeighborRequest) -> Result<Empty>;
@@ -93,4 +99,14 @@ pub trait Agent: AgentManager + HealthService + Send + Sync {
     async fn set_ip_tables(&self, req: SetIPTablesRequest) -> Result<SetIPTablesResponse>;
     async fn get_volume_stats(&self, req: VolumeStatsRequest) -> Result<VolumeStatsResponse>;
     async fn resize_volume(&self, req: ResizeVolumeRequest) -> Result<Empty>;
+    async fn get_guest_details(&self, req: GetGuestDetailsRequest) -> Result<GuestDetailsResponse>;
+    async fn add_swap(&self, req: AddSwapRequest) -> Result<Empty>;
+    async fn add_swap_path(&self, req: AddSwapPathRequest) -> Result<Empty>;
+    async fn set_policy(&self, req: SetPolicyRequest) -> Result<Empty>;
+
+    // diagnostics
+    async fn get_diagnostic_data(
+        &self,
+        req: GetDiagnosticDataRequest,
+    ) -> Result<GetDiagnosticDataResponse>;
 }

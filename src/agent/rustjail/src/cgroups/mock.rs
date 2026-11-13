@@ -6,14 +6,20 @@
 use protobuf::MessageField;
 
 use crate::cgroups::Manager as CgroupManager;
+use crate::cgroups_rs as cgroups;
 use crate::protocols::agent::{BlkioStats, CgroupStats, CpuStats, MemoryStats, PidsStats};
 use anyhow::Result;
 use cgroups::freezer::FreezerState;
 use libc::{self, pid_t};
-use oci::LinuxResources;
+use oci::{LinuxResources, Spec};
+use oci_spec::runtime as oci;
+use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::collections::HashMap;
 use std::string::String;
+use std::sync::{Arc, RwLock};
+
+use super::DevicesCgroupInfo;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Manager {
@@ -46,7 +52,7 @@ impl CgroupManager for Manager {
         Ok(())
     }
 
-    fn destroy(&mut self) -> Result<()> {
+    fn destroy(&self) -> Result<()> {
         Ok(())
     }
 
@@ -72,7 +78,11 @@ impl CgroupManager for Manager {
 }
 
 impl Manager {
-    pub fn new(cpath: &str) -> Result<Self> {
+    pub fn new(
+        cpath: &str,
+        _spec: &Spec,
+        _devcg_info: Option<Arc<RwLock<DevicesCgroupInfo>>>,
+    ) -> Result<Self> {
         Ok(Self {
             paths: HashMap::new(),
             mounts: HashMap::new(),

@@ -10,6 +10,7 @@ use std::{
     fmt, io,
     io::{Read, Result, Write},
     mem,
+    os::fd::BorrowedFd,
     os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd},
     pin::Pin,
     task::{Context, Poll},
@@ -28,7 +29,8 @@ struct StreamFd(RawFd);
 
 impl io::Read for &StreamFd {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match unistd::read(self.0, buf) {
+        let borrowed_fd = unsafe { BorrowedFd::borrow_raw(self.0) };
+        match unistd::read(borrowed_fd, buf) {
             Ok(l) => Ok(l),
             Err(e) => Err(e.into()),
         }
@@ -37,7 +39,8 @@ impl io::Read for &StreamFd {
 
 impl io::Write for &StreamFd {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match unistd::write(self.0, buf) {
+        let borrowed_fd = unsafe { BorrowedFd::borrow_raw(self.0) };
+        match unistd::write(borrowed_fd, buf) {
             Ok(l) => Ok(l),
             Err(e) => Err(e.into()),
         }
@@ -74,7 +77,9 @@ pub struct PipeStream(AsyncFd<StreamFd>);
 impl PipeStream {
     pub fn new(fd: RawFd) -> Result<Self> {
         set_nonblocking(fd);
-        Ok(Self(AsyncFd::new(StreamFd(fd))?))
+        // SAFETY: StreamFd owns fd, keeps it open until it is dropped, and
+        // as_raw_fd() always returns the same fd.
+        Ok(Self(unsafe { AsyncFd::register(StreamFd(fd))? }))
     }
 
     pub fn from_fd(fd: RawFd) -> Self {
@@ -177,19 +182,21 @@ mod tests {
     #[tokio::test]
     // Shutdown should never close the inner fd.
     async fn test_pipestream_shutdown() {
-        let (_, wfd1) = unistd::pipe2(OFlag::O_CLOEXEC).unwrap();
-        let mut writer1 = PipeStream::new(wfd1).unwrap();
+        // Keep the read end open so the write descriptor is reused only if
+        // shutdown() incorrectly closes it.
+        let (_rfd1, wfd1) = unistd::pipe2(OFlag::O_CLOEXEC).unwrap();
+        let mut writer1 = PipeStream::new(wfd1.into_raw_fd()).unwrap();
 
         // if close fd in shutdown, the fd will be reused
         // and the test will failed
-        let _ = writer1.shutdown().await.unwrap();
+        writer1.shutdown().await.unwrap();
 
         // let _ = unistd::close(wfd1);
 
         let (rfd2, wfd2) = unistd::pipe2(OFlag::O_CLOEXEC).unwrap(); // reuse fd number, rfd2 == wfd1
 
-        let mut reader2 = PipeStream::new(rfd2).unwrap();
-        let mut writer2 = PipeStream::new(wfd2).unwrap();
+        let mut reader2 = PipeStream::new(rfd2.into_raw_fd()).unwrap();
+        let mut writer2 = PipeStream::new(wfd2.into_raw_fd()).unwrap();
 
         // deregister writer1, then reader2 which has the same fd will be deregistered from epoll
         drop(writer1);

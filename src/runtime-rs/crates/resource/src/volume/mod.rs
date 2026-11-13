@@ -4,31 +4,44 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+pub(crate) mod block_emptydir_volume;
 mod block_volume;
 mod default_volume;
+mod ephemeral_volume;
 pub mod hugepage;
+mod local_volume;
 mod share_fs_volume;
 mod shm_volume;
 pub mod utils;
 
-pub mod vfio_volume;
-use vfio_volume::is_vfio_volume;
-
-pub mod spdk_volume;
-use spdk_volume::is_spdk_volume;
+pub mod direct_volume;
+use crate::volume::{direct_volume::is_direct_volume, share_fs_volume::VolumeManager};
+pub mod direct_volumes;
+pub use block_emptydir_volume::EphemeralDiskInfo;
 
 use std::{sync::Arc, vec::Vec};
-
-use anyhow::{Context, Result};
-use async_trait::async_trait;
-use tokio::sync::RwLock;
 
 use self::hugepage::{get_huge_page_limits_map, get_huge_page_option};
 use crate::{share_fs::ShareFs, volume::block_volume::is_block_volume};
 use agent::Agent;
+use anyhow::{Context, Result};
+use async_trait::async_trait;
 use hypervisor::device::device_manager::DeviceManager;
+use kata_sys_util::{k8s::is_disk_empty_dir, mount::get_mount_options};
+use oci_spec::runtime as oci;
+use tokio::sync::RwLock;
 
 const BIND: &str = "bind";
+
+pub struct VolumeContext<'a> {
+    pub share_fs: &'a Option<Arc<dyn ShareFs>>,
+    pub d: &'a RwLock<DeviceManager>,
+    pub sid: &'a str,
+    pub agent: Arc<dyn Agent>,
+    pub emptydir_mode: &'a str,
+    pub fs_sharing_supported: bool,
+    pub block_device_discard_supported: bool,
+}
 
 #[async_trait]
 pub trait Volume: Send + Sync {
@@ -41,58 +54,118 @@ pub trait Volume: Send + Sync {
 #[derive(Default)]
 pub struct VolumeResourceInner {
     volumes: Vec<Arc<dyn Volume>>,
+    ephemeral_disks: block_emptydir_volume::EphemeralDisks,
 }
 
 #[derive(Default)]
 pub struct VolumeResource {
     inner: Arc<RwLock<VolumeResourceInner>>,
+    // The core purpose of introducing `volume_manager` to `VolumeResource` is to centralize the management of shared file system volumes.
+    // By creating a single VolumeManager instance within VolumeResource, all shared file volumes are managed by one central entity.
+    // This single volume_manager can accurately track the references of all ShareFsVolume instances to the shared volumes,
+    // ensuring correct reference counting, proper volume lifecycle management, and preventing issues like volumes being overwritten.
+    volume_manager: Arc<VolumeManager>,
 }
 
 impl VolumeResource {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            inner: Arc::new(RwLock::new(VolumeResourceInner::default())),
+            volume_manager: Arc::new(VolumeManager::new()),
+        }
     }
 
     pub async fn handler_volumes(
         &self,
-        share_fs: &Option<Arc<dyn ShareFs>>,
+        ctx: &VolumeContext<'_>,
         cid: &str,
         spec: &oci::Spec,
-        d: &RwLock<DeviceManager>,
-        sid: &str,
-        agent: Arc<dyn Agent>,
     ) -> Result<Vec<Arc<dyn Volume>>> {
-        let mut volumes: Vec<Arc<dyn Volume>> = vec![];
-        let oci_mounts = &spec.mounts;
+        let mut volumes = vec![];
+        if let Err(e) = self.add_volumes(ctx, cid, spec, &mut volumes).await {
+            // On error the caller never receives these volumes and cannot clean them up.
+            for v in volumes.iter().rev() {
+                if let Err(err) = v.cleanup(ctx.d).await {
+                    warn!(sl!(), "failed to clean up volume: {:?}", err);
+                }
+            }
+            return Err(e);
+        }
+        Ok(volumes)
+    }
+
+    async fn add_volumes(
+        &self,
+        ctx: &VolumeContext<'_>,
+        cid: &str,
+        spec: &oci::Spec,
+        volumes: &mut Vec<Arc<dyn Volume>>,
+    ) -> Result<()> {
+        let share_fs = ctx.share_fs;
+        let d = ctx.d;
+        let sid = ctx.sid;
+        let emptydir_mode = ctx.emptydir_mode;
+        let fs_sharing_supported = ctx.fs_sharing_supported;
+        let oci_mounts = &spec.mounts().clone().unwrap_or_default();
         info!(sl!(), " oci mount is : {:?}", oci_mounts.clone());
         // handle mounts
         for m in oci_mounts {
-            let read_only = m.options.iter().any(|opt| opt == "ro");
-            let volume: Arc<dyn Volume> = if shm_volume::is_shim_volume(m) {
-                let shm_size = shm_volume::DEFAULT_SHM_SIZE;
+            let read_only = get_mount_options(m.options()).iter().any(|opt| opt == "ro");
+            let volume: Arc<dyn Volume> = if shm_volume::is_shm_volume(m) {
                 Arc::new(
-                    shm_volume::ShmVolume::new(m, shm_size)
-                        .with_context(|| format!("new shm volume {:?}", m))?,
+                    shm_volume::ShmVolume::new(m)
+                        .with_context(|| format!("new shm volume {m:?}"))?,
                 )
-            } else if is_block_volume(m).context("block volume type")? {
+            } else if ephemeral_volume::is_ephemeral_volume(m) {
+                Arc::new(
+                    ephemeral_volume::EphemeralVolume::new(m)
+                        .with_context(|| format!("new ephemeral volume {m:?}"))?,
+                )
+            } else if block_emptydir_volume::is_block_emptydir_volume(m, emptydir_mode) {
+                self.inner
+                    .write()
+                    .await
+                    .ephemeral_disks
+                    .record(block_emptydir_volume::disk_info(m)?);
+                Arc::new(
+                    block_emptydir_volume::BlockEmptyDirVolume::new(
+                        d,
+                        m,
+                        sid,
+                        emptydir_mode,
+                        ctx.block_device_discard_supported,
+                    )
+                    .await
+                    .with_context(|| format!("new block emptydir volume {m:?}"))?,
+                )
+            } else if need_local_volume(m, fs_sharing_supported, emptydir_mode) {
+                // This branch comes after is_block_emptydir_volume() so
+                // block-encrypted and block-plain emptyDirs are handled as
+                // block devices before falling back to guest-local storage.
+                warn!(
+                    sl!(),
+                    "handling emptyDir as guest-local volume because fs sharing is unsupported; Kubelet cannot enforce sizeLimit-based eviction",
+                );
+                Arc::new(
+                    local_volume::LocalStorage::new(m, sid, cid)
+                        .with_context(|| format!("new local volume {m:?}"))?,
+                )
+            } else if is_block_volume(m) {
                 // handle block volume
                 Arc::new(
-                    block_volume::BlockVolume::new(d, m, read_only, cid, sid)
+                    block_volume::BlockVolume::new(d, m, read_only, sid)
                         .await
-                        .with_context(|| format!("new share fs volume {:?}", m))?,
+                        .with_context(|| format!("new block volume {m:?}"))?,
                 )
-            } else if is_vfio_volume(m) {
-                Arc::new(
-                    vfio_volume::VfioVolume::new(d, m, read_only, cid, sid)
-                        .await
-                        .with_context(|| format!("new vfio volume {:?}", m))?,
-                )
-            } else if is_spdk_volume(m) {
-                Arc::new(
-                    spdk_volume::SPDKVolume::new(d, m, read_only, cid, sid)
-                        .await
-                        .with_context(|| format!("create spdk volume {:?}", m))?,
-                )
+            } else if is_direct_volume(m)? {
+                // handle direct volumes
+                match direct_volume::handle_direct_volume(d, m, read_only, sid)
+                    .await
+                    .context("handle direct volume")?
+                {
+                    Some(directvol) => directvol,
+                    None => continue,
+                }
             } else if let Some(options) =
                 get_huge_page_option(m).context("failed to check huge page")?
             {
@@ -102,13 +175,20 @@ impl VolumeResource {
                 // handle container hugepage
                 Arc::new(
                     hugepage::Hugepage::new(m, hugepage_limits, options)
-                        .with_context(|| format!("handle hugepages {:?}", m))?,
+                        .with_context(|| format!("handle hugepages {m:?}"))?,
                 )
             } else if share_fs_volume::is_share_fs_volume(m) {
                 Arc::new(
-                    share_fs_volume::ShareFsVolume::new(share_fs, m, cid, read_only, agent.clone())
-                        .await
-                        .with_context(|| format!("new share fs volume {:?}", m))?,
+                    share_fs_volume::ShareFsVolume::new(
+                        share_fs,
+                        m,
+                        cid,
+                        read_only,
+                        ctx.agent.clone(),
+                        self.volume_manager.clone(),
+                    )
+                    .await
+                    .with_context(|| format!("new share fs volume {m:?}"))?,
                 )
             } else if is_skip_volume(m) {
                 info!(sl!(), "skip volume {:?}", m);
@@ -116,7 +196,7 @@ impl VolumeResource {
             } else {
                 Arc::new(
                     default_volume::DefaultVolume::new(m)
-                        .with_context(|| format!("new default volume {:?}", m))?,
+                        .with_context(|| format!("new default volume {m:?}"))?,
                 )
             };
 
@@ -125,7 +205,56 @@ impl VolumeResource {
             inner.volumes.push(volume);
         }
 
-        Ok(volumes)
+        Ok(())
+    }
+
+    /// The block emptyDir disks the sandbox made, for its state.
+    pub async fn ephemeral_disks(&self) -> Vec<EphemeralDiskInfo> {
+        self.inner.read().await.ephemeral_disks.list()
+    }
+
+    /// Record the block emptyDir disks that creating a container from `spec`
+    /// will make, before any of them exists, so the caller can put them in
+    /// the saved state first. Returns the generation a save would cover, or
+    /// 0 when every recorded disk, this call's and earlier ones', already
+    /// reached the saved state.
+    pub async fn register_ephemeral_disks(
+        &self,
+        emptydir_mode: &str,
+        spec: &oci::Spec,
+    ) -> Result<u64> {
+        let oci_mounts = spec.mounts().clone().unwrap_or_default();
+        let mut inner = self.inner.write().await;
+        for m in &oci_mounts {
+            if block_emptydir_volume::is_block_emptydir_volume(m, emptydir_mode) {
+                inner
+                    .ephemeral_disks
+                    .record(block_emptydir_volume::disk_info(m)?);
+            }
+        }
+        Ok(inner.ephemeral_disks.unsaved())
+    }
+
+    /// Confirm that the saved state now holds the disks up to the generation
+    /// a registration handed out.
+    pub async fn ephemeral_disks_saved(&self, generation: u64) {
+        self.inner.write().await.ephemeral_disks.saved(generation);
+    }
+
+    /// Restore the disks a sandbox created before its shim went away, so
+    /// that recovery removes them.
+    pub fn restore(ephemeral_disks: Vec<EphemeralDiskInfo>) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(VolumeResourceInner {
+                volumes: Vec::new(),
+                ephemeral_disks: block_emptydir_volume::EphemeralDisks::restore(ephemeral_disks),
+            })),
+            volume_manager: Arc::new(VolumeManager::new()),
+        }
+    }
+
+    pub async fn cleanup_ephemeral_disks(&self) -> Result<()> {
+        self.inner.read().await.ephemeral_disks.cleanup()
     }
 
     pub async fn dump(&self) {
@@ -141,7 +270,194 @@ impl VolumeResource {
     }
 }
 
+/// Indicates whether a mount needs to be a local volume, i.e. created
+/// inside the guest instead of being shared from the host.
+///
+/// This returns true when the hypervisor doesn't support fs sharing
+/// (e.g. peer pods) and the mount is a non-block-based disk-backed
+/// emptyDir.
+///
+/// Limitation: Local volumes cannot be managed by Kubelet and hence may
+/// starve the host storage.
+fn need_local_volume(m: &oci::Mount, fs_sharing_supported: bool, emptydir_mode: &str) -> bool {
+    !fs_sharing_supported
+        && !block_emptydir_volume::is_block_emptydir_mode(emptydir_mode)
+        && m.source()
+            .as_ref()
+            .is_some_and(|src| is_disk_empty_dir(&src.display().to_string()))
+}
+
 fn is_skip_volume(_m: &oci::Mount) -> bool {
     // TODO: support volume check
     false
+}
+
+#[cfg(test)]
+mod cleanup_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn failed_ephemeral_disk_removal_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk_path = dir.path().join("disk.img");
+        std::fs::create_dir(&disk_path).unwrap();
+
+        let resource = VolumeResource::new();
+        resource
+            .inner
+            .write()
+            .await
+            .ephemeral_disks
+            .record(EphemeralDiskInfo {
+                disk_path: disk_path.clone(),
+                source_path: format!(
+                    "ephemeral-test-{}",
+                    dir.path().file_name().unwrap().to_string_lossy()
+                ),
+            });
+
+        assert!(resource.cleanup_ephemeral_disks().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn disks_in_the_saved_state_are_removed_by_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = EphemeralDiskInfo {
+            disk_path: dir.path().join("disk.img"),
+            source_path: format!(
+                "ephemeral-test-{}",
+                dir.path().file_name().unwrap().to_string_lossy()
+            ),
+        };
+        std::fs::write(&disk.disk_path, b"").unwrap();
+
+        let resource = VolumeResource::new();
+        resource
+            .inner
+            .write()
+            .await
+            .ephemeral_disks
+            .record(disk.clone());
+        let state = crate::resource_persist::ResourceState {
+            ephemeral_disks: resource.ephemeral_disks().await,
+            ..Default::default()
+        };
+        let state: crate::resource_persist::ResourceState =
+            serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        assert_eq!(state.ephemeral_disks, vec![disk.clone()]);
+
+        let restored = VolumeResource::restore(state.ephemeral_disks);
+        restored.cleanup_ephemeral_disks().await.unwrap();
+        assert!(!disk.disk_path.exists());
+        // A retry after a partial cleanup finds nothing left to remove.
+        restored.cleanup_ephemeral_disks().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_disk_recorded_before_it_was_made_cleans_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut m = oci::Mount::default();
+        m.set_source(Some(dir.path().join("scratch")));
+        let disk = block_emptydir_volume::disk_info(&m).unwrap();
+        assert_eq!(disk.disk_path, dir.path().join("scratch/disk.img"));
+
+        let mut disks = block_emptydir_volume::EphemeralDisks::default();
+        disks.record(disk.clone());
+        disks.record(disk.clone());
+        assert_eq!(disks.unsaved(), 1);
+        assert_eq!(disks.list(), vec![disk]);
+        disks.cleanup().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_stale_save_confirmation_hides_no_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk_info = |name: &str| {
+            let mut m = oci::Mount::default();
+            m.set_source(Some(dir.path().join(name)));
+            block_emptydir_volume::disk_info(&m).unwrap()
+        };
+
+        let mut disks = block_emptydir_volume::EphemeralDisks::default();
+        // Two creates overlap: both their saves cover the first disk, and
+        // the confirmation of the earlier save arrives last, after a third
+        // disk whose own save failed was recorded. It must not pass for the
+        // third disk's missing save.
+        disks.record(disk_info("one"));
+        let first = disks.unsaved();
+        disks.record(disk_info("two"));
+        let second = disks.unsaved();
+        disks.saved(second);
+        disks.record(disk_info("three"));
+        disks.saved(first);
+        assert!(disks.unsaved() > 0, "the third disk still waits for a save");
+
+        // Its retried registration asks again, and the confirmation of a
+        // covering save clears it.
+        let third = disks.unsaved();
+        disks.saved(third);
+        assert_eq!(disks.unsaved(), 0);
+    }
+
+    #[tokio::test]
+    async fn container_intents_name_the_disks_before_they_exist() {
+        let source = "/var/lib/kubelet/pods/uid-1/volumes/kubernetes.io~empty-dir/cache";
+        let mount = oci::MountBuilder::default()
+            .destination("/cache")
+            .typ("bind")
+            .source(source)
+            .build()
+            .unwrap();
+        let spec = oci::SpecBuilder::default()
+            .mounts(vec![mount])
+            .build()
+            .unwrap();
+
+        let resource = VolumeResource::new();
+        // Nothing recorded while emptyDirs are not disk-backed.
+        assert_eq!(
+            resource
+                .register_ephemeral_disks(kata_types::config::EMPTYDIR_MODE_SHARED_FS, &spec)
+                .await
+                .unwrap(),
+            0
+        );
+
+        assert_eq!(
+            resource
+                .register_ephemeral_disks(kata_types::config::EMPTYDIR_MODE_BLOCK_PLAIN, &spec)
+                .await
+                .unwrap(),
+            1
+        );
+        // While no save was confirmed, every registration keeps asking for
+        // one: a failed save must not let a retried container creation make
+        // the disk without persisted intent.
+        assert_eq!(
+            resource
+                .register_ephemeral_disks(kata_types::config::EMPTYDIR_MODE_BLOCK_PLAIN, &spec)
+                .await
+                .unwrap(),
+            1
+        );
+        resource.ephemeral_disks_saved(1).await;
+        // The next container of the pod shares the emptyDir, and its saved
+        // disk needs no further save.
+        assert_eq!(
+            resource
+                .register_ephemeral_disks(kata_types::config::EMPTYDIR_MODE_BLOCK_PLAIN, &spec)
+                .await
+                .unwrap(),
+            0
+        );
+
+        let disks = resource.ephemeral_disks().await;
+        assert_eq!(
+            disks,
+            vec![EphemeralDiskInfo {
+                disk_path: std::path::Path::new(source).join("disk.img"),
+                source_path: source.to_string(),
+            }]
+        );
+    }
 }

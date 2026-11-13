@@ -41,7 +41,7 @@ pub fn valid_env(e: &str) -> Option<(&str, &str)> {
     if let Some((key, value)) = e.split_once('=') {
         if !key.is_empty() && !key.as_bytes().contains(&b'\0') && !value.as_bytes().contains(&b'\0')
         {
-            return Some((key.trim(), value.trim()));
+            return Some((key, value));
         }
     }
 
@@ -265,11 +265,11 @@ mod tests {
         ];
 
         for (i, d) in tests.iter().enumerate() {
-            let msg = format!("test[{}]: {:?}", i, d);
+            let msg = format!("test[{i}]: {d:?}");
 
             let result = verify_id(d.id);
 
-            let msg = format!("{}, result: {:?}", msg, result);
+            let msg = format!("{msg}, result: {result:?}");
 
             if result.is_ok() {
                 assert!(!d.expect_error, "{}", msg);
@@ -287,18 +287,30 @@ mod tests {
         let env = valid_env("a=b");
         assert_eq!(Some(("a", "b")), env);
         let env = valid_env("a =b");
-        assert_eq!(Some(("a", "b")), env);
+        assert_eq!(Some(("a ", "b")), env);
 
         let env = valid_env(" a =b");
-        assert_eq!(Some(("a", "b")), env);
+        assert_eq!(Some((" a ", "b")), env);
 
         let env = valid_env("a= b");
-        assert_eq!(Some(("a", "b")), env);
+        assert_eq!(Some(("a", " b")), env);
 
         let env = valid_env("a=b ");
-        assert_eq!(Some(("a", "b")), env);
+        assert_eq!(Some(("a", "b ")), env);
         let env = valid_env("a=b c ");
-        assert_eq!(Some(("a", "b c")), env);
+        assert_eq!(Some(("a", "b c ")), env);
+
+        let env = valid_env(" = b ");
+        assert_eq!(Some((" ", " b ")), env);
+
+        let env = valid_env("a=value\n");
+        assert_eq!(Some(("a", "value\n")), env);
+
+        let env = valid_env("a= \n ");
+        assert_eq!(Some(("a", " \n ")), env);
+
+        let env = valid_env("a=\u{a0}value\u{2003}");
+        assert_eq!(Some(("a", "\u{a0}value\u{2003}")), env);
 
         let env = valid_env("=b");
         assert_eq!(None, env);
@@ -315,11 +327,11 @@ mod tests {
         let invalid_str = vec![97, b'\0', 98];
         let invalid_string = std::str::from_utf8(&invalid_str).unwrap();
 
-        let invalid_env = format!("{}=value", invalid_string);
+        let invalid_env = format!("{invalid_string}=value");
         let env = valid_env(&invalid_env);
         assert_eq!(None, env);
 
-        let invalid_env = format!("key={}", invalid_string);
+        let invalid_env = format!("key={invalid_string}");
         let env = valid_env(&invalid_env);
         assert_eq!(None, env);
     }

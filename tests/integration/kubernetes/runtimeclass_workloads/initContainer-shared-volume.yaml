@@ -8,8 +8,9 @@ kind: Pod
 metadata:
   name: initcontainer-shared-volume
 spec:
-  terminationGracePeriodSeconds: 0
   runtimeClassName: kata
+  securityContext:
+    supplementalGroups: [10]
   initContainers:
   - name: first
     image: quay.io/prometheus/busybox:latest

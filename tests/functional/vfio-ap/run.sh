@@ -1,0 +1,371 @@
+#!/bin/bash
+#
+# Copyright (c) 2023 IBM Corp.
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+
+[[ -n "${DEBUG:-}" ]] && set -x
+set -o nounset
+set -o pipefail
+set -o errtrace
+
+script_path=$(dirname "$0")
+# shellcheck source=/dev/null
+source "${script_path}/../../common.bash"
+registry_port="${REGISTRY_PORT:-5000}"
+registry_name="local-registry"
+container_engine="${container_engine:-docker}"
+dev_base="/dev/vfio"
+sys_bus_base="/sys/bus/ap"
+sys_device_base="/sys/devices/vfio_ap/matrix"
+command_file="mdev_supported_types/vfio_ap-passthrough/create"
+test_image_name="localhost:${registry_port}/vfio-ap-test:latest"
+kata_base="/opt/kata"
+runtime_config_base="${kata_base}/share/defaults/kata-containers"
+
+test_category="[kata][vfio-ap][containerd]"
+
+trap cleanup EXIT
+
+# Prevent the program from exiting on error
+trap - ERR
+registry_image="registry:2.8.3"
+
+setup_config_file() {
+    local target_item=$1
+    local action=$2
+    local replacement=${3:-}
+    local runtime_dir=${4:-}
+    local kata_config_file="${runtime_config_base}/${runtime_dir}/configuration.toml"
+
+    if [[ "${action}" == "comment_out" ]]; then
+        sudo sed -i -e 's/.*\('"${target_item}"'.*\)/#\1/g' "${kata_config_file}"
+    else
+        # Booleans must stay unquoted to remain valid TOML
+        local quote='"'
+        [[ "${replacement}" =~ ^(true|false)$ ]] && quote=''
+        sudo sed -i -e 's/.*\('"${target_item}"'\s*=\).*/\1 '"${quote}${replacement}${quote}"'/g' "${kata_config_file}"
+    fi
+}
+
+show_config_file() {
+    local runtime_dir=${1:-}
+    local kata_config_file="${runtime_config_base}/${runtime_dir}/configuration.toml"
+    echo "Show kata configuration"
+    grep -v '^\s*$\|^\s*\#' "${kata_config_file}"
+}
+
+setup_hotplug() {
+    local runtime=$1
+    local rootless=${2:-}
+    echo "Set up the configuration file for Hotplug for ${runtime}"
+    if [[ "${runtime}" == "runtime" ]]; then
+        setup_config_file "vfio_mode" "replace" "vfio"
+        setup_config_file "cold_plug_vfio" "comment_out"
+        setup_config_file "hot_plug_vfio" "replace" "bridge-port"
+        show_config_file
+    elif [[ "${runtime}" == "runtime-rs" ]]; then
+        setup_config_file "vfio_mode" "replace" "vfio" "runtime-rs"
+        setup_config_file "cold_plug_vfio" "replace" "no-port" "runtime-rs"
+        if [[ "${rootless}" == "rootless" ]]; then
+            setup_config_file "rootless" "replace" "true" "runtime-rs"
+        else
+            setup_config_file "rootless" "replace" "false" "runtime-rs"
+        fi
+        show_config_file "runtime-rs"
+    else
+        echo "Invalid runtime: ${runtime}" >&2
+        exit 1
+    fi
+}
+
+setup_coldplug() {
+    local runtime=$1
+    local rootless=${2:-}
+    echo "Set up the configuration file for Coldplug for ${runtime}"
+    if [[ "${runtime}" == "runtime" ]]; then
+        setup_config_file "vfio_mode" "replace" "vfio"
+        setup_config_file "hot_plug_vfio" "comment_out"
+        setup_config_file "cold_plug_vfio" "replace" "bridge-port"
+        show_config_file
+    elif [[ "${runtime}" == "runtime-rs" ]]; then
+        setup_config_file "vfio_mode" "replace" "vfio" "runtime-rs"
+        setup_config_file "cold_plug_vfio" "replace" "root-port" "runtime-rs"
+        if [[ "${rootless}" == "rootless" ]]; then
+            setup_config_file "rootless" "replace" "true" "runtime-rs"
+        else
+            setup_config_file "rootless" "replace" "false" "runtime-rs"
+        fi
+        show_config_file "runtime-rs"
+    else
+        echo "Invalid runtime: ${runtime}" >&2
+        exit 1
+    fi
+}
+
+cleanup() {
+    # Clean up ctr resources
+    # shellcheck disable=SC2046
+    sudo ctr image rm $(sudo ctr image list -q) || true
+
+    # Remove the test image
+    ${container_engine} rmi -f "${test_image_name}" > /dev/null 2>&1
+
+    # Destroy mediated devices
+    IFS=$'\n' read -r -d '' -a arr_dev < <( ls -1 /sys/bus/mdev/devices && printf '\0' )
+    for item in "${arr_dev[@]}"; do
+        if [[ ${item//-/} =~ ^[[:xdigit:]]{32}$ ]]; then
+            echo 1 | sudo tee "/sys/bus/mdev/devices/${item}/remove" > /dev/null
+        fi
+    done
+
+    # Release devices from vfio-ap
+    echo "0x$(printf -- 'f%.0s' {1..64})" | sudo tee /sys/bus/ap/apmask > /dev/null
+    echo "0x$(printf -- 'f%.0s' {1..64})" | sudo tee /sys/bus/ap/aqmask > /dev/null
+
+    # Remove files used for testing
+    rm -f "${script_path}/zcrypttest"
+}
+
+validate_env() {
+    if [[ ! -f "${HOME}/script/zcrypttest" ]]; then
+        echo "zcrypttest not found" >&2
+        exit 1
+    fi
+    necessary_commands=( "${container_engine}" "ctr" "lszcrypt" )
+    for cmd in "${necessary_commands[@]}"; do
+        if ! which "${cmd}" > /dev/null 2>&1; then
+            echo "${cmd} not found" >&2
+            exit 1
+        fi
+    done
+
+    if ! ${container_engine} ps | grep -q "${registry_name}"; then
+        echo "Docker registry not found. Installing..."
+        ${container_engine} run -d -p "${registry_port}":5000 --restart=always --name "${registry_name}" "${registry_image}"
+        # wait for registry container
+        waitForProcess 15 3 "curl http://localhost:${registry_port}"
+    fi
+
+    sudo modprobe vfio
+    sudo modprobe vfio_ap
+}
+
+build_test_image() {
+    cp "${HOME}/script/zcrypttest" "${script_path}"
+    ${container_engine} rmi -f "${test_image_name}" > /dev/null 2>&1
+    ${container_engine} build --no-cache -t "${test_image_name}" "${script_path}"
+    ${container_engine} push "${test_image_name}"
+}
+
+create_mediated_device() {
+    # Choose the first listed EP11 queue.
+    APQN=$(lszcrypt | awk '/EP11/ && /\./ { print $1; exit }')
+    if [[ ! ${APQN} =~ [[:xdigit:]]{2}.[[:xdigit:]]{4} ]]; then
+        echo "Incorrect format for APQN" >&2
+        exit 1
+    fi
+    _APID=${APQN//.*}
+    _APQI=${APQN#*.}
+    APID="${_APID##+(0)}"
+    APID=${APID:-0}
+    APQI="${_APQI##+(0)}"
+    APQI=${APQI:-0}
+
+    # Release the device from the host
+    pushd "${sys_bus_base}" || exit
+    echo "-0x${APID}" | sudo tee apmask
+    echo "-0x${APQI}" | sudo tee aqmask
+    popd || exit
+    lszcrypt --verbose
+
+    # Create a mediated device (mdev) for the released device
+    echo "Status before creation of  mediated device"
+    ls "${dev_base}"
+
+    pushd "${sys_device_base}" || exit
+    if [[ ! -f "${command_file}" ]]; then
+        echo "${command_file} not found}" >&2
+        exit 1
+    fi
+
+    mdev_uuid=$(uuidgen)
+    echo "${mdev_uuid}" | sudo tee "${command_file}"
+
+    echo "Status after creation of mediated device"
+    ls "${dev_base}"
+
+    [[ -n "${mdev_uuid}" ]] && cd "${mdev_uuid}" || exit
+    if [[ ! -L iommu_group ]]; then
+        echo "${mdev_uuid}/iommu_group not found" >&2
+        exit 1
+    fi
+    dev_index=$(readlink iommu_group | xargs -I{} basename {})
+    if [[ -z "${dev_index}" ]]; then
+        echo "No dev_index from 'readlink ${sys_device_base}/${mdev_uuid}/iommu_group'" >&2
+        exit 1
+    fi
+    cat matrix
+    echo "0x${APID}" | sudo tee assign_adapter
+    echo "0x${APQI}" | sudo tee assign_domain
+    cat matrix
+    popd || exit
+}
+
+run_test() {
+    local run_index=$1
+    local runtime=$2
+    local test_message=$3
+    local extra_cmd=${4:-}
+    local error_pattern=${5:-}
+    local start_time
+    start_time=$(date +"%Y-%m-%d %H:%M:%S")
+    [[ -n "${dev_index}" ]] || { echo "No dev_index" >&2; exit 1; }
+
+    local device_path="${dev_base}/${dev_index}"
+    if [[ "${test_message}" == *cdev* ]]; then
+        # Rootless uses the iommufd cdev, e.g. /dev/vfio/devices/vfio0
+        local vfio_dev
+        vfio_dev=$(find "${sys_device_base}/${mdev_uuid}/vfio-dev" -mindepth 1 -maxdepth 1 -name 'vfio*' -printf '%f\n' | head -n1)
+        [[ -n "${vfio_dev}" ]] || { echo "No vfio-dev under ${sys_device_base}/${mdev_uuid}/vfio-dev" >&2; exit 1; }
+        device_path="${dev_base}/devices/${vfio_dev}"
+    fi
+
+    if [[ "${runtime}" == "runtime" ]]; then
+        local runtime_type="io.containerd.run.kata.v2"
+    elif [[ "${runtime}" == "runtime-rs" ]]; then
+        local runtime_type="io.containerd.kata-qemu-runtime-rs.v2"
+    else
+        echo "Invalid runtime: ${runtime}" >&2
+        exit 1
+    fi
+
+    # Set time granularity to a second for capturing the log
+    sleep 1
+
+    sudo ctr image pull --plain-http "${test_image_name}"
+    # Create a container and run the test
+    local ctr_output
+    if ctr_output=$(sudo ctr run --runtime "${runtime_type}" --rm \
+        --privileged --privileged-without-host-devices \
+        --device "${device_path}" "${test_image_name}" "test-${run_index}" \
+        -- bash -c "lszcrypt ${_APID}.${_APQI} | grep ${APQN} ${extra_cmd}" 2>&1); then
+        local ctr_status=0
+    else
+        local ctr_status=1
+    fi
+
+    local result=1
+    local fail_reason=""
+    if [[ -n "${error_pattern}" ]]; then
+        # A negative test: ctr must fail and the output must match the pattern
+        if [[ "${ctr_status}" -eq 0 ]]; then
+            fail_reason="expected failure matching \"${error_pattern}\", but ctr succeeded"
+        elif grep -q "${error_pattern}" <<< "${ctr_output}"; then
+            result=0
+        else
+            fail_reason="ctr failed, but \"${error_pattern}\" not found in the output"
+        fi
+    else
+        # A positive test: success iff ctr succeeded
+        result="${ctr_status}"
+    fi
+
+    if [[ "${result}" -eq 0 ]]; then
+        echo "ok ${run_index} ${test_category}[${runtime}] ${test_message}"
+        if [[ -n "${error_pattern}" ]]; then
+            echo "\"${error_pattern}\" found in the output:"
+        fi
+        echo "${ctr_output}"
+    else
+        echo "not ok ${run_index} ${test_category}[${runtime}] ${test_message}"
+        [[ -z "${fail_reason}" ]] || echo "${fail_reason}" >&2
+        echo "${ctr_output}" >&2
+        echo "Logging the journal..."
+        sudo journalctl --no-pager --since "${start_time}"
+    fi
+}
+
+configure_containerd_for_runtime_rs() {
+    local vfio_rs_drop="/etc/containerd/conf.d/52-kata-ci-vfio-ap-qemu-runtime-rs.toml"
+
+    sudo rm -f /usr/local/bin/containerd-shim-kata-qemu-runtime-rs-v2 \
+        "${runtime_config_base}/runtime-rs/configuration.toml"
+    if [[ ! -f "${kata_base}/runtime-rs/bin/containerd-shim-kata-v2" ]]; then
+        echo "${kata_base}/runtime-rs/bin/containerd-shim-kata-v2 not found" >&2
+        exit 1
+    fi
+    if [[ ! -f "${runtime_config_base}/runtime-rs/configuration-qemu-runtime-rs.toml" ]]; then
+        echo "${runtime_config_base}/runtime-rs/configuration-qemu-runtime-rs.toml not found" >&2
+        exit 1
+    fi
+    sudo ln -sf "${kata_base}/runtime-rs/bin/containerd-shim-kata-v2" \
+        /usr/local/bin/containerd-shim-kata-qemu-runtime-rs-v2
+    sudo ln -sf "${runtime_config_base}/runtime-rs/configuration-qemu-runtime-rs.toml" \
+        "${runtime_config_base}/runtime-rs/configuration.toml"
+
+    if [[ ! -f "/etc/containerd/config.toml" ]]; then
+        echo "/etc/containerd/config.toml not found" >&2
+        exit 1
+    fi
+
+    local schema
+    schema="$(_containerd_resolved_schema_version)"
+    if [[ "${schema}" -ge 3 ]]; then
+        # containerd v2.x (schema v3+): add the runtime via a conf.d drop-in.
+        sudo mkdir -p /etc/containerd/conf.d
+        cat <<EOF | sudo tee "${vfio_rs_drop}"
+[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.kata-qemu-runtime-rs]
+  runtime_type = 'io.containerd.kata-qemu-runtime-rs.v2'
+  sandboxer = 'podsandbox'
+EOF
+    else
+        # containerd v1.x (schema v2): conf.d is not honoured the same way, so
+        # append the (new) runtime table directly to config.toml.
+        cat <<EOF | sudo tee -a /etc/containerd/config.toml
+[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.kata-qemu-runtime-rs]
+  runtime_type = "io.containerd.kata-qemu-runtime-rs.v2"
+EOF
+    fi
+
+    sudo systemctl daemon-reload
+    sudo systemctl restart containerd
+    # Wait for containerd to restart and the configuration to take effect
+    sleep 1
+}
+
+run_tests() {
+    setup_hotplug "runtime"
+    run_test "1" "runtime" "Test can assign a CEX device inside the guest via VFIO-AP Hotplug" "&& zcrypttest -a -v"
+
+    setup_coldplug "runtime"
+    run_test "2" "runtime" "Test can assign a CEX device inside the guest via VFIO-AP Coldplug" "&& zcrypttest -a -v"
+
+    configure_containerd_for_runtime_rs
+
+    setup_hotplug "runtime-rs"
+    run_test "3" "runtime-rs" "Test can assign a CEX device inside the guest via VFIO-AP Hotplug" "&& zcrypttest -a -v"
+
+    setup_coldplug "runtime-rs"
+    run_test "4" "runtime-rs" "Test can assign a CEX device inside the guest via VFIO-AP Coldplug" "&& zcrypttest -a -v"
+
+    setup_hotplug "runtime-rs"
+    run_test "5" "runtime-rs" "Test can assign a CEX device inside the guest via VFIO-AP Hotplug (cdev)" "&& zcrypttest -a -v"
+
+    setup_coldplug "runtime-rs" "rootless"
+    run_test "6" "runtime-rs" "Test can assign a CEX device inside rootless guest via VFIO-AP Coldplug (iommufd+cdev)" "&& zcrypttest -a -v"
+
+    setup_hotplug "runtime-rs" "rootless"
+    run_test "7" "runtime-rs" "Test cannot assign a CEX device inside rootless guest via VFIO-AP Hotplug (iommufd+cdev)" "&& zcrypttest -a -v" "device_add vfio device failed Qapi"
+}
+
+main() {
+    validate_env
+    cleanup
+    build_test_image
+    create_mediated_device
+    run_tests
+}
+
+main "$@"

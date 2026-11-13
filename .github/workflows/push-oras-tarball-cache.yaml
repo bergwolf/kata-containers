@@ -1,0 +1,46 @@
+# Push gperf and busybox tarballs to the ORAS cache (ghcr.io) so that
+# download-with-oras-cache.sh can pull them instead of hitting upstream.
+# Runs when versions.yaml changes on main (e.g. after a PR merge) or manually.
+name: CI | Push ORAS tarball cache
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'versions.yaml'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  push-oras-cache:
+    name: push-oras-cache
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write # needed to push the ORAS tarball cache to ghcr.io
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install yq
+        run: ./ci/install_yq.sh
+
+      - name: Install ORAS from versions.yaml
+        run: ./tools/packaging/kata-deploy/local-build/dockerbuild/install_oras.sh
+
+      - name: Populate ORAS tarball cache
+        run: ./tools/packaging/scripts/populate-oras-tarball-cache.sh all
+        env:
+          ARTEFACT_REGISTRY: ghcr.io
+          ARTEFACT_REPOSITORY: kata-containers
+          ARTEFACT_REGISTRY_USERNAME: ${{ github.actor }}
+          ARTEFACT_REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}

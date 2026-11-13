@@ -4,12 +4,16 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 
 use super::VhostUserConfig;
 use crate::{
-    device::{Device, DeviceType},
+    device::{
+        topology::PCIeTopology,
+        util::{do_decrease_count, do_increase_count},
+        Device, DeviceType,
+    },
     Hypervisor as hypervisor,
 };
 
@@ -45,7 +49,11 @@ impl VhostUserBlkDevice {
 
 #[async_trait]
 impl Device for VhostUserBlkDevice {
-    async fn attach(&mut self, h: &dyn hypervisor) -> Result<()> {
+    async fn attach(
+        &mut self,
+        _pcie_topo: &mut Option<&mut PCIeTopology>,
+        h: &dyn hypervisor,
+    ) -> Result<()> {
         // increase attach count, skip attach the device if the device is already attached
         if self
             .increase_attach_count()
@@ -64,7 +72,11 @@ impl Device for VhostUserBlkDevice {
         return Ok(());
     }
 
-    async fn detach(&mut self, h: &dyn hypervisor) -> Result<Option<u64>> {
+    async fn detach(
+        &mut self,
+        _pcie_topo: &mut Option<&mut PCIeTopology>,
+        h: &dyn hypervisor,
+    ) -> Result<Option<u64>> {
         // get the count of device detached, and detach once it reaches 0
         if self
             .decrease_attach_count()
@@ -86,37 +98,20 @@ impl Device for VhostUserBlkDevice {
         Ok(Some(self.config.index))
     }
 
+    async fn update(&mut self, _h: &dyn hypervisor) -> Result<()> {
+        // There's no need to do update for vhost-user-blk
+        Ok(())
+    }
+
     async fn get_device_info(&self) -> DeviceType {
         DeviceType::VhostUserBlk(self.clone())
     }
 
     async fn increase_attach_count(&mut self) -> Result<bool> {
-        match self.attach_count {
-            0 => {
-                // do real attach
-                self.attach_count += 1;
-                Ok(false)
-            }
-            std::u64::MAX => Err(anyhow!("device was attached too many times")),
-            _ => {
-                self.attach_count += 1;
-                Ok(true)
-            }
-        }
+        do_increase_count(&mut self.attach_count)
     }
 
     async fn decrease_attach_count(&mut self) -> Result<bool> {
-        match self.attach_count {
-            0 => Err(anyhow!("detaching a device that wasn't attached")),
-            1 => {
-                // do real wrok
-                self.attach_count -= 1;
-                Ok(false)
-            }
-            _ => {
-                self.attach_count -= 1;
-                Ok(true)
-            }
-        }
+        do_decrease_count(&mut self.attach_count)
     }
 }

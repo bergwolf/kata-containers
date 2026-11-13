@@ -49,6 +49,10 @@ impl AgentManager for KataAgent {
     async fn agent_config(&self) -> AgentConfig {
         self.agent_config().await
     }
+
+    async fn disconnect(&self) -> Result<()> {
+        self.disconnect().await.context("disconnect agent")
+    }
 }
 
 // implement for health service
@@ -115,6 +119,8 @@ impl_agent!(
     list_routes | crate::Empty | crate::Routes | None,
     create_sandbox | crate::CreateSandboxRequest | crate::Empty | None,
     destroy_sandbox | crate::Empty | crate::Empty | None,
+    reseed_random_dev | crate::ReseedRandomDevRequest | crate::Empty | None,
+    set_guest_date_time | crate::SetGuestDateTimeRequest | crate::Empty | None,
     copy_file | crate::CopyFileRequest | crate::Empty | None,
     get_oom_event | crate::Empty | crate::OomEventResponse | Some(0),
     get_ip_tables | crate::GetIPTablesRequest | crate::GetIPTablesResponse | None,
@@ -122,5 +128,10 @@ impl_agent!(
     get_volume_stats | crate::VolumeStatsRequest | crate::VolumeStatsResponse | None,
     resize_volume | crate::ResizeVolumeRequest | crate::Empty | None,
     online_cpu_mem | crate::OnlineCPUMemRequest | crate::Empty | None,
-    get_metrics | crate::Empty | crate::MetricsResponse | None
+    get_metrics | crate::Empty | crate::MetricsResponse | None,
+    get_guest_details | crate::GetGuestDetailsRequest | crate::GuestDetailsResponse | None,
+    add_swap | crate::AddSwapRequest | crate::Empty | None,
+    add_swap_path | crate::AddSwapPathRequest | crate::Empty | None,
+    set_policy | crate::SetPolicyRequest | crate::Empty | None,
+    get_diagnostic_data | crate::GetDiagnosticDataRequest | crate::GetDiagnosticDataResponse | None
 );

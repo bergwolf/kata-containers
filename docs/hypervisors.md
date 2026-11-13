@@ -16,50 +16,38 @@ which hypervisors you may wish to investigate further.
 
 ## Types
 
-Since each hypervisor offers different features and options, Kata Containers
-provides a separate
-[configuration file](/src/runtime/README.md#configuration)
-for each. The configuration files contain comments explaining which options
-are available, their default values and how each setting can be used.
+| Hypervisor | Written in | Architectures | GPU Support | Intel TDX | AMD SEV-SNP |
+|-|-|-|-|-|-|
+|[Cloud Hypervisor](#cloud-hypervisor) | rust | `aarch64`, `x86_64` | :x: | :x: | :x: |
+|[Firecracker](#firecracker) | rust | `aarch64`, `x86_64` | :x: | :x: | :x: |
+|[QEMU](#qemu) | C | all | :white_check_mark: | :white_check_mark: | :white_check_mark: |
+|[Dragonball](#dragonball) | rust | `aarch64`, `x86_64` | :x: | :x: | :x: |
+|StratoVirt | rust | `aarch64`, `x86_64` | :x: | :x: | :x: |
 
-> **Note:**
->
-> The simplest way to switch between hypervisors is to create a symbolic link
-> to the appropriate hypervisor-specific configuration file.
+Each Kata runtime is configured for a specific hypervisor through the runtime's configuration file. For example:
 
-| Hypervisor | Written in | Architectures | Type | Configuration file |
-|-|-|-|-|-|
-[ACRN] | C | `x86_64` | Type 1 (bare metal) | `configuration-acrn.toml` |
-[Cloud Hypervisor] | rust | `aarch64`, `x86_64` | Type 2 ([KVM]) | `configuration-clh.toml` |
-[Firecracker] | rust | `aarch64`, `x86_64` | Type 2 ([KVM]) | `configuration-fc.toml` |
-[QEMU] | C | all | Type 2 ([KVM]) | `configuration-qemu.toml` |
-[`Dragonball`] | rust | `aarch64`, `x86_64` | Type 2 ([KVM]) | `configuration-dragonball.toml` |
-
-## Determine currently configured hypervisor
-
-```bash
-$ kata-runtime kata-env | awk -v RS= '/\[Hypervisor\]/' | grep Path
+```toml title="/opt/kata/share/defaults/kata-containers/configuration.toml"
+[hypervisor.qemu]
+path = "/opt/kata/bin/qemu-system-x86_64"
 ```
 
-## Choose a Hypervisor
+```toml title="/opt/kata/share/defaults/kata-containers/configuration-clh.toml"
+[hypervisor.clh]
+path = "/opt/kata/bin/cloud-hypervisor"
+```
 
-The table below provides a brief summary of some of the differences between
-the hypervisors:
+## Cloud Hypervisor
 
+[Cloud Hypervisor](https://www.cloudhypervisor.org/) is a more modern hypervisor written in Rust.
 
-| Hypervisor | Summary | Features | Limitations | Container Creation speed | Memory density | Use cases | Comment |
-|-|-|-|-|-|-|-|-|
-[ACRN] | Safety critical and real-time workloads | | | excellent | excellent | Embedded and IOT systems | For advanced users |
-[Cloud Hypervisor] | Low latency, small memory footprint, small attack surface | Minimal | | excellent | excellent | High performance modern cloud workloads | |
-[Firecracker] | Very slimline | Extremely minimal | Doesn't support all device types | excellent | excellent | Serverless / FaaS | |
-[QEMU] | Lots of features | Lots | | good | good | Good option for most users | | All users |
-[`Dragonball`] | Built-in VMM,  low CPU and memory overhead| Minimal | | excellent | excellent | Optimized for most container workloads | `out-of-the-box` Kata Containers experience |
+## Firecracker
 
-For further details, see the [Virtualization in Kata Containers](design/virtualization.md) document and the official documentation for each hypervisor.
+[Firecracker](https://firecracker-microvm.github.io/) is a minimal and lightweight hypervisor created for the AWS Lambda product.
 
-[ACRN]: https://projectacrn.org
-[Cloud Hypervisor]: https://github.com/cloud-hypervisor/cloud-hypervisor
-[Firecracker]: https://github.com/firecracker-microvm/firecracker
-[KVM]: https://en.wikipedia.org/wiki/Kernel-based_Virtual_Machine
-[QEMU]: http://www.qemu-project.org
-[`Dragonball`]: https://github.com/openanolis/dragonball-sandbox
+## QEMU
+
+QEMU is the best supported hypervisor for NVIDIA-based GPUs and for confidential computing use-cases (such as Intel TDX and AMD SEV-SNP). Runtimes that use this are normally named `kata-qemu-nvidia-gpu-*`. The Kata project focuses primarily on QEMU runtimes for GPU support.
+
+## Dragonball
+
+Dragonball is a special hypervisor created by the Ant Group that runs in the same process as the Rust-based containerd shim.

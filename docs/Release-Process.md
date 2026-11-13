@@ -1,90 +1,116 @@
 # How to do a Kata Containers Release
-  This document lists the tasks required to create a Kata Release.
+
+This document lists the tasks required to create a Kata Release.
 
 ## Requirements
 
-- [hub](https://github.com/github/hub)
-  * Using an [application token](https://github.com/settings/tokens) is required for hub (set to a GITHUB_TOKEN environment variable).
+- GitHub permissions to run workflows.
 
-- GitHub permissions to push tags and create releases in Kata repositories.
+## Release Model
 
-- GPG configured to sign git tags. https://docs.github.com/en/authentication/managing-commit-signature-verification/generating-a-new-gpg-key
+Kata Containers follows a rolling release model with monthly snapshots.
+New features, bug fixes, and improvements are continuously integrated into
+`main`. Each month, a snapshot is tagged as a new `MINOR` release. The
+target release date is no earlier than the first Tuesday on or after
+the 15th of each month. The actual release date may be later, but any
+changes merged before the target date are expected to make it into the release.
 
-- You should configure your GitHub to use your ssh keys (to push to branches). See https://help.github.com/articles/adding-a-new-ssh-key-to-your-github-account/.
-    * As an alternative, configure hub to push and fork with HTTPS, `git config --global hub.protocol https` (Not tested yet) *
+### Versioning
+
+Releases use the `MAJOR.MINOR.PATCH` scheme. Monthly snapshots increment
+`MINOR`; `PATCH` is typically `0`. Major releases are rare (years apart) and
+signal significant architectural changes that may require updates to container
+managers (Containerd, CRI-O) or other infrastructure. Breaking changes in
+`MINOR` releases are avoided where possible, but may occasionally occur as
+features are deprecated or removed.
+
+### No Stable Branches
+
+The Kata Containers project does not maintain stable branches (see
+[#9064](https://github.com/kata-containers/kata-containers/issues/9064)).
+Bug fixes land on `main` and ship in the next monthly snapshot rather than
+being backported. Downstream projects that need extended support or compliance
+certifications should select a monthly snapshot as their stable base and manage
+their own validation and patch backporting from there.
 
 ## Release Process
 
+### Lock the `main` branch and announce release process
 
-### Bump all Kata repositories
+In order to prevent any PRs getting merged during the release process, and
+slowing the release process down, by impacting the payload caches, we have
+recently trialed setting the `main` branch to read-only.
+Once the `kata-containers/kata-containers` repository is ready for a new
+release, lock the main branch until the release action has completed.
+Notify the #kata-dev Slack channel about the ongoing release process.
+Ideally, CI usage by others should be reduced to a minimum during the
+ongoing release process.
 
-  Bump the repositories using a script in the Kata packaging repo, where:
-  - `BRANCH=<the-branch-you-want-to-bump>`
-  - `NEW_VERSION=<the-new-kata-version>`
-  ```
-  $ cd ${GOPATH}/src/github.com/kata-containers/kata-containers/tools/packaging/release
-  $ export NEW_VERSION=<the-new-kata-version>
-  $ export BRANCH=<the-branch-you-want-to-bump>
-  $ ./update-repository-version.sh -p "$NEW_VERSION" "$BRANCH"
-  ```
+> [!NOTE]
+> Admin permission is needed to lock/unlock the `main` branch.
 
-### Merge all bump version Pull requests
+### Bump the `VERSION` and `Chart.yaml` file
 
-  - The above step will create a GitHub pull request in the Kata projects. Trigger the CI using `/test` command on each bump Pull request.
-  - Trigger the `test-kata-deploy` workflow which is under the `Actions` tab on the repository GitHub page (make sure to select the correct branch and validate it passes).
-  - Check any failures and fix if needed.
-  - Work with the Kata approvers to verify that the CI works and the pull requests are merged.
+Create a PR to set the release in the [`VERSION`](./../VERSION) file and to
+update the `version` and `appVersion` fields in the
+[`Chart.yaml`](./../tools/packaging/kata-deploy/helm-chart/kata-deploy/Chart.yaml)
+file. Temporarily unlock the main branch to merge the PR.
 
-### Tag all Kata repositories
+### Wait for the `VERSION` bump PR payload publish to complete
 
-  Once all the pull requests to bump versions in all Kata repositories are merged,
-  tag all the repositories as shown below.
-  ```
-  $ cd ${GOPATH}/src/github.com/kata-containers/kata-containers/tools/packaging/release
-  $ git checkout  <kata-branch-to-release>
-  $ git pull
-  $ ./tag_repos.sh -p -b "$BRANCH" tag
-  ```
+To reduce the chance of need to re-run the release workflow, check the [CI |
+Publish Kata Containers
+payload](https://github.com/kata-containers/kata-containers/actions/workflows/payload-after-push.yaml)
+once the `VERSION` PR bump has merged to check that the assets build correctly
+and are cached, so that the release process can just download these artifacts
+rather than needing to build them all, which takes time and can reveal errors in
+infra.
 
-### Point tests repository to stable branch
+### Trigger the `Release Kata Containers` GitHub Action
 
-  If your release changes a major or minor version number(not a patch release), then the above 
-  `./tag_repos.sh` script will create a new stable branch in all the repositories in addition to tagging them.
-  This happens when you are making the first `rc` release for a new major or minor version in Kata.
-  In this case, you should modify the `tests` repository to point to the newly created stable branch and not the `main` branch.
-  The objective is that changes in the CI on the main branch will not impact the stable branch.
+We make use of [GitHub actions](https://github.com/features/actions) in the
+[release](https://github.com/kata-containers/kata-containers/actions/workflows/release.yaml)
+file from the `kata-containers/kata-containers` repository to build and upload
+release artifacts.
 
-  In the test directory, change references of the `main` branch to the new stable branch in:
-  * `README.md`
-  * `versions.yaml`
-  * `cmd/github-labels/labels.yaml.in`
-  * `cmd/pmemctl/pmemctl.sh`
-  * `.ci/lib.sh`
-  * `.ci/static-checks.sh`
+> [!NOTE]
+> Write permissions to trigger the action.
 
-  See the commits in [the corresponding PR for stable-2.1](https://github.com/kata-containers/tests/pull/3504) for an example of the changes.
+The action is manually triggered and is responsible for generating a new release
+(including a new tag), pushing those to the `kata-containers/kata-containers`
+repository. The new release is initially created as a draft. It is promoted to
+an official release when the whole workflow has completed successfully.
 
-### Check Git-hub Actions
+Check the [actions status
+page](https://github.com/kata-containers/kata-containers/actions) to verify all
+steps in the actions workflow have completed successfully. On success, a static
+tarball containing Kata release artifacts will be uploaded to the [Release
+page](https://github.com/kata-containers/kata-containers/releases).
 
-  We make use of [GitHub actions](https://github.com/features/actions) in this [file](../.github/workflows/release.yaml) in the `kata-containers/kata-containers` repository to build and upload release artifacts. This action is auto triggered with the above step when a new tag is pushed to the `kata-containers/kata-containers` repository.
+If the workflow fails because of some external environmental causes, e.g.
+network timeout, simply re-run the failed jobs until they eventually succeed.
 
-  Check the [actions status page](https://github.com/kata-containers/kata-containers/actions) to verify all steps in the actions workflow have completed successfully. On success, a static tarball containing Kata release artifacts will be uploaded to the [Release page](https://github.com/kata-containers/kata-containers/releases).
+If for some reason you need to cancel the workflow or re-run it entirely, go
+first to the [Release
+page](https://github.com/kata-containers/kata-containers/releases) and delete
+the draft release from the previous run.
 
-### Create release notes
+### Unlock the `main` branch
 
-  We have a script in place in the packaging repository to create release notes that include a short-log of the commits across Kata components.
+After the release process has concluded, either unlock the `main` branch, or ask
+an admin to do it.
 
-  Run the script as shown below:
+### Improve the release notes
 
-  ```
-  $ cd ${GOPATH}/src/github.com/kata-containers/kata-containers/tools/packaging/release
-  # Note: OLD_VERSION is where the script should start to get changes.
-  $ ./release-notes.sh ${OLD_VERSION} ${NEW_VERSION} > notes.md
-  # Edit the `notes.md` file to review and make any changes to the release notes.
-  # Add the release notes in the project's GitHub.
-  $ hub release edit -F notes.md "${NEW_VERSION}"
-  ```
+Release notes are auto-generated by the GitHub CLI tool used as part of our
+release workflow.  However, some manual tweaking may still be necessary in order
+to highlight the most important features and bug fixes in a specific release.
+
+With this in mind, please, poke @channel on #kata-dev and people who worked on
+the release will be able to contribute to that.
 
 ### Announce the release
 
-  Publish in [Slack and Kata mailing list](https://github.com/kata-containers/community#join-us) that new release is ready.
+Publish in [Slack and Kata mailing
+list](https://github.com/kata-containers/community#join-us) that new release is
+ready.

@@ -8,22 +8,19 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use hypervisor::device::device_manager::{do_handle_device, DeviceManager};
-use hypervisor::device::{DeviceConfig, DeviceType};
-use hypervisor::{Hypervisor, NetworkConfig, NetworkDevice};
+use hypervisor::device::device_manager::DeviceManager;
+use hypervisor::device::driver::NetworkConfig;
+use hypervisor::device::DeviceType;
+use hypervisor::{Hypervisor, NetworkDevice};
 use tokio::sync::RwLock;
 
-use super::endpoint_persist::TapEndpointState;
-use super::Endpoint;
+use super::{attach_network_device, Endpoint};
 use crate::network::network_pair::{get_link_by_name, NetworkInterface};
 use crate::network::{utils, EndpointState};
 
 /// TapEndpoint is used to attach to the hypervisor directly
 #[derive(Debug)]
 pub struct TapEndpoint {
-    // Index
-    #[allow(dead_code)]
-    index: u32,
     // Name of virt interface
     name: String,
     // Hardware address of virt interface
@@ -42,7 +39,6 @@ impl TapEndpoint {
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
         handle: &rtnetlink::Handle,
-        index: u32,
         name: &str,
         tap_name: &str,
         guest_mac: &str,
@@ -57,7 +53,6 @@ impl TapEndpoint {
             utils::get_mac_addr(&tap_link.attrs().hardware_addr).context("Get mac addr of tap")?;
 
         Ok(TapEndpoint {
-            index,
             name: name.to_owned(),
             guest_mac: guest_mac.to_owned(),
             tap_iface: NetworkInterface {
@@ -94,12 +89,11 @@ impl Endpoint for TapEndpoint {
         self.guest_mac.clone()
     }
 
-    async fn attach(&self) -> Result<()> {
+    async fn attach(&self) -> Result<Option<String>> {
         let config = self.get_network_config().context("Get network config")?;
-        do_handle_device(&self.dev_mgr, &DeviceConfig::NetworkCfg(config))
+        attach_network_device(&self.dev_mgr, config)
             .await
-            .context("Handle device")?;
-        Ok(())
+            .context("Handle device")
     }
 
     async fn detach(&self, h: &dyn Hypervisor) -> Result<()> {
@@ -114,11 +108,8 @@ impl Endpoint for TapEndpoint {
     }
 
     async fn save(&self) -> Option<EndpointState> {
-        Some(EndpointState {
-            tap_endpoint: Some(TapEndpointState {
-                if_name: self.name.clone(),
-            }),
-            ..Default::default()
-        })
+        // The TAP is handed in from the outside; recovery has nothing of
+        // this endpoint's on the host to act on.
+        None
     }
 }

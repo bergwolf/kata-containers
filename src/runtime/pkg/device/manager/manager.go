@@ -59,23 +59,20 @@ func NewDeviceManager(blockDriver string, vhostUserStoreEnabled bool, vhostUserS
 		vhostUserReconnectTimeout: vhostUserReconnect,
 		devices:                   make(map[string]api.Device),
 	}
-	if blockDriver == config.VirtioMmio {
-		dm.blockDriver = config.VirtioMmio
-	} else if blockDriver == config.VirtioBlock {
-		dm.blockDriver = config.VirtioBlock
-	} else if blockDriver == config.Nvdimm {
-		dm.blockDriver = config.Nvdimm
-	} else if blockDriver == config.VirtioBlockCCW {
-		dm.blockDriver = config.VirtioBlockCCW
-	} else {
+
+	switch blockDriver {
+	case config.VirtioMmio, config.VirtioBlock, config.Nvdimm, config.VirtioBlockCCW:
+		dm.blockDriver = blockDriver
+	default:
 		dm.blockDriver = config.VirtioSCSI
 	}
 
-	config.PCIeDevices = make(map[config.PCIePort]config.PCIePortMapping)
-
-	config.PCIeDevices[config.RootPort] = make(map[string]bool)
-	config.PCIeDevices[config.SwitchPort] = make(map[string]bool)
-	config.PCIeDevices[config.BridgePort] = make(map[string]bool)
+	config.PCIeDevicesPerPort = make(map[config.PCIePort][]config.VFIODev)
+	config.PCIeDevicesPerPort[config.RootPort] = make([]config.VFIODev, 0)
+	config.PCIeDevicesPerPort[config.SwitchPort] = make([]config.VFIODev, 0)
+	config.PCIeDevicesPerPort[config.BridgePort] = make([]config.VFIODev, 0)
+	config.NUMARootPorts = make(map[int][]string)
+	config.NUMARootPortDeviceCount = make(map[int]int)
 
 	for _, dev := range devices {
 		dm.devices[dev.DeviceID()] = dev
@@ -83,7 +80,7 @@ func NewDeviceManager(blockDriver string, vhostUserStoreEnabled bool, vhostUserS
 	return dm
 }
 
-func (dm *deviceManager) findDevice(devInfo *config.DeviceInfo) api.Device {
+func (dm *deviceManager) FindDevice(devInfo *config.DeviceInfo) api.Device {
 	// For devices with a major of -1, we use the host path to find existing instances.
 	if devInfo.Major == -1 {
 		for _, dev := range dm.devices {
@@ -122,7 +119,7 @@ func (dm *deviceManager) createDevice(devInfo config.DeviceInfo) (dev api.Device
 		}
 	}()
 
-	if existingDev := dm.findDevice(&devInfo); existingDev != nil {
+	if existingDev := dm.FindDevice(&devInfo); existingDev != nil {
 		return existingDev, nil
 	}
 

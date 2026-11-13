@@ -1,6 +1,7 @@
 <img src="https://object-storage-ca-ymq-1.vexxhost.net/swift/v1/6e4619c416ff4bd19e1c087f27a43eea/www-images-prod/openstack-logo/kata/SVG/kata-1.svg" width="900">
 
 [![CI | Publish Kata Containers payload](https://github.com/kata-containers/kata-containers/actions/workflows/payload-after-push.yaml/badge.svg)](https://github.com/kata-containers/kata-containers/actions/workflows/payload-after-push.yaml) [![Kata Containers Nightly CI](https://github.com/kata-containers/kata-containers/actions/workflows/ci-nightly.yaml/badge.svg)](https://github.com/kata-containers/kata-containers/actions/workflows/ci-nightly.yaml)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/kata-containers/kata-containers/badge)](https://scorecard.dev/viewer/?uri=github.com/kata-containers/kata-containers)
 
 # Kata Containers
 
@@ -63,17 +64,19 @@ $ kata-runtime check
 
 ## Getting started
 
-See the [installation documentation](docs/install).
+New to Kata Containers? Start with the
+[Quick Start Guide](docs/quick-start-guide.md) to learn the basics and run your
+first workload, then see the [installation guide](docs/installation.md).
 
 ## Documentation
 
 See the [official documentation](docs) including:
 
-- [Installation guides](docs/install)
+- [Installation guide](docs/installation.md)
 - [Developer guide](docs/Developer-Guide.md)
 - [Design documents](docs/design)
   - [Architecture overview](docs/design/architecture)
-  - [Architecture 3.0 overview](docs/design/architecture_3.0/)
+  - [Architecture 4.0 overview](docs/design/architecture_4.0/architecture.md)
 
 ## Configuration
 
@@ -104,7 +107,7 @@ Please raise an issue
 [in this repository](https://github.com/kata-containers/kata-containers/issues).
 
 > **Note:**
-> If you are reporting a security issue, please follow the [vulnerability reporting process](https://github.com/kata-containers/community#vulnerability-handling)
+> If you are reporting a security issue, please follow the [vulnerability reporting process](SECURITY.md)
 
 ## Developers
 
@@ -123,7 +126,7 @@ The table below lists the core parts of the project:
 | [agent](src/agent) | core | Management process running inside the virtual machine / POD that sets up the container environment. |
 | [`dragonball`](src/dragonball) | core | An optional built-in VMM brings out-of-the-box Kata Containers experience with optimizations on container workloads |
 | [documentation](docs) | documentation | Documentation common to all components (such as design and install documentation). |
-| [tests](https://github.com/kata-containers/tests) | tests | Excludes unit tests which live with the main code. |
+| [tests](tests) | tests | Excludes unit tests which live with the main code. |
 
 ### Additional components
 
@@ -137,20 +140,20 @@ The table below lists the remaining parts of the project:
 | [kata-debug](tools/packaging/kata-debug/README.md) | infrastructure | Utility tool to gather Kata Containers debug information from Kubernetes clusters. |
 | [`agent-ctl`](src/tools/agent-ctl) | utility | Tool that provides low-level access for testing the agent. |
 | [`kata-ctl`](src/tools/kata-ctl) | utility | Tool that provides advanced commands and debug facilities. |
-| [`log-parser-rs`](src/tools/log-parser-rs) | utility | Tool that aid in analyzing logs from the kata runtime. |
 | [`trace-forwarder`](src/tools/trace-forwarder) | utility | Agent tracing helper. |
-| [`runk`](src/tools/runk) | utility | Standard OCI container runtime based on the agent. |
-| [`ci`](https://github.com/kata-containers/ci) | CI | Continuous Integration configuration files and scripts. |
+| [`ci`](.github/workflows) | CI | Continuous Integration configuration files and scripts. |
+| [`ocp-ci`](ci/openshift-ci/README.md) | CI | Continuous Integration configuration for the OpenShift pipelines. |
 | [`katacontainers.io`](https://github.com/kata-containers/www.katacontainers.io) | Source for the [`katacontainers.io`](https://www.katacontainers.io) site. |
+| [`Webhook`](tools/testing/kata-webhook/README.md) | utility | Example of a simple admission controller webhook to annotate pods with the Kata runtime class |
 
 ### Packaging and releases
 
-Kata Containers is now
-[available natively for most distributions](docs/install/README.md#packaged-installation-methods).
+See the [installation guide](docs/installation.md) for release tarballs, the
+`kata-deploy` Helm chart on Kubernetes, and build-from-source instructions.
 
-## Metrics tests
+## General tests
 
-See the [metrics documentation](tests/metrics/README.md).
+See the [tests documentation](tests/README.md).
 
 ## Glossary of Terms
 

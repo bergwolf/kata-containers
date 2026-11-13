@@ -11,18 +11,26 @@ use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::process::Command;
 
-use crate::{eother, sl};
+use crate::sl;
 
 // nix filesystem_type for different libc and architectures
 #[cfg(all(target_os = "linux", target_env = "musl"))]
-type FsType = libc::c_ulong;
+pub(crate) type FsType = libc::c_ulong;
 #[cfg(all(
     target_os = "linux",
     not(any(target_env = "musl", target_arch = "s390x"))
 ))]
-type FsType = libc::__fsword_t;
+pub(crate) type FsType = libc::__fsword_t;
 #[cfg(all(target_os = "linux", not(target_env = "musl"), target_arch = "s390x"))]
-type FsType = libc::c_uint;
+pub(crate) type FsType = libc::c_uint;
+
+/// Whether the filesystem holding `path` reports the given magic number; a
+/// path that cannot be statted does not.
+pub(crate) fn has_fs_magic(path: &Path, magic: FsType) -> bool {
+    nix::sys::statfs::statfs(path)
+        .map(|fs| fs.filesystem_type().0 == magic)
+        .unwrap_or(false)
+}
 
 // from linux.git/fs/fuse/inode.c: #define FUSE_SUPER_MAGIC 0x65735546
 const FUSE_SUPER_MAGIC: FsType = 0x65735546;
@@ -33,31 +41,21 @@ const OVERLAYFS_SUPER_MAGIC: FsType = 0x794c7630;
 pub fn get_base_name<P: AsRef<Path>>(src: P) -> Result<OsString> {
     let s = src.as_ref().canonicalize()?;
     s.file_name().map(|v| v.to_os_string()).ok_or_else(|| {
-        eother!(
+        std::io::Error::other(format!(
             "failed to get base name of path {}",
-            src.as_ref().to_string_lossy()
-        )
+            src.as_ref().to_string_lossy(),
+        ))
     })
 }
 
 /// Check whether `path` is on a fuse filesystem.
 pub fn is_fuse_fs<P: AsRef<Path>>(path: P) -> bool {
-    if let Ok(st) = nix::sys::statfs::statfs(path.as_ref()) {
-        if st.filesystem_type().0 == FUSE_SUPER_MAGIC {
-            return true;
-        }
-    }
-    false
+    has_fs_magic(path.as_ref(), FUSE_SUPER_MAGIC)
 }
 
 /// Check whether `path` is on a overlay filesystem.
 pub fn is_overlay_fs<P: AsRef<Path>>(path: P) -> bool {
-    if let Ok(st) = nix::sys::statfs::statfs(path.as_ref()) {
-        if st.filesystem_type().0 == OVERLAYFS_SUPER_MAGIC {
-            return true;
-        }
-    }
-    false
+    has_fs_magic(path.as_ref(), OVERLAYFS_SUPER_MAGIC)
 }
 
 /// Check whether the given path is a symlink.
@@ -80,27 +78,33 @@ pub fn reflink_copy<S: AsRef<Path>, D: AsRef<Path>>(src: S, dst: D) -> Result<()
     let dst = dst_path.to_string_lossy();
 
     if !src_path.is_file() {
-        return Err(eother!("reflink_copy src {} is not a regular file", src));
+        return Err(std::io::Error::other(format!(
+            "reflink_copy src {src} is not a regular file"
+        )));
     }
 
     // Make sure dst's parent exist. If dst is a regular file, then unlink it for later copy.
     if dst_path.exists() {
         if !dst_path.is_file() {
-            return Err(eother!("reflink_copy dst {} is not a regular file", dst));
+            return Err(std::io::Error::other(format!(
+                "reflink_copy dst {dst} is not a regular file",
+            )));
         } else {
             fs::remove_file(dst_path)?;
         }
     } else if let Some(dst_parent) = dst_path.parent() {
         if !dst_parent.exists() {
             if let Err(e) = fs::create_dir_all(dst_parent) {
-                return Err(eother!(
+                return Err(std::io::Error::other(format!(
                     "reflink_copy: create_dir_all {} failed: {:?}",
                     dst_parent.to_str().unwrap(),
-                    e
-                ));
+                    e,
+                )));
             }
         } else if !dst_parent.is_dir() {
-            return Err(eother!("reflink_copy parent of {} is not a directory", dst));
+            return Err(std::io::Error::other(format!(
+                "reflink_copy parent of {dst} is not a directory",
+            )));
         }
     }
 
@@ -119,22 +123,16 @@ pub fn reflink_copy<S: AsRef<Path>, D: AsRef<Path>>(src: S, dst: D) -> Result<()
                     "reflink_copy: reflink is not supported ({:?}), do regular copy instead", e,
                 );
                 if let Err(e) = do_regular_copy(src.as_ref(), dst.as_ref()) {
-                    return Err(eother!(
-                        "reflink_copy: regular copy {} to {} failed: {:?}",
-                        src,
-                        dst,
-                        e
-                    ));
+                    return Err(std::io::Error::other(format!(
+                        "reflink_copy: regular copy {src} to {dst} failed: {e:?}",
+                    )));
                 }
             }
             // Reflink copy failed
             _ => {
-                return Err(eother!(
-                    "reflink_copy: copy {} to {} failed: {:?}",
-                    src,
-                    dst,
-                    e,
-                ))
+                return Err(std::io::Error::other(format!(
+                    "reflink_copy: copy {src} to {dst} failed: {e:?}",
+                )))
             }
         }
     }
@@ -150,9 +148,11 @@ fn do_regular_copy(src: &str, dst: &str) -> Result<()> {
     match cmd.output() {
         Ok(output) => match output.status.success() {
             true => Ok(()),
-            false => Err(eother!("`{:?}` failed: {:?}", cmd, output)),
+            false => Err(std::io::Error::other(format!(
+                "`{cmd:?}` failed: {output:?}"
+            ))),
         },
-        Err(e) => Err(eother!("`{:?}` failed: {:?}", cmd, e)),
+        Err(e) => Err(std::io::Error::other(format!("`{cmd:?}` failed: {e:?}"))),
     }
 }
 

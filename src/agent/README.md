@@ -113,3 +113,51 @@ agent control tool, rather than the Kata runtime.
 
 For further details, see the
 [agent control tool documentation](../tools/agent-ctl/README.md#run-the-tool-and-the-agent-in-the-same-environment).
+
+## Agent options
+
+The kata agent has the ability to configure agent options in guest kernel command line at runtime. Currently, the following agent options can be configured:
+
+| Option | Name | Description  | Type | Default |
+|-|-|:-:|:-:|:-:|
+| `agent.config_file` | `Configuration file` | Allow to configure options through a configuration file from the root filesystem | string | `""` |
+| `agent.container_pipe_size` | `Container pipe sizes` | Allow to configure the stdout or stderr pipe sizes | integer | `0` |
+| `agent.debug_console` | Debug console flag | Allow to connect guest OS running inside hypervisor Connect using `kata-runtime exec <sandbox-id>` | boolean | `false` |
+| `agent.debug_console_vport` | Debug console port | Allow to specify the `vsock` port to connect the debugging console | integer | `0` |
+| `agent.guest_components_rest_api` | `api-server-rest` configuration | Select the features that the API Server Rest attestation component will run with. Valid values are `all`, `attestation`, `resource` | string | `resource` |
+| `agent.guest_components_procs` | guest-components processes | Attestation-related processes that should be spawned as children of the guest. Valid values are `none`, `attestation-agent`, `confidential-data-hub` (implies `attestation-agent`), `api-server-rest` (implies `attestation-agent` and `confidential-data-hub`) | string | `api-server-rest` |
+| `agent.hotplug_timeout` | Hotplug timeout | Allow to configure hotplug timeout(seconds) of block devices | integer | `3` |
+| `agent.cdh_api_timeout` | Confidential Data Hub (CDH) API timeout | Allow to configure CDH API timeout(seconds) | integer | `50` |
+| `agent.image_pull_timeout` | Confidential Data Hub (CDH) Image Pull API timeout | Allow to configure CDH API image pull timeout(seconds) | integer | `1200` |
+| `agent.https_proxy` | HTTPS proxy | Allow to configure `https_proxy` in the guest | string | `""` |
+| `agent.image_registry_auth` | Image registry credential URI | The URI to where image-rs can find the credentials for pulling images from private registries e.g. `file:///root/.docker/config.json` to read from a file in the guest image, or `kbs:///default/credentials/test` to get the file from the KBS| string | `""` |
+| `agent.enable_signature_verification` | Image security policy flag | Whether enable image security policy enforcement. If `true`, the resource indexed by URI `agent.image_policy_file` will be got to work as image pulling policy. | string | `""` |
+| `agent.image_policy_file` | Image security policy URI | The URI to where image-rs Typical policy URIs are like `file:///etc/image.json` to read from a file in the guest image, or `kbs:///default/security-policy/test` to get the file from the KBS| string | `""` |
+| `agent.log` | Log level | Allow the agent log level to be changed (produces more or less output) | string | `"info"` |
+| `agent.log_vport` | Log port | Allow to specify the `vsock` port to read logs | integer | `0` |
+| `agent.no_proxy` | NO proxy | Allow to configure `no_proxy` in the guest | string | `""` |
+| `agent.passfd_listener_port` | File descriptor passthrough IO listener port | Allow to set the file descriptor passthrough IO listener port | integer | `0` |
+| `agent.secure_image_storage_integrity` | Image storage integrity | Allow to use `dm-integrity` to protect the integrity of encrypted block volume | boolean | `false` |
+| `agent.server_addr` | Server address | Allow the ttRPC server address to be specified | string | `"vsock://-1:1024"` |
+| `agent.trace` | Trace mode | Allow to static tracing | boolean | `false` |
+| `systemd.unified_cgroup_hierarchy` | `Cgroup hierarchy` | Allow to setup v2 cgroups | boolean | `false` |
+
+> **Note:** Accepted values for some agent options
+>  - `agent.config_file`: If we enable `agent.config_file` in guest kernel command line,
+>    we will generate the agent config from it.
+>    The agent will fail to start if the configuration file is not present,
+>    or if it can't be parsed properly.
+>  - `agent.hotplug_timeout`, `agent.image_pull_timeout` and `agent.cdh_api_timeout`: a whole number of seconds
+>  - `agent.log`:   "critical"("fatal" | "panic") | "error" | "warn"("warning") | "info" | "debug"
+>  - `agent.server_addr`: "{VSOCK_ADDR}:{VSOCK_PORT}"
+>  - `agent.trace`: true | false
+>  - `systemd.unified_cgroup_hierarchy`: true | false
+
+For instance, you can enable the debug console and set the agent log level to debug by configuring the guest kernel command line in the configuration file:
+```toml
+kernel_params = "agent.debug_console agent.log=debug agent.hotplug_timeout=10"
+```
+results in:
+```bash
+{"msg":"announce","level":"INFO","subsystem":"root","version":"0.1.0","pid":"214","source":"agent","name":"kata-agent","config":"AgentConfig { debug_console: true, log_level: Debug, hotplug_timeout: 10s, debug_console_vport: 0, log_vport: 0, container_pipe_size: 0, server_addr: "vsock://-1:1024", passfd_listener_port: 0, unified_cgroup_hierarchy: false, tracing: false, supports_seccomp: true }","agent-version":"3.3.0-alpha0"}
+```

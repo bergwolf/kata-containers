@@ -11,11 +11,24 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"syscall"
 	"testing"
 
+	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/agent/protocols/grpc"
+	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
+	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+type noFSSharingHypervisor struct {
+	mockHypervisor
+}
+
+func (*noFSSharingHypervisor) Capabilities(context.Context) types.Capabilities {
+	return types.Capabilities{}
+}
 
 func TestSandboxSharedFilesystem(t *testing.T) {
 	if os.Getuid() != 0 {
@@ -95,4 +108,154 @@ func TestSandboxSharedFilesystem(t *testing.T) {
 	assert.NoError(err)
 	err = sandbox.fsShare.Cleanup(sandbox.ctx)
 	assert.NoError(err)
+}
+
+func TestShareRootFilesystem(t *testing.T) {
+	requireNewFilesystemShare := func(sandbox *Sandbox) *FilesystemShare {
+		fsShare, err := NewFilesystemShare(sandbox)
+		assert.NoError(t, err)
+		return fsShare
+	}
+
+	testCases := map[string]struct {
+		fsSharer       *FilesystemShare
+		container      *Container
+		wantErr        bool
+		wantSharedFile *SharedFile
+	}{
+		"force guest pull successful": {
+			fsSharer: requireNewFilesystemShare(&Sandbox{
+				config: &SandboxConfig{
+					ForceGuestPull: true,
+				},
+			}),
+			container: &Container{
+				id:           "container-id-abc",
+				rootfsSuffix: "test-suffix",
+				config: &ContainerConfig{
+					Annotations: map[string]string{
+						"io.kubernetes.cri.image-name": "test-image-name",
+					},
+					CustomSpec: &specs.Spec{
+						Annotations: map[string]string{
+							"io.kubernetes.cri.container-type": "",
+						},
+					},
+				},
+			},
+			wantSharedFile: &SharedFile{
+				containerStorages: []*grpc.Storage{{
+					Fstype:     "overlay",
+					Source:     "test-image-name",
+					MountPoint: "/run/kata-containers/container-id-abc/test-suffix",
+					Driver:     "image_guest_pull",
+				}},
+				guestPath: "/run/kata-containers/container-id-abc/test-suffix",
+			},
+		},
+		"force guest pull image name missing": {
+			fsSharer: requireNewFilesystemShare(&Sandbox{
+				config: &SandboxConfig{
+					ForceGuestPull: true,
+				},
+			}),
+			container: &Container{
+				id:           "container-id-abc",
+				rootfsSuffix: "test-suffix",
+				config: &ContainerConfig{
+					Annotations: map[string]string{},
+					CustomSpec: &specs.Spec{
+						Annotations: map[string]string{
+							"io.kubernetes.cri.container-type": "",
+						},
+					},
+				},
+			},
+			wantErr: true,
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			assert := assert.New(t)
+
+			sharedFile, err := tc.fsSharer.ShareRootFilesystem(context.Background(), tc.container)
+			if tc.wantErr {
+				assert.Error(err)
+				return
+			}
+			assert.NoError(err)
+
+			assert.Equal(tc.wantSharedFile, sharedFile)
+		})
+	}
+}
+
+func TestShareFileName(t *testing.T) {
+	testCases := map[string]struct {
+		containerID    string
+		source         string
+		destination    string
+		randHex        string
+		sandboxScoped  bool
+		expectedResult string
+	}{
+		"container scoped": {
+			containerID:    "container-id-abc",
+			source:         "/var/lib/kubelet/pods/poduid/volumes/kubernetes.io~empty-dir/cache",
+			destination:    "/mnt/cache",
+			randHex:        "0011223344556677",
+			expectedResult: "container-id-abc-0011223344556677-cache",
+		},
+		"sandbox scoped source basename": {
+			containerID:    "container-id-abc",
+			source:         "/var/lib/kubelet/pods/poduid/volumes/kubernetes.io~empty-dir/cache/",
+			destination:    "/mnt/different-cache-name",
+			randHex:        "0011223344556677",
+			sandboxScoped:  true,
+			expectedResult: "sandbox-0011223344556677-cache",
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			assert.Equal(t, tc.expectedResult, shareFileName(tc.containerID, tc.source, tc.destination, tc.randHex, tc.sandboxScoped))
+		})
+	}
+}
+
+func TestShareFileCopyGuestPath(t *testing.T) {
+	originalKataGuestSharedDir := kataGuestSharedDir
+	kataGuestSharedDir = func() string {
+		return "/run/user/1002" + defaultKataGuestSharedDir
+	}
+	t.Cleanup(func() {
+		kataGuestSharedDir = originalKataGuestSharedDir
+	})
+
+	sandbox := &Sandbox{
+		ctx:        context.Background(),
+		id:         "sandbox-id",
+		agent:      newMockAgent(),
+		hypervisor: &noFSSharingHypervisor{},
+	}
+	fsShare, err := NewFilesystemShare(sandbox)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		fsShare.watcher.Close()
+	})
+
+	source := filepath.Join(t.TempDir(), "resolv.conf")
+	require.NoError(t, os.WriteFile(source, []byte("nameserver 192.0.2.1\n"), 0o644))
+
+	sharedFile, err := fsShare.ShareFile(context.Background(), &Container{id: "container-id"}, &Mount{
+		Source:      source,
+		Destination: "/etc/resolv.conf",
+	})
+	require.NoError(t, err)
+	require.NotNil(t, sharedFile)
+
+	expected := "^" + regexp.QuoteMeta(defaultKataGuestSharedDir) +
+		`container-id-[0-9a-f]{16}-resolv\.conf$`
+	assert.Regexp(t, expected, sharedFile.guestPath)
 }

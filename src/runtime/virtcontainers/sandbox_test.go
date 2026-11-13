@@ -8,6 +8,7 @@ package virtcontainers
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"path"
 	"path/filepath"
@@ -15,6 +16,7 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/drivers"
@@ -23,7 +25,6 @@ import (
 	exp "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/experimental"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/persist/fs"
 
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/annotations"
 	vcAnnotations "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/annotations"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
@@ -50,6 +51,11 @@ func testCreateSandbox(t *testing.T, id string,
 	nconfig NetworkConfig, containers []ContainerConfig,
 	volumes []types.Volume) (*Sandbox, error) {
 
+	// GITHUB_RUNNER_CI_NON_VIRT is set to true in .github/workflows/build-checks.yaml file for ARM64 runners because the self hosted runners do not support Virtualization
+	if os.Getenv("GITHUB_RUNNER_CI_NON_VIRT") == "true" {
+		t.Skip("Skipping the test as the GitHub self hosted runners for ARM64 do not support Virtualization")
+	}
+
 	if tc.NotValid(ktu.NeedRoot()) {
 		t.Skip(testDisabledAsNonRoot)
 	}
@@ -62,6 +68,7 @@ func testCreateSandbox(t *testing.T, id string,
 		Volumes:          volumes,
 		Containers:       containers,
 		Annotations:      sandboxAnnotations,
+		VfioMode:         config.VFIOModeGuestKernel,
 	}
 
 	ctx := WithNewAgentFunc(context.Background(), newMockAgent)
@@ -108,6 +115,122 @@ func TestCreateMockSandbox(t *testing.T) {
 	defer cleanUp()
 }
 
+func TestConsoleWatcherConnectsWhenSocketAppears(t *testing.T) {
+	socketPath := filepath.Join(t.TempDir(), "console.sock")
+	watcher := &consoleWatcher{
+		proto:      consoleProtoUnix,
+		consoleURL: socketPath,
+	}
+	sandbox := &Sandbox{id: testSandboxID}
+
+	start := time.Now()
+	assert.NoError(t, watcher.start(sandbox))
+	assert.Less(t, time.Since(start), time.Second)
+
+	listener, err := net.Listen("unix", socketPath)
+	if !assert.NoError(t, err) {
+		watcher.stop()
+		return
+	}
+	defer listener.Close()
+
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err == nil {
+			accepted <- conn
+		}
+	}()
+
+	var consoleConn net.Conn
+	select {
+	case conn := <-accepted:
+		consoleConn = conn
+	case <-time.After(time.Second):
+		watcher.stop()
+		t.Fatal("console watcher did not connect after the socket appeared")
+	}
+
+	consoleConn.Close()
+	watcher.stop()
+}
+
+func TestConsoleWatcherStopDrainsConnectedConsole(t *testing.T) {
+	socketPath := filepath.Join(t.TempDir(), "console.sock")
+	listener, err := net.Listen("unix", socketPath)
+	if !assert.NoError(t, err) {
+		return
+	}
+	defer listener.Close()
+
+	watcher := &consoleWatcher{
+		proto:      consoleProtoUnix,
+		consoleURL: socketPath,
+	}
+	sandbox := &Sandbox{id: testSandboxID}
+
+	assert.NoError(t, watcher.start(sandbox))
+
+	consoleConn, err := listener.Accept()
+	if !assert.NoError(t, err) {
+		watcher.stop()
+		return
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		watcher.Lock()
+		connected := watcher.conn != nil
+		watcher.Unlock()
+		if connected {
+			break
+		}
+		if time.Now().After(deadline) {
+			consoleConn.Close()
+			watcher.stop()
+			t.Fatal("console watcher did not record the connection")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	stopped := make(chan struct{})
+	go func() {
+		watcher.stop()
+		close(stopped)
+	}()
+
+	select {
+	case <-stopped:
+		consoleConn.Close()
+		t.Fatal("console watcher stopped before console EOF")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	_, err = consoleConn.Write([]byte("final console line\n"))
+	assert.NoError(t, err)
+	assert.NoError(t, consoleConn.Close())
+
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("console watcher did not stop after console EOF")
+	}
+}
+
+func TestConsoleWatcherStopCancelsConnect(t *testing.T) {
+	watcher := &consoleWatcher{
+		proto:      consoleProtoUnix,
+		consoleURL: filepath.Join(t.TempDir(), "missing-console.sock"),
+	}
+	sandbox := &Sandbox{id: testSandboxID}
+
+	assert.NoError(t, watcher.start(sandbox))
+
+	start := time.Now()
+	watcher.stop()
+	assert.Less(t, time.Since(start), time.Second)
+}
+
 func TestCalculateSandboxCPUs(t *testing.T) {
 	sandbox := &Sandbox{}
 	sandbox.config = &SandboxConfig{}
@@ -126,7 +249,7 @@ func TestCalculateSandboxCPUs(t *testing.T) {
 	tests := []struct {
 		name       string
 		containers []ContainerConfig
-		want       uint32
+		want       float32
 	}{
 		{"1-unconstrained", []ContainerConfig{unconstrained}, 0},
 		{"2-unconstrained", []ContainerConfig{unconstrained, unconstrained}, 0},
@@ -223,7 +346,7 @@ func TestPrepareEphemeralMounts(t *testing.T) {
 		assert.Equal(t, s.Driver, KataEphemeralDevType)
 		assert.Equal(t, s.Source, "tmpfs")
 		assert.Equal(t, s.Fstype, "tmpfs")
-		assert.Equal(t, s.MountPoint, filepath.Join(ephemeralPath(), "tmp"))
+		assert.Equal(t, s.MountPoint, filepath.Join(defaultEphemeralPath, "tmp"))
 		assert.Equal(t, len(s.Options), 2) // remount, size=1024M
 
 		validSet := map[string]struct{}{
@@ -673,67 +796,58 @@ func TestSandboxCreateAssets(t *testing.T) {
 	originalInitrdPath := filepath.Join(testDir, testInitrd)
 	originalFirmwarePath := filepath.Join(testDir, testFirmware)
 	originalHypervisorPath := filepath.Join(testDir, testHypervisor)
-	originalHypervisorCtlPath := filepath.Join(testDir, testHypervisorCtl)
 	originalJailerPath := filepath.Join(testDir, testJailer)
 
 	hc := HypervisorConfig{
-		KernelPath:        originalKernelPath,
-		ImagePath:         originalImagePath,
-		InitrdPath:        originalInitrdPath,
-		FirmwarePath:      originalFirmwarePath,
-		HypervisorPath:    originalHypervisorPath,
-		HypervisorCtlPath: originalHypervisorCtlPath,
-		JailerPath:        originalJailerPath,
+		KernelPath:     originalKernelPath,
+		ImagePath:      originalImagePath,
+		InitrdPath:     originalInitrdPath,
+		FirmwarePath:   originalFirmwarePath,
+		HypervisorPath: originalHypervisorPath,
+		JailerPath:     originalJailerPath,
 	}
 
 	data := []testData{
 		{
 			types.FirmwareAsset,
 			map[string]string{
-				annotations.FirmwarePath: filename,
-				annotations.FirmwareHash: assetContentHash,
+				vcAnnotations.FirmwarePath: filename,
+				vcAnnotations.FirmwareHash: assetContentHash,
 			},
 		},
 		{
 			types.HypervisorAsset,
 			map[string]string{
-				annotations.HypervisorPath: filename,
-				annotations.HypervisorHash: assetContentHash,
-			},
-		},
-		{
-			types.HypervisorCtlAsset,
-			map[string]string{
-				annotations.HypervisorCtlPath: filename,
-				annotations.HypervisorCtlHash: assetContentHash,
+				vcAnnotations.HypervisorPath: filename,
+				vcAnnotations.HypervisorHash: assetContentHash,
 			},
 		},
 		{
 			types.ImageAsset,
 			map[string]string{
-				annotations.ImagePath: filename,
-				annotations.ImageHash: assetContentHash,
+				vcAnnotations.ImagePath: filename,
+				vcAnnotations.ImageHash: assetContentHash,
 			},
 		},
 		{
 			types.InitrdAsset,
 			map[string]string{
-				annotations.InitrdPath: filename,
-				annotations.InitrdHash: assetContentHash,
+				vcAnnotations.InitrdPath: filename,
+				vcAnnotations.InitrdHash: assetContentHash,
 			},
 		},
 		{
 			types.JailerAsset,
 			map[string]string{
-				annotations.JailerPath: filename,
-				annotations.JailerHash: assetContentHash,
+				vcAnnotations.JailerPath: filename,
+				vcAnnotations.JailerHash: assetContentHash,
 			},
 		},
 		{
 			types.KernelAsset,
 			map[string]string{
-				annotations.KernelPath: filename,
-				annotations.KernelHash: assetContentHash,
+				vcAnnotations.KernelPath: filename,
+				vcAnnotations.KernelHash: assetContentHash,
 			},
 		},
 	}
@@ -771,6 +885,24 @@ func TestSandboxCreateAssets(t *testing.T) {
 		err = createAssets(context.Background(), config)
 		assert.Error(err, msg)
 	}
+
+	// Remote Hypervisor scenario for ImagePath
+	msg := "test[image]: imagePath"
+	imagePathData := &testData{
+		assetType: types.ImageAsset,
+		annotations: map[string]string{
+			vcAnnotations.ImagePath: "rhel9-os",
+		},
+	}
+
+	config := &SandboxConfig{
+		Annotations:      imagePathData.annotations,
+		HypervisorConfig: hc,
+		HypervisorType:   RemoteHypervisor,
+	}
+
+	err = createAssets(context.Background(), config)
+	assert.NoError(err, msg)
 }
 
 func testFindContainerFailure(t *testing.T, sandbox *Sandbox, cid string) {
@@ -1297,6 +1429,10 @@ func checkSandboxRemains() error {
 }
 
 func TestSandboxCreationFromConfigRollbackFromCreateSandbox(t *testing.T) {
+	// GITHUB_RUNNER_CI_NON_VIRT is set to true in .github/workflows/build-checks.yaml file for ARM64 runners because the self hosted runners do not support Virtualization
+	if os.Getenv("GITHUB_RUNNER_CI_NON_VIRT") == "true" {
+		t.Skip("Skipping the test as the GitHub self hosted runners for ARM64 do not support Virtualization")
+	}
 	defer cleanUp()
 	assert := assert.New(t)
 	ctx := context.Background()
@@ -1388,15 +1524,19 @@ func TestSandboxExperimentalFeature(t *testing.T) {
 }
 
 func TestSandbox_Cgroups(t *testing.T) {
+	// GITHUB_RUNNER_CI_NON_VIRT is set to true in .github/workflows/build-checks.yaml file for ARM64 runners because the self hosted runners do not support Virtualization
+	if os.Getenv("GITHUB_RUNNER_CI_NON_VIRT") == "true" {
+		t.Skip("Skipping the test as the GitHub self hosted runners for ARM64 do not support Virtualization")
+	}
 	sandboxContainer := ContainerConfig{}
 	sandboxContainer.Annotations = make(map[string]string)
-	sandboxContainer.Annotations[annotations.ContainerTypeKey] = string(PodSandbox)
+	sandboxContainer.Annotations[vcAnnotations.ContainerTypeKey] = string(PodSandbox)
 
 	emptyJSONLinux := ContainerConfig{
 		CustomSpec: newEmptySpec(),
 	}
 	emptyJSONLinux.Annotations = make(map[string]string)
-	emptyJSONLinux.Annotations[annotations.ContainerTypeKey] = string(PodSandbox)
+	emptyJSONLinux.Annotations[vcAnnotations.ContainerTypeKey] = string(PodSandbox)
 
 	cloneSpec1 := newEmptySpec()
 	cloneSpec1.Linux.CgroupsPath = "/myRuntime/myContainer"
@@ -1404,7 +1544,7 @@ func TestSandbox_Cgroups(t *testing.T) {
 		CustomSpec: cloneSpec1,
 	}
 	successfulContainer.Annotations = make(map[string]string)
-	successfulContainer.Annotations[annotations.ContainerTypeKey] = string(PodSandbox)
+	successfulContainer.Annotations[vcAnnotations.ContainerTypeKey] = string(PodSandbox)
 
 	// nolint: govet
 	tests := []struct {
@@ -1458,6 +1598,19 @@ func TestSandbox_Cgroups(t *testing.T) {
 				config: &SandboxConfig{Containers: []ContainerConfig{
 					successfulContainer,
 				}}},
+			false,
+			true,
+		},
+		{
+			"sandbox, remote hypervisor (no kvm required)",
+			&Sandbox{
+				config: &SandboxConfig{
+					HypervisorType: RemoteHypervisor,
+					Containers: []ContainerConfig{
+						successfulContainer,
+					},
+				},
+			},
 			false,
 			true,
 		},
@@ -1643,4 +1796,121 @@ func TestSandboxHugepageLimit(t *testing.T) {
 	}
 	err = s.updateResources(context.Background())
 	assert.NoError(t, err)
+}
+
+// TestCheckVCPUsPinningNUMAMemoryOnly verifies that when vCPUs < NUMA nodes
+// (memory-only topology for pxb-pcie GPU placement), the function does not
+// return a vCPU-distribution error — the single vCPU is assigned to the first
+// node, memory-only nodes receive 0 vCPUs and are skipped in the pinning loop.
+// SetThreadAffinity may fail in the test environment (no real thread to pin),
+// so we accept any low-level affinity error but must not see a topology error.
+func TestCheckVCPUsPinningNUMAMemoryOnly(t *testing.T) {
+	assert := assert.New(t)
+	s := &Sandbox{}
+	// 1 vCPU, 2 NUMA nodes — simulates memory-only node 1 for pxb-pcie.
+	vCPUThreadsMap := VcpuThreadIDs{vcpus: map[int]int{0: 100}}
+	numaNodes := []types.GuestNUMANode{
+		{HostNodes: "0", HostCPUs: "0-3"},
+		{HostNodes: "1", HostCPUs: "4-7"},
+	}
+	err := s.checkVCPUsPinningNUMA(context.Background(), vCPUThreadsMap, numaNodes, []int{0, 1, 2, 3, 4, 5, 6, 7})
+	if err != nil {
+		// The only permissible failure here is a low-level affinity syscall
+		// error (no real thread in the test process).  A NUMA-topology error
+		// — "no NUMA nodes", "HostCPUs … must not be empty", or a vCPU
+		// distribution failure — must never be returned.
+		assert.NotContains(err.Error(), "no NUMA nodes")
+		assert.NotContains(err.Error(), "HostCPUs")
+		assert.NotContains(err.Error(), "failed to compute NUMA vCPU distribution")
+	}
+}
+
+func TestCheckVCPUsPinningNUMABadHostCPUs(t *testing.T) {
+	assert := assert.New(t)
+	s := &Sandbox{}
+	vCPUThreadsMap := VcpuThreadIDs{vcpus: map[int]int{0: 100, 1: 101, 2: 102, 3: 103}}
+	numaNodes := []types.GuestNUMANode{
+		{HostNodes: "0", HostCPUs: "not-valid"},
+		{HostNodes: "1", HostCPUs: "4-7"},
+	}
+	err := s.checkVCPUsPinningNUMA(context.Background(), vCPUThreadsMap, numaNodes, []int{0, 1, 2, 3, 4, 5, 6, 7})
+	assert.Error(err)
+	assert.Contains(err.Error(), "failed to parse HostCPUs")
+}
+
+func TestHotplugVfioNetworkDeviceAlreadyAttached(t *testing.T) {
+	assert := assert.New(t)
+
+	pciPath, err := types.PciPathFromString("02")
+	assert.NoError(err)
+
+	s := &Sandbox{
+		config: &SandboxConfig{
+			HypervisorConfig: HypervisorConfig{
+				HotPlugVFIO: config.NoPort,
+			},
+		},
+	}
+
+	// An endpoint whose guest PCI path is already known has been hotplugged
+	// before: the call must be a no-op, even when no hotplug port is
+	// configured.
+	ep := &VfioEndpoint{
+		EndpointType: VfioEndpointType,
+		HostBDF:      "0000:ff:1f.7",
+		PCIPath:      pciPath,
+		Iface:        NetworkInterface{Name: "eth1"},
+	}
+
+	assert.NoError(s.hotplugVfioNetworkDevice(context.Background(), ep))
+	assert.Equal(pciPath, ep.PciPath())
+}
+
+func TestHotplugVfioNetworkDeviceNoPort(t *testing.T) {
+	assert := assert.New(t)
+
+	s := &Sandbox{
+		config: &SandboxConfig{
+			HypervisorConfig: HypervisorConfig{
+				HotPlugVFIO: config.NoPort,
+			},
+		},
+	}
+
+	ep := &VfioEndpoint{
+		EndpointType: VfioEndpointType,
+		HostBDF:      "0000:ff:1f.7",
+		Iface:        NetworkInterface{Name: "eth1"},
+	}
+
+	err := s.hotplugVfioNetworkDevice(context.Background(), ep)
+	assert.Error(err)
+	assert.Contains(err.Error(), "hot_plug_vfio")
+	assert.True(ep.PciPath().IsNil())
+}
+
+func TestHotplugVfioNetworkDevicePortConfigured(t *testing.T) {
+	assert := assert.New(t)
+
+	s := &Sandbox{
+		config: &SandboxConfig{
+			HypervisorConfig: HypervisorConfig{
+				HotPlugVFIO: config.RootPort,
+			},
+		},
+	}
+
+	// With a hotplug port configured the guards are passed and the VFIO
+	// device path resolution is attempted. The malformed BDF cannot match
+	// any sysfs PCI device directory, so the resolution fails
+	// deterministically on every host.
+	ep := &VfioEndpoint{
+		EndpointType: VfioEndpointType,
+		HostBDF:      "not-a-bdf",
+		Iface:        NetworkInterface{Name: "eth1"},
+	}
+
+	err := s.hotplugVfioNetworkDevice(context.Background(), ep)
+	assert.Error(err)
+	assert.Contains(err.Error(), "failed to resolve VFIO device path")
 }

@@ -44,7 +44,7 @@ type VMConfig struct {
 }
 
 func (c *VMConfig) Valid() error {
-	return validateHypervisorConfig(&c.HypervisorConfig)
+	return validateHypervisorConfig(&c.HypervisorConfig, c.HypervisorType)
 }
 
 // ToGrpc convert VMConfig struct to grpc format pb.GrpcVMConfig.
@@ -160,7 +160,7 @@ func NewVM(ctx context.Context, config VMConfig) (*VM, error) {
 		id:         id,
 		hypervisor: hypervisor,
 		agent:      agent,
-		cpu:        config.HypervisorConfig.NumVCPUs,
+		cpu:        config.HypervisorConfig.NumVCPUs(),
 		memory:     config.HypervisorConfig.MemorySize,
 		store:      store,
 	}, nil

@@ -2,6 +2,9 @@ name: CI | Run kubernetes tests on AKS
 on:
   workflow_call:
     inputs:
+      tarball-suffix:
+        required: false
+        type: string
       registry:
         required: true
         type: string
@@ -21,25 +24,62 @@ on:
         required: false
         type: string
         default: ""
+    secrets:
+
+      AZ_APPID:
+        required: true
+      AZ_TENANT_ID:
+        required: true
+      AZ_SUBSCRIPTION_ID:
+        required: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-aks
+  cancel-in-progress: true
+
+permissions: {}
 
 jobs:
   run-k8s-tests:
+    name: run-k8s-tests
     strategy:
       fail-fast: false
       matrix:
-        host_os:
-          - ubuntu
-        vmm:
-          - clh
-          - dragonball
-          - qemu
-        instance-type:
-          - small
-          - normal
         include:
           - host_os: cbl-mariner
-            vmm: clh
-    runs-on: ubuntu-latest
+            vmm: clh-azure
+            instance-type: small
+            genpolicy-pull-method: oci-distribution
+          - host_os: cbl-mariner
+            vmm: clh-azure
+            instance-type: small
+            genpolicy-pull-method: containerd
+          - host_os: cbl-mariner
+            vmm: clh-azure
+            instance-type: normal
+          - host_os: cbl-mariner
+            vmm: clh-azure-runtime-rs
+            instance-type: small
+          - host_os: cbl-mariner
+            vmm: clh-azure-runtime-rs
+            instance-type: normal
+          - host_os: cbl-mariner
+            vmm: openvmm-azure-runtime-rs
+            instance-type: small
+          - host_os: cbl-mariner
+            vmm: openvmm-azure-runtime-rs
+            instance-type: normal
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.job }}-${{ github.event.pull_request.number || github.ref }}-run-k8s-tests-aks-${{ toJSON(matrix) }}
+      cancel-in-progress: true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      id-token: write # Used for OIDC access to log into Azure
+    environment:
+      name: ci
+      deployment: false
     env:
       DOCKER_REGISTRY: ${{ inputs.registry }}
       DOCKER_REPO: ${{ inputs.repo }}
@@ -48,13 +88,16 @@ jobs:
       KATA_HOST_OS: ${{ matrix.host_os }}
       KATA_HYPERVISOR: ${{ matrix.vmm }}
       KUBERNETES: "vanilla"
-      USING_NFD: "false"
       K8S_TEST_HOST_TYPE: ${{ matrix.instance-type }}
+      GENPOLICY_PULL_METHOD: ${{ matrix.genpolicy-pull-method }}
+      RUNS_ON_AKS: "true"
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.commit-hash }}
+          allow-unsafe-pr-checkout: true
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Rebase atop of the latest target branch
         run: |
@@ -62,37 +105,72 @@ jobs:
         env:
           TARGET_BRANCH: ${{ inputs.target-branch }}
 
+      - name: get-kata-tools-tarball
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: kata-tools-static-tarball-amd64${{ inputs.tarball-suffix }}
+          path: kata-tools-artifacts
+
+      - name: Install kata-tools
+        run: bash tests/integration/kubernetes/gha-run.sh install-kata-tools kata-tools-artifacts
+
       - name: Download Azure CLI
-        run: bash tests/integration/kubernetes/gha-run.sh install-azure-cli
+        uses: azure/setup-kubectl@15650b3ad78fff148532a140b8a4c821796b2d7b # v5.0.0
+        with:
+          version: 'latest'
 
       - name: Log into the Azure account
-        run: bash tests/integration/kubernetes/gha-run.sh login-azure
-        env:
-          AZ_APPID: ${{ secrets.AZ_APPID }}
-          AZ_PASSWORD: ${{ secrets.AZ_PASSWORD }}
-          AZ_TENANT_ID: ${{ secrets.AZ_TENANT_ID }}
+        uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43 # v3.0.0
+        with:
+          client-id: ${{ secrets.AZ_APPID }}
+          tenant-id: ${{ secrets.AZ_TENANT_ID }}
+          subscription-id: ${{ secrets.AZ_SUBSCRIPTION_ID }}
 
       - name: Create AKS cluster
-        timeout-minutes: 10
-        run: bash tests/integration/kubernetes/gha-run.sh create-cluster
+        uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60 # v4.0.0
+        with:
+          timeout_minutes: 15
+          max_attempts: 20
+          retry_on: error
+          retry_wait_seconds: 10
+          command: bash tests/integration/kubernetes/gha-run.sh create-cluster
 
       - name: Install `bats`
         run: bash tests/integration/kubernetes/gha-run.sh install-bats
 
       - name: Install `kubectl`
-        run: bash tests/integration/kubernetes/gha-run.sh install-kubectl
+        uses: azure/setup-kubectl@15650b3ad78fff148532a140b8a4c821796b2d7b # v5.0.0
+        with:
+          version: 'latest'
 
       - name: Download credentials for the Kubernetes CLI to use them
         run: bash tests/integration/kubernetes/gha-run.sh get-cluster-credentials
 
       - name: Deploy Kata
-        timeout-minutes: 10
+        timeout-minutes: 20
         run: bash tests/integration/kubernetes/gha-run.sh deploy-kata-aks
-      
+
       - name: Run tests
         timeout-minutes: 60
         run: bash tests/integration/kubernetes/gha-run.sh run-tests
 
+      - name: Report tests
+        if: always()
+        run: bash tests/integration/kubernetes/gha-run.sh report-tests
+
+      - name: Refresh OIDC token in case access token expired
+        if: always()
+        uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43 # v3.0.0
+        with:
+          client-id: ${{ secrets.AZ_APPID }}
+          tenant-id: ${{ secrets.AZ_TENANT_ID }}
+          subscription-id: ${{ secrets.AZ_SUBSCRIPTION_ID }}
+
       - name: Delete AKS cluster
         if: always()
-        run: bash tests/integration/kubernetes/gha-run.sh delete-cluster
+        uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60 # v4.0.0
+        with:
+          timeout_minutes: 15
+          max_attempts: 3
+          retry_wait_seconds: 300
+          command: bash tests/integration/kubernetes/gha-run.sh delete-cluster

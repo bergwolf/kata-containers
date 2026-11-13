@@ -25,6 +25,7 @@ type MacvtapEndpoint struct {
 	VMFds              []*os.File
 	VhostFds           []*os.File
 	PCIPath            vcTypes.PciPath
+	CCWDevice          *vcTypes.CcwDevice
 	RxRateLimiter      bool
 	TxRateLimiter      bool
 }
@@ -71,13 +72,13 @@ func (endpoint *MacvtapEndpoint) Attach(ctx context.Context, s *Sandbox) error {
 
 	h := s.hypervisor
 
-	endpoint.VMFds, err = createMacvtapFds(endpoint.EndpointProperties.Iface.Index, int(h.HypervisorConfig().NumVCPUs))
+	endpoint.VMFds, err = createMacvtapFds(endpoint.EndpointProperties.Iface.Index, int(h.HypervisorConfig().NumVCPUs()))
 	if err != nil {
 		return fmt.Errorf("Could not setup macvtap fds %s: %s", endpoint.EndpointProperties.Iface.Name, err)
 	}
 
 	if !h.HypervisorConfig().DisableVhostNet {
-		vhostFds, err := createVhostFds(int(h.HypervisorConfig().NumVCPUs))
+		vhostFds, err := createVhostFds(int(h.HypervisorConfig().NumVCPUs()))
 		if err != nil {
 			return fmt.Errorf("Could not setup vhost fds %s : %s", endpoint.EndpointProperties.Iface.Name, err)
 		}
@@ -93,12 +94,12 @@ func (endpoint *MacvtapEndpoint) Detach(ctx context.Context, netNsCreated bool, 
 }
 
 // HotAttach for macvtap endpoint not supported yet
-func (endpoint *MacvtapEndpoint) HotAttach(ctx context.Context, h Hypervisor) error {
+func (endpoint *MacvtapEndpoint) HotAttach(ctx context.Context, s *Sandbox) error {
 	return fmt.Errorf("MacvtapEndpoint does not support Hot attach")
 }
 
 // HotDetach for macvtap endpoint not supported yet
-func (endpoint *MacvtapEndpoint) HotDetach(ctx context.Context, h Hypervisor, netNsCreated bool, netNsPath string) error {
+func (endpoint *MacvtapEndpoint) HotDetach(ctx context.Context, s *Sandbox, netNsCreated bool, netNsPath string) error {
 	return fmt.Errorf("MacvtapEndpoint does not support Hot detach")
 }
 
@@ -110,6 +111,16 @@ func (endpoint *MacvtapEndpoint) PciPath() vcTypes.PciPath {
 // SetPciPath sets the PCI path of the endpoint.
 func (endpoint *MacvtapEndpoint) SetPciPath(pciPath vcTypes.PciPath) {
 	endpoint.PCIPath = pciPath
+}
+
+// CcwDevice returns the CCW device of the endpoint.
+func (endpoint *MacvtapEndpoint) CcwDevice() *vcTypes.CcwDevice {
+	return endpoint.CCWDevice
+}
+
+// SetCcwDevice sets the CCW device of the endpoint.
+func (endpoint *MacvtapEndpoint) SetCcwDevice(ccwDev vcTypes.CcwDevice) {
+	endpoint.CCWDevice = &ccwDev
 }
 
 // NetworkPair returns the network pair of the endpoint.

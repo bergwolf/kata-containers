@@ -32,7 +32,7 @@ For virtio-fs, the [runtime](README.md#runtime) starts one `virtiofsd` daemon
 ## Devicemapper
 
 The
-[devicemapper `snapshotter`](https://github.com/containerd/containerd/tree/main/snapshots/devmapper)
+[devicemapper `snapshotter`](https://github.com/containerd/containerd/blob/main/docs/snapshotters/devmapper.md)
 is a special case. The `snapshotter` uses dedicated block devices
 rather than formatted filesystems, and operates at the block level
 rather than the file level. This knowledge is used to directly use the
@@ -51,6 +51,8 @@ containers started after the VM has been launched.
 Users can check to see if the container uses the `devicemapper` block
 device as its rootfs by calling `mount(8)` within the container. If
 the `devicemapper` block device is used, the root filesystem (`/`)
-will be mounted from `/dev/vda`. Users can disable direct mounting of
-the underlying block device through the runtime
-[configuration](README.md#configuration).
+will be mounted from `/dev/vda`. Users of the Go runtime can enable
+direct mounting of the underlying block device by setting the runtime
+[configuration](README.md#configuration) flag `disable_block_device_use` to
+`false`. This is the default behavior in the Rust runtime and this flag
+is not supported there.

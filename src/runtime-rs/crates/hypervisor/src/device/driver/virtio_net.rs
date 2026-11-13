@@ -9,12 +9,12 @@ use std::fmt;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 
-use crate::{
-    device::{Device, DeviceType},
-    Hypervisor as hypervisor,
-};
+use crate::device::pci_path::PciPath;
+use crate::device::topology::PCIeTopology;
+use crate::device::{Device, DeviceType};
+use crate::Hypervisor as hypervisor;
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct Address(pub [u8; 6]);
 
 impl fmt::Debug for Address {
@@ -35,18 +35,22 @@ pub struct NetworkConfig {
 
     /// Host level path for the guest network interface.
     pub host_dev_name: String,
-
     /// Guest iface name for the guest network interface.
     pub virt_iface_name: String,
-
     /// Guest MAC address.
     pub guest_mac: Option<Address>,
-
     /// Virtio queue size
     pub queue_size: usize,
-
     /// Virtio queue num
     pub queue_num: usize,
+    /// Use shared irq
+    pub use_shared_irq: Option<bool>,
+    /// Use generic irq
+    pub use_generic_irq: Option<bool>,
+    /// Allow duplicate mac
+    pub allow_duplicate_mac: bool,
+    /// Guest PCI path after hot-plug (used by the agent to wait for uevents).
+    pub pci_path: Option<PciPath>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -70,20 +74,38 @@ impl NetworkDevice {
 
 #[async_trait]
 impl Device for NetworkDevice {
-    async fn attach(&mut self, h: &dyn hypervisor) -> Result<()> {
-        h.add_device(DeviceType::Network(self.clone()))
+    async fn attach(
+        &mut self,
+        _pcie_topo: &mut Option<&mut PCIeTopology>,
+        h: &dyn hypervisor,
+    ) -> Result<()> {
+        let updated = h
+            .add_device(DeviceType::Network(self.clone()))
             .await
             .context("add network device.")?;
 
-        return Ok(());
+        if let DeviceType::Network(net) = updated {
+            self.config = net.config;
+        }
+
+        Ok(())
     }
 
-    async fn detach(&mut self, h: &dyn hypervisor) -> Result<Option<u64>> {
+    async fn detach(
+        &mut self,
+        _pcie_topo: &mut Option<&mut PCIeTopology>,
+        h: &dyn hypervisor,
+    ) -> Result<Option<u64>> {
         h.remove_device(DeviceType::Network(self.clone()))
             .await
             .context("remove network device.")?;
 
         Ok(Some(self.config.index))
+    }
+
+    async fn update(&mut self, _h: &dyn hypervisor) -> Result<()> {
+        // There's no need to do update for network device
+        Ok(())
     }
 
     async fn get_device_info(&self) -> DeviceType {

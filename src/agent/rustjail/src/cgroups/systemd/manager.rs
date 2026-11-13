@@ -4,11 +4,14 @@
 //
 
 use crate::cgroups::Manager as CgroupManager;
+use crate::cgroups_rs as cgroups;
 use crate::protocols::agent::CgroupStats;
 use anyhow::{anyhow, Result};
 use cgroups::freezer::FreezerState;
 use libc::{self, pid_t};
 use oci::LinuxResources;
+use oci_spec::runtime as oci;
+use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::collections::HashMap;
 use std::convert::TryInto;
@@ -40,7 +43,8 @@ pub struct Manager {
 impl CgroupManager for Manager {
     fn apply(&self, pid: pid_t) -> Result<()> {
         if self.dbus_client.unit_exists()? {
-            self.dbus_client.add_process(pid)?;
+            let subcgroup = self.fs_manager.subcgroup();
+            self.dbus_client.add_process(pid, subcgroup)?;
         } else {
             self.dbus_client.start_unit(
                 (pid as u32).try_into().unwrap(),
@@ -80,7 +84,7 @@ impl CgroupManager for Manager {
         }
     }
 
-    fn destroy(&mut self) -> Result<()> {
+    fn destroy(&self) -> Result<()> {
         self.dbus_client.kill_unit()?;
         self.fs_manager.destroy()
     }
@@ -113,7 +117,7 @@ impl Manager {
         let (parent_slice, unit_name) = cgroups_path.parse()?;
         let cpath = parent_slice + "/" + &unit_name;
 
-        let fs_manager = FsManager::new(cpath.as_str())?;
+        let fs_manager = FsManager::new_systemd(cpath.as_str())?;
 
         Ok(Manager {
             paths: fs_manager.paths.clone(),

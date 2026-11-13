@@ -171,10 +171,9 @@ allows you to think about what types of value to test.
 
 ### Other categories of test
 
-Raised a GitHub issue in the
-[`tests`](https://github.com/kata-containers/tests) repository that
+Raised a GitHub issue in the Kata Containers repository that
 explains what sort of test is required along with as much detail as
-possible. Ensure the original issue is referenced on the `tests` issue.
+possible. Ensure the original issue is referenced in the issue.
 
 ### Unsafe code
 
@@ -229,13 +228,7 @@ maintenance issue.
 ### Markdown syntax
 
 Run the
-[markdown checker](https://github.com/kata-containers/tests/tree/main/cmd/check-markdown)
-on your documentation changes.
-
-### Spell check
-
-Run the
-[spell checker](https://github.com/kata-containers/tests/tree/main/cmd/check-spelling)
+[markdown checker](https://github.com/kata-containers/kata-containers/tree/main/tests/cmd/check-markdown)
 on your documentation changes.
 
 ## Finally

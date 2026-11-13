@@ -1,22 +1,27 @@
 [package]
+authors = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
 name = "service"
 version = "0.1.0"
-authors = ["The Kata Containers community <kata-dev@lists.katacontainers.io>"]
-edition = "2018"
-license = "Apache-2.0"
 
 [dependencies]
-anyhow = "^1.0"
-async-trait = "0.1.48"
-slog = "2.5.2"
-slog-scope = "4.4.0"
-tokio = { version = "1.28.1", features = ["rt-multi-thread"] }
-tracing = "0.1.36"
-ttrpc = { version = "0.7.1" }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+containerd-shim = { workspace = true }
+containerd-shim-protos = { features = ["async", "sandbox"], workspace = true }
+slog = { workspace = true }
+slog-scope = { workspace = true }
+tokio = { features = ["rt-multi-thread"], workspace = true }
+ttrpc = { workspace = true }
 
-common = { path = "../runtimes/common" }
-containerd-shim-protos = { version = "0.3.0", features = ["async"]}
-logging = { path = "../../../libs/logging"}
-kata-types = { path = "../../../libs/kata-types" }
-runtimes = { path = "../runtimes" }
-persist = { path = "../persist" }
+# Local dependencies
+common = { workspace = true }
+kata-types = { workspace = true }
+logging = { workspace = true }
+persist = { workspace = true }
+runtimes = { workspace = true }
+
+
+[package.metadata.cargo-machete]
+ignored = ["slog-scope"]

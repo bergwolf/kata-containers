@@ -56,7 +56,7 @@ const NUMA_NODE_CPU_LIST_NAME: &str = "cpulist";
 
 /// Get numa node id for a CPU
 pub fn get_node_id(cpu: u32) -> Result<u32> {
-    let path = NUMA_CPU_PATH.join(format!("cpu{}", cpu));
+    let path = NUMA_CPU_PATH.join(format!("cpu{cpu}"));
     let dirs = path.read_dir().map_err(|_| Error::InvalidCpu(cpu))?;
 
     for d in dirs {
@@ -84,7 +84,7 @@ pub fn get_node_map(cpus: &str) -> Result<HashMap<u32, Vec<u32>>> {
 
     for c in cpuset.iter() {
         let node_id = get_node_id(*c)?;
-        node_map.entry(node_id).or_insert_with(Vec::new).push(*c);
+        node_map.entry(node_id).or_default().push(*c);
     }
 
     Ok(node_map)
@@ -168,7 +168,7 @@ pub fn is_valid_numa_cpu(cpus: &[u32]) -> Result<bool> {
     let numa_nodes = get_numa_nodes()?;
 
     for cpu in cpus {
-        if numa_nodes.get(cpu).is_none() {
+        if !numa_nodes.contains_key(cpu) {
             return Ok(false);
         }
     }

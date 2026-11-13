@@ -1,8 +1,11 @@
 // Copyright (C) 2021 Alibaba Cloud. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::HashMap;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::ops::Deref;
+#[cfg(target_arch = "x86_64")]
+use std::os::unix::io::AsRawFd;
 use std::os::unix::io::RawFd;
 
 use std::sync::{Arc, Mutex, RwLock};
@@ -12,14 +15,17 @@ use dbs_address_space::AddressSpace;
 use dbs_arch::gic::GICDevice;
 #[cfg(target_arch = "aarch64")]
 use dbs_arch::pmu::PmuError;
-use dbs_boot::InitrdConfig;
+use dbs_boot::{FirmwareType, InitrdConfig};
 use dbs_utils::epoll_manager::EpollManager;
 use dbs_utils::time::TimestampUs;
 use kvm_ioctls::VmFd;
 use linux_loader::loader::{KernelLoader, KernelLoaderResult};
 use seccompiler::BpfProgram;
+use seccompiler::{apply_filter_all_threads, Error as SecError};
 use serde_derive::{Deserialize, Serialize};
 use slog::{error, info};
+#[cfg(target_arch = "x86_64")]
+use tdx::launch::*;
 use vm_memory::{Bytes, GuestAddress, GuestAddressSpace};
 use vmm_sys_util::eventfd::EventFd;
 
@@ -32,16 +38,18 @@ use crate::address_space_manager::{
     AddressManagerError, AddressSpaceMgr, AddressSpaceMgrBuilder, GuestAddressSpaceImpl,
     GuestMemoryImpl,
 };
+use crate::api::v1::ConfidentialVmType;
 use crate::api::v1::{InstanceInfo, InstanceState};
 use crate::device_manager::console_manager::DmesgWriter;
 use crate::device_manager::{DeviceManager, DeviceMgrError, DeviceOpContext};
-use crate::error::{LoadInitrdError, Result, StartMicroVmError, StopMicrovmError};
+use crate::error::{Error, LoadInitrdError, Result, StartMicroVmError, StopMicrovmError};
 use crate::event_manager::EventManager;
 use crate::kvm_context::KvmContext;
 use crate::resource_manager::ResourceManager;
 use crate::vcpu::{VcpuManager, VcpuManagerError};
 #[cfg(feature = "hotplug")]
 use crate::vcpu::{VcpuResizeError, VcpuResizeInfo};
+use crate::{ALL_THREADS, VCPU_THREAD, VMM_THREAD};
 #[cfg(target_arch = "aarch64")]
 use dbs_arch::gic::Error as GICError;
 
@@ -138,6 +146,9 @@ pub struct VmConfigInfo {
 
     /// sock path
     pub serial_path: Option<String>,
+
+    /// Enable PCI device hotplug or not
+    pub pci_hotplug_enabled: bool,
 }
 
 impl Default for VmConfigInfo {
@@ -157,6 +168,7 @@ impl Default for VmConfigInfo {
             mem_file_path: String::from(""),
             mem_size_mib: 128,
             serial_path: None,
+            pci_hotplug_enabled: false,
         }
     }
 }
@@ -182,7 +194,8 @@ pub struct Vm {
     shared_info: Arc<RwLock<InstanceInfo>>,
 
     address_space: AddressSpaceMgr,
-    device_manager: DeviceManager,
+    /// device manager for Dragonball
+    pub device_manager: DeviceManager,
     dmesg_fifo: Option<Box<dyn io::Write + Send>>,
     kernel_config: Option<KernelConfigInfo>,
     logger: slog::Logger,
@@ -203,6 +216,13 @@ pub struct Vm {
 
     #[cfg(all(feature = "hotplug", feature = "dbs-upcall"))]
     upcall_client: Option<Arc<UpcallClient<DevMgrService>>>,
+
+    firmware_type: Option<FirmwareType>,
+
+    #[cfg(target_arch = "x86_64")]
+    tdx_launcher: Option<Launcher>,
+    #[cfg(target_arch = "x86_64")]
+    tdx_capabilities: Option<TdxCapabilities>,
 }
 
 impl Vm {
@@ -215,6 +235,16 @@ impl Vm {
         let id = api_shared_info.read().unwrap().id.clone();
         let logger = slog_scope::logger().new(slog::o!("id" => id));
         let kvm = KvmContext::new(kvm_fd)?;
+        #[cfg(target_arch = "x86_64")]
+        let tdx_enabled =
+            api_shared_info.read().unwrap().confidential_vm_type == Some(ConfidentialVmType::TDX);
+        #[cfg(target_arch = "x86_64")]
+        let vm_fd = if tdx_enabled {
+            Arc::new(kvm.create_vm_with_type(KVM_X86_TDX_VM)?)
+        } else {
+            Arc::new(kvm.create_vm()?)
+        };
+        #[cfg(not(target_arch = "x86_64"))]
         let vm_fd = Arc::new(kvm.create_vm()?);
         let resource_manager = Arc::new(ResourceManager::new(Some(kvm.max_memslots())));
         let device_manager = DeviceManager::new(
@@ -223,7 +253,27 @@ impl Vm {
             epoll_manager.clone(),
             &logger,
             api_shared_info.clone(),
-        );
+        )
+        .map_err(Error::DeviceMgrError)?;
+
+        #[cfg(target_arch = "x86_64")]
+        let firmware_type = if tdx_enabled {
+            Some(FirmwareType::Tdshim)
+        } else {
+            None
+        };
+
+        #[cfg(not(target_arch = "x86_64"))]
+        let firmware_type = None;
+
+        #[cfg(target_arch = "x86_64")]
+        let (tdx_launcher, tdx_capabilities) = if tdx_enabled {
+            let mut launcher = Launcher::new(vm_fd.as_raw_fd());
+            let capabilities = launcher.get_capabilities().map_err(Error::TdxError)?;
+            (Some(launcher), Some(capabilities))
+        } else {
+            (None, None)
+        };
 
         Ok(Vm {
             epoll_manager,
@@ -249,6 +299,13 @@ impl Vm {
             irqchip_handle: None,
             #[cfg(all(feature = "hotplug", feature = "dbs-upcall"))]
             upcall_client: None,
+
+            firmware_type,
+
+            #[cfg(target_arch = "x86_64")]
+            tdx_launcher,
+            #[cfg(target_arch = "x86_64")]
+            tdx_capabilities,
         })
     }
 
@@ -335,13 +392,17 @@ impl Vm {
 
     /// Check whether the VM instance is running.
     pub fn is_vm_running(&self) -> bool {
-        let instance_state = {
-            // Use expect() to crash if the other thread poisoned this lock.
-            let shared_info = self.shared_info.read()
-                .expect("Failed to determine if instance is initialized because shared info couldn't be read due to poisoned lock");
-            shared_info.state
-        };
-        instance_state == InstanceState::Running
+        self.instance_state() == InstanceState::Running
+    }
+
+    /// Return the current VM instance state.
+    pub fn instance_state(&self) -> InstanceState {
+        self.shared_info
+            .read()
+            .expect(
+                "Failed to determine instance state because shared info couldn't be read due to poisoned lock",
+            )
+            .state
     }
 
     /// Save VM instance exit state
@@ -399,6 +460,15 @@ impl Vm {
             AddressManagerError::GuestMemoryNotInitialized,
         ))
     }
+
+    /// Get confidential VM type for micro VM, if any
+    pub fn confidential_vm_type(&self) -> Option<ConfidentialVmType> {
+        self.shared_info
+            .read()
+            .unwrap()
+            .confidential_vm_type
+            .clone()
+    }
 }
 
 impl Vm {
@@ -416,6 +486,8 @@ impl Vm {
             self.shared_info.clone(),
             self.device_manager.io_manager(),
             self.epoll_manager.clone(),
+            #[cfg(target_arch = "x86_64")]
+            self.device_manager.irq_manager(),
         )?;
         self.vcpu_manager = Some(vcpu_manager);
 
@@ -438,6 +510,10 @@ impl Vm {
         self.start_instance_downtime = ts.time_us;
 
         self.vcpu_manager()?.pause_all_vcpus()?;
+        self.shared_info
+            .write()
+            .expect("Failed to pause microVM because shared info couldn't be written")
+            .state = InstanceState::Paused;
 
         Ok(())
     }
@@ -445,6 +521,10 @@ impl Vm {
     /// Resume all vcpus and calc the intance downtime
     pub fn resume_all_vcpus_with_downtime(&mut self) -> std::result::Result<(), VcpuManagerError> {
         self.vcpu_manager()?.resume_all_vcpus()?;
+        self.shared_info
+            .write()
+            .expect("Failed to resume microVM because shared info couldn't be written")
+            .state = InstanceState::Running;
 
         if self.start_instance_downtime != 0 {
             let now = TimestampUs::default();
@@ -484,19 +564,55 @@ impl Vm {
                 .ok_or(StartMicroVmError::AddressManagerError(
                     AddressManagerError::GuestMemoryNotInitialized,
                 ))?;
+        let dmesg_fifo = self.dmesg_fifo.take();
         self.device_manager.create_devices(
             vm_as.clone(),
             epoll_manager,
             kernel_config,
-            self.dmesg_fifo.take(),
+            dmesg_fifo,
             self.address_space.address_space(),
             &self.vm_config,
         )?;
 
         info!(self.logger, "VM: start devices");
-        self.device_manager.start_devices()?;
+        self.device_manager.start_devices(vm_as)?;
 
         info!(self.logger, "VM: initializing devices done");
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn init_devices_from_snapshot(
+        &mut self,
+        epoll_manager: EpollManager,
+    ) -> std::result::Result<(), StartMicroVmError> {
+        info!(self.logger, "VM: initializing devices from snapshot ...");
+
+        info!(self.logger, "VM: create interrupt manager");
+        self.device_manager
+            .create_interrupt_manager()
+            .map_err(StartMicroVmError::DeviceManager)?;
+
+        info!(self.logger, "VM: create devices");
+        let vm_as =
+            self.address_space
+                .get_vm_as()
+                .ok_or(StartMicroVmError::AddressManagerError(
+                    AddressManagerError::GuestMemoryNotInitialized,
+                ))?;
+        let dmesg_fifo = self.dmesg_fifo.take();
+        self.device_manager.create_devices_from_snapshot(
+            vm_as.clone(),
+            epoll_manager,
+            dmesg_fifo,
+            self.address_space.address_space(),
+            &self.vm_config,
+        )?;
+
+        info!(self.logger, "VM: start devices");
+        self.device_manager.start_devices(vm_as)?;
+
+        info!(self.logger, "VM: initializing devices from snapshot done");
         Ok(())
     }
 
@@ -586,6 +702,9 @@ impl Vm {
         let mut address_space_param = AddressSpaceMgrBuilder::new(&mem_type, &mem_file_path)
             .map_err(StartMicroVmError::AddressManagerError)?;
         address_space_param.set_kvm_vm_fd(self.vm_fd.clone());
+        address_space_param.toggle_use_firmware(self.firmware_type.is_some());
+        #[cfg(target_arch = "x86_64")]
+        address_space_param.toggle_kvm_mem_attr_private(self.kvm_mem_attr_private());
         self.address_space
             .create_address_space(&self.resource_manager, &numa_regions, address_space_param)
             .map_err(StartMicroVmError::AddressManagerError)?;
@@ -633,7 +752,7 @@ impl Vm {
         image: &mut F,
     ) -> std::result::Result<InitrdConfig, LoadInitrdError>
     where
-        F: Read + Seek,
+        F: Read + Seek + vm_memory::ReadVolatile,
     {
         use crate::error::LoadInitrdError::*;
 
@@ -657,7 +776,7 @@ impl Vm {
 
         // Load the image into memory
         vm_memory
-            .read_from(GuestAddress(address), image, size)
+            .read_volatile_from(GuestAddress(address), image, size)
             .map_err(|_| LoadInitrd)?;
 
         Ok(InitrdConfig {
@@ -703,10 +822,31 @@ impl Vm {
     pub fn start_microvm(
         &mut self,
         event_mgr: &mut EventManager,
-        vmm_seccomp_filter: BpfProgram,
-        vcpu_seccomp_filter: BpfProgram,
+        seccomp_filters: HashMap<String, BpfProgram>,
+        initialize_upcall: bool,
     ) -> std::result::Result<(), StartMicroVmError> {
+        #[cfg(not(feature = "dbs-upcall"))]
+        let _ = initialize_upcall;
+
         info!(self.logger, "VM: received instance start command");
+
+        if let Some(process_seccomp_filter) = seccomp_filters.get(ALL_THREADS) {
+            // Load seccomp filters for the whole process.
+            // Execution panics if filters cannot be loaded, use --seccomp-level=0 if skipping filters
+            // altogether is the desired behaviour.
+            if let Err(e) = apply_filter_all_threads(process_seccomp_filter) {
+                if !matches!(e, SecError::EmptyFilter) {
+                    error!(
+                        self.logger,
+                        "VM: failed to apply process-wide seccomp filters: {}", e
+                    );
+                    return Err(StartMicroVmError::SeccompFilters(e));
+                }
+            } else {
+                info!(self.logger, "VM: process-wide seccomp filters applied");
+            }
+        }
+
         if self.is_vm_initialized() {
             return Err(StartMicroVmError::MicroVMAlreadyRunning);
         }
@@ -732,12 +872,25 @@ impl Vm {
                 AddressManagerError::GuestMemoryNotInitialized,
             ))?;
 
-        self.init_vcpu_manager(vm_as.clone(), vcpu_seccomp_filter)
-            .map_err(StartMicroVmError::Vcpu)?;
+        #[cfg(target_arch = "x86_64")]
+        if self.confidential_vm_type() == Some(ConfidentialVmType::TDX) {
+            self.tdx_init_vm()?;
+        }
+
+        self.init_vcpu_manager(
+            vm_as.clone(),
+            seccomp_filters
+                .get(VCPU_THREAD)
+                .cloned()
+                .unwrap_or_default(),
+        )
+        .map_err(StartMicroVmError::Vcpu)?;
         self.init_microvm(event_mgr.epoll_manager(), vm_as.clone(), request_ts)?;
         self.init_configure_system(&vm_as)?;
         #[cfg(feature = "dbs-upcall")]
-        self.init_upcall()?;
+        if initialize_upcall {
+            self.init_upcall()?;
+        }
 
         info!(self.logger, "VM: register events");
         self.register_events(event_mgr)?;
@@ -745,7 +898,7 @@ impl Vm {
         info!(self.logger, "VM: start vcpus");
         self.vcpu_manager()
             .map_err(StartMicroVmError::Vcpu)?
-            .start_boot_vcpus(vmm_seccomp_filter)
+            .start_boot_vcpus(seccomp_filters.get(VMM_THREAD).cloned().unwrap_or_default())
             .map_err(StartMicroVmError::Vcpu)?;
 
         // Use expect() to crash if the other thread poisoned this lock.
@@ -755,6 +908,117 @@ impl Vm {
             .state = InstanceState::Running;
 
         info!(self.logger, "VM started");
+        Ok(())
+    }
+
+    /// Start a microVM by restoring it from a snapshot (see
+    /// [`Vm::save_microvm`]) instead of cold booting.
+    ///
+    /// The VM must have been configured with the same machine and devices the
+    /// snapshot was taken with. A boot source is not required: this mirrors
+    /// [`Vm::start_microvm`] but skips kernel loading and boot-time system
+    /// configuration, then applies the snapshot before the vCPUs start. The
+    /// snapshot restores guest memory contents, device runtime state
+    /// (replaying virtio activation) and vCPU register state.
+    #[cfg(target_arch = "x86_64")]
+    pub fn start_microvm_from_snapshot(
+        &mut self,
+        event_mgr: &mut EventManager,
+        seccomp_filters: HashMap<String, BpfProgram>,
+        state_path: &std::path::Path,
+        mem_path: &std::path::Path,
+        reset_vsock_pending: bool,
+    ) -> std::result::Result<(), StartMicroVmError> {
+        info!(self.logger, "VM: received restore-from-snapshot command");
+
+        if let Some(process_seccomp_filter) = seccomp_filters.get(ALL_THREADS) {
+            if let Err(e) = apply_filter_all_threads(process_seccomp_filter) {
+                if !matches!(e, SecError::EmptyFilter) {
+                    error!(
+                        self.logger,
+                        "VM: failed to apply process-wide seccomp filters: {}", e
+                    );
+                    return Err(StartMicroVmError::SeccompFilters(e));
+                }
+            }
+        }
+
+        if self.is_vm_initialized() {
+            return Err(StartMicroVmError::MicroVMAlreadyRunning);
+        }
+
+        let request_ts = TimestampUs::default();
+        self.start_instance_request_ts = request_ts.time_us;
+        self.start_instance_request_cpu_ts = request_ts.cputime_us;
+
+        self.init_dmesg_logger();
+
+        // Use expect() to crash if the other thread poisoned this lock.
+        self.shared_info
+            .write()
+            .expect("Failed to start microVM because shared info couldn't be written due to poisoned lock")
+            .state = InstanceState::Starting;
+
+        self.init_guest_memory()?;
+        let vm_as = self
+            .vm_as()
+            .cloned()
+            .ok_or(StartMicroVmError::AddressManagerError(
+                AddressManagerError::GuestMemoryNotInitialized,
+            ))?;
+
+        self.init_vcpu_manager(
+            vm_as.clone(),
+            seccomp_filters
+                .get(VCPU_THREAD)
+                .cloned()
+                .unwrap_or_default(),
+        )
+        .map_err(StartMicroVmError::Vcpu)?;
+
+        // Device attachment order determines guest-visible MMIO and IRQ
+        // assignments. Load the saved block attachment phases before device
+        // creation instead of inferring them from root/read-only properties.
+        #[cfg(feature = "virtio-blk")]
+        {
+            use crate::snapshot::MicrovmState;
+            let snapshot = MicrovmState::load_from_file(state_path)
+                .map_err(|e| StartMicroVmError::RestoreMicroVm(e.to_string()))?;
+            if let Some(block_state) = &snapshot.device_states.block {
+                self.device_manager
+                    .block_manager
+                    .prepare_restore_layout(block_state)
+                    .map_err(|e| StartMicroVmError::RestoreMicroVm(e.to_string()))?;
+            }
+        }
+        // Recreate host-side devices and fresh vCPU objects without loading a
+        // kernel or constructing throwaway cold-boot register state. Guest
+        // memory and every vCPU register are replaced by the snapshot below.
+        self.init_microvm_from_snapshot(event_mgr.epoll_manager(), vm_as.clone(), request_ts)?;
+
+        #[cfg(feature = "dbs-upcall")]
+        self.init_upcall()?;
+
+        info!(self.logger, "VM: restoring snapshot state");
+        self.restore_microvm(state_path, mem_path, reset_vsock_pending)
+            .map_err(|e| StartMicroVmError::RestoreMicroVm(e.to_string()))?;
+
+        info!(self.logger, "VM: register events");
+        self.register_events(event_mgr)?;
+
+        info!(self.logger, "VM: start vcpus");
+        self.vcpu_manager()
+            .map_err(StartMicroVmError::Vcpu)?
+            .start_boot_vcpus(seccomp_filters.get(VMM_THREAD).cloned().unwrap_or_default())
+            .map_err(StartMicroVmError::Vcpu)?;
+
+        // Use expect() to crash if the other thread poisoned this lock.
+        self.shared_info
+            .write()
+            .expect("Failed to start microVM because shared info couldn't be written due to poisoned lock")
+            .state = InstanceState::Running;
+
+        info!(self.logger, "VM restored from snapshot");
         Ok(())
     }
 }
@@ -827,7 +1091,7 @@ impl Vm {
     pub fn resize_vcpu(
         &mut self,
         config: VcpuResizeInfo,
-        sync_tx: Option<Sender<bool>>,
+        sync_tx: Option<Sender<Option<i32>>>,
     ) -> std::result::Result<(), VcpuResizeError> {
         if self.upcall_client().is_none() {
             Err(VcpuResizeError::UpcallClientMissing)
@@ -869,6 +1133,275 @@ impl Vm {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+impl Vm {
+    /// Save the state of the running microVM into a snapshot: a state file
+    /// at `state_path` (vCPU/device metadata state, JSON) plus a memory file
+    /// at `mem_path` (guest RAM contents).
+    ///
+    /// A running VM is paused while the state is captured and resumed
+    /// afterwards (branch semantics). An already-paused VM remains paused,
+    /// which lets the common VM factory preserve its pause-save contract.
+    /// Saving stops in-kernel vhost rings on the source (a
+    /// VHOST_GET_VRING_BASE side effect), so its vhost devices stay quiesced.
+    /// The boot-to-be-template flow tears the source VM down afterwards.
+    pub fn save_microvm(
+        &mut self,
+        state_path: &std::path::Path,
+        mem_path: &std::path::Path,
+        reset_vsock_transport: bool,
+    ) -> std::result::Result<(), crate::snapshot::SnapshotError> {
+        use crate::snapshot::SnapshotError;
+
+        let msr_list = self.kvm.supported_msrs(0).map_err(SnapshotError::Kvm)?;
+
+        let initial_state = self.instance_state();
+        let resume_after_save = match initial_state {
+            InstanceState::Running => {
+                self.pause_all_vcpus_with_downtime()?;
+                true
+            }
+            InstanceState::Paused => false,
+            state => return Err(SnapshotError::InvalidState(format!("{state:?}"))),
+        };
+
+        let save_result = self.save_microvm_paused(
+            state_path,
+            mem_path,
+            msr_list.as_slice(),
+            reset_vsock_transport,
+        );
+        let resume_result = if resume_after_save {
+            self.resume_all_vcpus_with_downtime()
+        } else {
+            Ok(())
+        };
+        match (save_result, resume_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(save_err), Ok(())) => Err(save_err),
+            (Ok(()), Err(resume_err)) => Err(SnapshotError::Vcpu(resume_err)),
+            (Err(save_err), Err(resume_err)) => {
+                // Both failed: the vCPUs may be left paused, which is the more
+                // urgent condition to surface, but don't silently lose the
+                // save error that is the actual root cause.
+                error!(
+                    self.logger,
+                    "snapshot save failed and vCPUs could not be resumed, \
+                     VM may be left paused: {}",
+                    save_err
+                );
+                Err(SnapshotError::Vcpu(resume_err))
+            }
+        }
+    }
+
+    /// Capture the microVM state while all vCPUs are paused.
+    ///
+    /// Device (queue) state is captured *before* guest memory: the vCPUs are
+    /// paused and userspace virtio backends run on the VMM event-loop thread
+    /// executing this action, so captured queue state cannot change
+    /// afterwards, and saving a vhost device stops its in-kernel rings (a
+    /// VHOST_GET_VRING_BASE side effect), so kernel backends stop writing
+    /// guest memory before the dump below. Backends processing queues on
+    /// other threads must be idle; the boot-to-be-template flow quiesces
+    /// guest I/O before saving.
+    fn save_microvm_paused(
+        &mut self,
+        state_path: &std::path::Path,
+        mem_path: &std::path::Path,
+        msr_list: &[u32],
+        #[allow(unused_variables)] reset_vsock_transport: bool,
+    ) -> std::result::Result<(), crate::snapshot::SnapshotError> {
+        use crate::snapshot::{DeviceManagerState, MicrovmState, SnapshotError};
+        use dbs_snapshot::Persist;
+
+        let vcpu_states = self.vcpu_manager()?.save_state(msr_list)?;
+
+        // VM-scoped KVM state, captured while the vCPUs are paused.
+        let vm_kvm_state = {
+            let vm_fd = self.vm_fd();
+            let pit = vm_fd.get_pit2().map_err(SnapshotError::Kvm)?;
+            let mut clock = vm_fd.get_clock().map_err(SnapshotError::Kvm)?;
+            // Per the KVM API, the KVM_CLOCK_TSC_STABLE flag returned by
+            // KVM_GET_CLOCK must not be fed back into KVM_SET_CLOCK.
+            clock.flags = 0;
+            let mut pic_master = kvm_bindings::kvm_irqchip {
+                chip_id: kvm_bindings::KVM_IRQCHIP_PIC_MASTER,
+                ..Default::default()
+            };
+            vm_fd
+                .get_irqchip(&mut pic_master)
+                .map_err(SnapshotError::Kvm)?;
+            let mut pic_slave = kvm_bindings::kvm_irqchip {
+                chip_id: kvm_bindings::KVM_IRQCHIP_PIC_SLAVE,
+                ..Default::default()
+            };
+            vm_fd
+                .get_irqchip(&mut pic_slave)
+                .map_err(SnapshotError::Kvm)?;
+            let mut ioapic = kvm_bindings::kvm_irqchip {
+                chip_id: kvm_bindings::KVM_IRQCHIP_IOAPIC,
+                ..Default::default()
+            };
+            vm_fd.get_irqchip(&mut ioapic).map_err(SnapshotError::Kvm)?;
+            crate::snapshot::VmKvmState {
+                pit,
+                clock,
+                pic_master,
+                pic_slave,
+                ioapic,
+            }
+        };
+
+        #[allow(unused_mut)]
+        let mut device_states = DeviceManagerState::default();
+        #[cfg(feature = "virtio-blk")]
+        {
+            device_states.block = Some(self.device_manager.block_manager.save_state(())?);
+        }
+        // TODO: this is gated on `virtio-net`, but `net_manager` also holds
+        // vhost-net and vhost-user-net devices. With `virtio-net` enabled they
+        // are refused loudly by `save_state` (`UnsupportedBackend`); in a build
+        // with only the vhost backends this block is compiled out entirely, so
+        // such devices are silently omitted from the snapshot. Gate the net
+        // snapshot on `any(virtio-net, vhost-net, vhost-user-net)` and keep the
+        // per-backend refuse so the guard holds in every build configuration.
+        #[cfg(feature = "virtio-net")]
+        {
+            device_states.virtio_net = Some(self.device_manager.net_manager.save_state(())?);
+        }
+        #[cfg(feature = "virtio-vsock")]
+        {
+            device_states.vsock = Some(
+                self.device_manager
+                    .vsock_manager
+                    .save_state(reset_vsock_transport)?,
+            );
+        }
+        #[cfg(any(feature = "virtio-fs", feature = "vhost-user-fs"))]
+        {
+            device_states.fs = Some(
+                self.device_manager
+                    .fs_manager
+                    .lock()
+                    .unwrap()
+                    .save_state(())?,
+            );
+        }
+        // TODO: balloon, virtio-mem, vhost-net and vhost-user-net are not yet
+        // snapshotted; kata-dragonball does not instantiate them.
+
+        let mut mem_file = std::fs::File::create(mem_path)?;
+        let memory_state = self.address_space.save_state(&mut mem_file)?;
+
+        let state = MicrovmState {
+            vm_kvm_state: Some(vm_kvm_state),
+            vcpu_states,
+            memory_state: Some(memory_state),
+            device_states,
+            ..Default::default()
+        };
+        state.save_to_file(state_path)?;
+        Ok(())
+    }
+
+    /// Restore the runtime state of a freshly built microVM from a snapshot.
+    ///
+    /// Expected calling sequence (mirroring the normal boot flow, driven by
+    /// the VMM/API layer):
+    /// 1. Create the VM from the *same configuration* the snapshot was taken
+    ///    with: address space, devices and vCPUs are created (but the vCPUs
+    ///    not yet started, and no boot code runs).
+    /// 2. Call this method: it loads guest RAM from `mem_path` and applies
+    ///    the vCPU and device states from `state_path`, replaying virtio
+    ///    device activation.
+    /// 3. Start the vCPU threads and resume execution.
+    pub fn restore_microvm(
+        &mut self,
+        state_path: &std::path::Path,
+        mem_path: &std::path::Path,
+        #[allow(unused_variables)] reset_vsock_pending: bool,
+    ) -> std::result::Result<(), crate::snapshot::SnapshotError> {
+        use crate::snapshot::MicrovmState;
+        use dbs_snapshot::Persist;
+
+        let state = MicrovmState::load_from_file(state_path)?;
+        state.validate_for_restore(self.vm_config.vcpu_count)?;
+
+        // Restore the VM-scoped KVM state first: interrupt delivery for
+        // everything below depends on the IOAPIC/PIC redirection tables the
+        // guest had programmed.
+        if let Some(kvm_state) = &state.vm_kvm_state {
+            let vm_fd = self.vm_fd();
+            vm_fd
+                .set_pit2(&kvm_state.pit)
+                .map_err(crate::snapshot::SnapshotError::Kvm)?;
+            vm_fd
+                .set_clock(&kvm_state.clock)
+                .map_err(crate::snapshot::SnapshotError::Kvm)?;
+            vm_fd
+                .set_irqchip(&kvm_state.pic_master)
+                .map_err(crate::snapshot::SnapshotError::Kvm)?;
+            vm_fd
+                .set_irqchip(&kvm_state.pic_slave)
+                .map_err(crate::snapshot::SnapshotError::Kvm)?;
+            vm_fd
+                .set_irqchip(&kvm_state.ioapic)
+                .map_err(crate::snapshot::SnapshotError::Kvm)?;
+        }
+
+        if let Some(memory_state) = &state.memory_state {
+            let mut mem_file = std::fs::File::open(mem_path)?;
+            self.address_space
+                .restore_state(memory_state, &mut mem_file)?;
+        }
+
+        // Restore vCPU/LAPIC state before device activation can replay an
+        // interrupt from a snapshotted virtio queue.
+        dbs_snapshot::Persist::restore_state(&mut *self.vcpu_manager()?, &state.vcpu_states, ())?;
+
+        #[cfg(feature = "virtio-blk")]
+        if let Some(block_state) = &state.device_states.block {
+            self.device_manager
+                .block_manager
+                .restore_state(block_state, ())?;
+        }
+        #[cfg(feature = "virtio-net")]
+        if let Some(net_state) = &state.device_states.virtio_net {
+            self.device_manager
+                .net_manager
+                .restore_state(net_state, ())?;
+        }
+        #[cfg(feature = "virtio-vsock")]
+        if let Some(vsock_state) = &state.device_states.vsock {
+            self.device_manager
+                .vsock_manager
+                .restore_state(vsock_state, reset_vsock_pending)?;
+        }
+        #[cfg(any(feature = "virtio-fs", feature = "vhost-user-fs"))]
+        if let Some(fs_state) = &state.device_states.fs {
+            self.device_manager
+                .fs_manager
+                .lock()
+                .unwrap()
+                .restore_state(fs_state, ())?;
+        }
+        // TODO: balloon, virtio-mem, vhost-net and vhost-user-net are not yet
+        // snapshotted; kata-dragonball does not instantiate them.
+
+        // TODO(security): the guest's RNG/entropy state lives in the restored
+        // memory, so every VM restored from the same template starts with
+        // identical randomness and can emit identical secrets (crypto keys,
+        // UUIDs, nonces) until its pool refreshes. Reseed after restore --
+        // e.g. inject fresh entropy through a virtio-rng device. vmgenid is
+        // not usable here: its Linux guest driver is ACPI-only and Dragonball
+        // exposes no ACPI (MP table on x86_64, FDT on aarch64).
+        Ok(())
+    }
+}
+
+/// Unit test module for methods of struct Vm, and helper functions to shorten
+/// test code.
 #[cfg(test)]
 pub mod tests {
     #[cfg(target_arch = "aarch64")]
@@ -876,7 +1409,9 @@ pub mod tests {
     #[cfg(target_arch = "x86_64")]
     use kvm_ioctls::VcpuExit;
     use linux_loader::cmdline::Cmdline;
-    use test_utils::skip_if_not_root;
+    use test_utils::skip_if_kvm_unaccessable;
+    #[cfg(target_arch = "x86_64")]
+    use vm_memory::Address;
     use vm_memory::GuestMemory;
     use vmm_sys_util::tempfile::TempFile;
 
@@ -884,6 +1419,7 @@ pub mod tests {
     use crate::test_utils::tests::create_vm_for_test;
 
     impl Vm {
+        /// Helper function to forch change `mstate` of Vms
         pub fn set_instance_state(&mut self, mstate: InstanceState) {
             self.shared_info
             .write()
@@ -892,6 +1428,7 @@ pub mod tests {
         }
     }
 
+    /// Helper function to create dummy Vm instance for testing purpose
     pub fn create_vm_instance() -> Vm {
         let instance_info = Arc::new(RwLock::new(InstanceInfo::default()));
         let epoll_manager = EpollManager::default();
@@ -900,7 +1437,7 @@ pub mod tests {
 
     #[test]
     fn test_create_vm_instance() {
-        skip_if_not_root!();
+        skip_if_kvm_unaccessable!();
         let vm = create_vm_instance();
         assert!(vm.check_health().is_err());
         assert!(vm.kernel_config.is_none());
@@ -910,9 +1447,241 @@ pub mod tests {
         assert!(vm.reset_console().is_ok());
     }
 
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_restore_initialization_without_kernel_config() {
+        skip_if_kvm_unaccessable!();
+
+        let vm_config = VmConfigInfo {
+            vcpu_count: 1,
+            max_vcpu_count: 1,
+            cpu_pm: "off".to_string(),
+            mem_type: "shmem".to_string(),
+            mem_file_path: "".to_string(),
+            mem_size_mib: 16,
+            serial_path: None,
+            cpu_topology: CpuTopology {
+                threads_per_core: 1,
+                cores_per_die: 1,
+                dies_per_socket: 1,
+                sockets: 1,
+            },
+            vpmu_feature: 0,
+            pci_hotplug_enabled: false,
+        };
+
+        let restore_epoll = EpollManager::default();
+        let mut restore_vm = create_vm_instance();
+        restore_vm.set_vm_config(vm_config.clone());
+        restore_vm.init_guest_memory().unwrap();
+        let restore_vm_as = restore_vm.vm_as().cloned().unwrap();
+        restore_vm
+            .init_vcpu_manager(restore_vm_as.clone(), Default::default())
+            .unwrap();
+
+        restore_vm
+            .init_microvm_from_snapshot(restore_epoll, restore_vm_as, TimestampUs::default())
+            .unwrap();
+
+        assert!(restore_vm.kernel_config.is_none());
+        assert_eq!(restore_vm.vcpu_manager().unwrap().vcpus().len(), 1);
+
+        let cold_epoll = EpollManager::default();
+        let mut cold_vm = create_vm_instance();
+        cold_vm.set_vm_config(vm_config);
+        cold_vm.init_guest_memory().unwrap();
+        let cold_vm_as = cold_vm.vm_as().cloned().unwrap();
+        cold_vm
+            .init_vcpu_manager(cold_vm_as.clone(), Default::default())
+            .unwrap();
+
+        let err = cold_vm
+            .init_microvm(cold_epoll, cold_vm_as, TimestampUs::default())
+            .unwrap_err();
+        assert!(matches!(err, StartMicroVmError::MissingKernelConfig));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_restore_valid_snapshot_without_kernel_config() {
+        use crate::snapshot::{MicrovmState, SnapshotError};
+        use dbs_snapshot::Persist;
+
+        skip_if_kvm_unaccessable!();
+
+        const CODE_ADDRESS: GuestAddress = GuestAddress(0x1000);
+        const MARKER_ADDRESS: GuestAddress = GuestAddress(0x2000);
+        const MEMORY_MARKER: u64 = 0xdbdb_1375_2db0_0bad;
+
+        let vm_config = VmConfigInfo {
+            vcpu_count: 1,
+            max_vcpu_count: 1,
+            cpu_pm: "off".to_string(),
+            mem_type: "shmem".to_string(),
+            mem_file_path: "".to_string(),
+            mem_size_mib: 16,
+            serial_path: None,
+            cpu_topology: CpuTopology {
+                threads_per_core: 1,
+                cores_per_die: 1,
+                dies_per_socket: 1,
+                sockets: 1,
+            },
+            vpmu_feature: 0,
+            pci_hotplug_enabled: false,
+        };
+        let state_file = TempFile::new().unwrap();
+        let memory_file = TempFile::new().unwrap();
+
+        // Build a complete snapshot without configuring a boot source. The
+        // two-byte loop gives the restored vCPU safe code to execute until the
+        // test shuts it down, while the marker verifies guest-memory restore.
+        let source_epoll = EpollManager::default();
+        let mut source = create_vm_instance();
+        source.set_vm_config(vm_config.clone());
+        source.init_guest_memory().unwrap();
+        let source_vm_as = source.vm_as().cloned().unwrap();
+        source
+            .init_vcpu_manager(source_vm_as.clone(), Default::default())
+            .unwrap();
+        source
+            .init_microvm_from_snapshot(source_epoll, source_vm_as, TimestampUs::default())
+            .unwrap();
+
+        let source_memory = source.address_space.vm_memory().unwrap();
+        source_memory
+            .write_slice(&[0xeb, 0xfe], CODE_ADDRESS)
+            .unwrap();
+        source_memory
+            .write_obj(MEMORY_MARKER, MARKER_ADDRESS)
+            .unwrap();
+
+        let msr_list = source.kvm.supported_msrs(0).unwrap();
+        let mut vcpu_states = {
+            let mut manager = source.vcpu_manager().unwrap();
+            manager
+                .vcpus_mut()
+                .into_iter()
+                .map(|vcpu| Persist::save_state(vcpu, msr_list.as_slice()).unwrap())
+                .collect::<Vec<_>>()
+        };
+        vcpu_states[0].regs.rip = CODE_ADDRESS.raw_value();
+        vcpu_states[0].regs.rflags = 2;
+        vcpu_states[0].regs.rbx = MEMORY_MARKER;
+        vcpu_states[0].sregs.cs.base = 0;
+        vcpu_states[0].sregs.cs.selector = 0;
+
+        {
+            let mut manager = source.vcpu_manager().unwrap();
+            Persist::restore_state(&mut *manager, &vcpu_states, ()).unwrap();
+            manager
+                .start_vcpus(vm_config.vcpu_count, Default::default(), false)
+                .unwrap();
+        }
+        source.set_instance_state(InstanceState::Paused);
+        source
+            .save_microvm(state_file.as_path(), memory_file.as_path(), false)
+            .unwrap();
+
+        let snapshot = MicrovmState::load_from_file(state_file.as_path()).unwrap();
+        snapshot.validate_for_restore(vm_config.vcpu_count).unwrap();
+
+        let mut incomplete: MicrovmState =
+            serde_json::from_value(serde_json::to_value(&snapshot).unwrap()).unwrap();
+        incomplete.vcpu_states.clear();
+        assert!(matches!(
+            incomplete.validate_for_restore(vm_config.vcpu_count),
+            Err(SnapshotError::InvalidSnapshot(message))
+                if message == "expected 1 vCPU states, found 0"
+        ));
+
+        let mut duplicate_json = serde_json::to_value(&snapshot).unwrap();
+        let states = duplicate_json["vcpu_states"].as_array_mut().unwrap();
+        states.push(states[0].clone());
+        let duplicate: MicrovmState = serde_json::from_value(duplicate_json).unwrap();
+        assert!(matches!(
+            duplicate.validate_for_restore(2),
+            Err(SnapshotError::InvalidSnapshot(message))
+                if message == "duplicate vCPU state id 0"
+        ));
+
+        source.vcpu_manager().unwrap().exit_all_vcpus().unwrap();
+        drop(source);
+
+        // Inspect a fresh target before vCPU launch so both memory and register
+        // markers can be checked deterministically.
+        let inspect_epoll = EpollManager::default();
+        let mut inspected = create_vm_instance();
+        inspected.set_vm_config(vm_config.clone());
+        inspected.init_guest_memory().unwrap();
+        let inspected_vm_as = inspected.vm_as().cloned().unwrap();
+        inspected
+            .init_vcpu_manager(inspected_vm_as.clone(), Default::default())
+            .unwrap();
+        inspected
+            .init_microvm_from_snapshot(inspect_epoll, inspected_vm_as, TimestampUs::default())
+            .unwrap();
+        inspected
+            .restore_microvm(state_file.as_path(), memory_file.as_path(), false)
+            .unwrap();
+        assert_eq!(
+            inspected
+                .address_space
+                .vm_memory()
+                .unwrap()
+                .read_obj::<u64>(MARKER_ADDRESS)
+                .unwrap(),
+            MEMORY_MARKER
+        );
+        let inspected_msrs = inspected.kvm.supported_msrs(0).unwrap();
+        let inspected_vcpu_states = {
+            let mut manager = inspected.vcpu_manager().unwrap();
+            manager
+                .vcpus_mut()
+                .into_iter()
+                .map(|vcpu| Persist::save_state(vcpu, inspected_msrs.as_slice()).unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(inspected_vcpu_states[0].regs.rbx, MEMORY_MARKER);
+        drop(inspected);
+
+        let target_epoll = EpollManager::default();
+        let vmm = Arc::new(Mutex::new(crate::vmm::tests::create_vmm_instance(
+            target_epoll.clone(),
+        )));
+        let mut event_manager = EventManager::new(&vmm, target_epoll).unwrap();
+        let mut vmm = vmm.lock().unwrap();
+        let target = vmm.get_vm_mut().unwrap();
+        target.set_vm_config(vm_config);
+
+        target
+            .start_microvm_from_snapshot(
+                &mut event_manager,
+                Default::default(),
+                state_file.as_path(),
+                memory_file.as_path(),
+                false,
+            )
+            .unwrap();
+
+        assert!(target.kernel_config.is_none());
+        assert_eq!(target.instance_state(), InstanceState::Running);
+        assert_eq!(
+            target
+                .address_space
+                .vm_memory()
+                .unwrap()
+                .read_obj::<u64>(MARKER_ADDRESS)
+                .unwrap(),
+            MEMORY_MARKER
+        );
+
+        target.vcpu_manager().unwrap().exit_all_vcpus().unwrap();
+    }
+
     #[test]
     fn test_vm_init_guest_memory() {
-        skip_if_not_root!();
+        skip_if_kvm_unaccessable!();
         let vm_config = VmConfigInfo {
             vcpu_count: 1,
             max_vcpu_count: 3,
@@ -928,6 +1697,7 @@ pub mod tests {
                 sockets: 1,
             },
             vpmu_feature: 0,
+            pci_hotplug_enabled: false,
         };
 
         let mut vm = create_vm_instance();
@@ -960,6 +1730,7 @@ pub mod tests {
                 sockets: 1,
             },
             vpmu_feature: 0,
+            pci_hotplug_enabled: false,
         };
         vm.set_vm_config(vm_config);
         assert!(vm.init_guest_memory().is_ok());
@@ -984,7 +1755,7 @@ pub mod tests {
 
     #[test]
     fn test_vm_create_devices() {
-        skip_if_not_root!();
+        skip_if_kvm_unaccessable!();
         let epoll_mgr = EpollManager::default();
         let vmm = Arc::new(Mutex::new(crate::vmm::tests::create_vmm_instance(
             epoll_mgr.clone(),
@@ -1008,6 +1779,7 @@ pub mod tests {
                 sockets: 1,
             },
             vpmu_feature: 0,
+            pci_hotplug_enabled: false,
         };
 
         vm.set_vm_config(vm_config);
@@ -1031,6 +1803,7 @@ pub mod tests {
             kernel_file.into_file(),
             None,
             cmd_line,
+            None,
         ));
 
         vm.init_devices(epoll_mgr).unwrap();
@@ -1038,7 +1811,7 @@ pub mod tests {
 
     #[test]
     fn test_vm_delete_devices() {
-        skip_if_not_root!();
+        skip_if_kvm_unaccessable!();
         let mut vm = create_vm_for_test();
         let epoll_mgr = EpollManager::default();
 
@@ -1050,7 +1823,7 @@ pub mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_run_code() {
-        skip_if_not_root!();
+        skip_if_kvm_unaccessable!();
 
         use std::io::{self, Write};
         // This example is based on https://lwn.net/Articles/658511/
@@ -1084,6 +1857,7 @@ pub mod tests {
                 sockets: 1,
             },
             vpmu_feature: 0,
+            pci_hotplug_enabled: false,
         };
 
         vm.set_vm_config(vm_config);
@@ -1092,7 +1866,7 @@ pub mod tests {
         let vm_memory = vm.address_space.vm_memory().unwrap();
         vm_memory.write_obj(code, load_addr).unwrap();
 
-        let vcpu_fd = vm.vm_fd().create_vcpu(0).unwrap();
+        let mut vcpu_fd = vm.vm_fd().create_vcpu(0).unwrap();
         let mut vcpu_sregs = vcpu_fd.get_sregs().unwrap();
         assert_ne!(vcpu_sregs.cs.base, 0);
         assert_ne!(vcpu_sregs.cs.selector, 0);

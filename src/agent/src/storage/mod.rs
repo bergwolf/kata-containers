@@ -4,42 +4,49 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::os::fd::AsFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
-use kata_sys_util::mount::{create_mount_destination, parse_mount_options};
+use kata_sys_util::mount::{
+    create_mount_destination, parse_mount_flags, parse_mount_options, Error as MountError,
+};
 use kata_types::mount::{StorageDevice, StorageHandlerManager, KATA_SHAREDFS_GUEST_PREMOUNT_TAG};
+use nix::mount::MsFlags;
 use nix::unistd::{Gid, Uid};
 use protocols::agent::Storage;
 use protocols::types::FSGroupChangePolicy;
+use rustix::fs::CWD;
+use rustix::mount::{
+    fsconfig_create, fsconfig_set_flag, fsconfig_set_string, fsmount, fsopen, move_mount,
+    FsMountFlags, FsOpenFlags, MountAttrFlags, MoveMountFlags,
+};
 use slog::Logger;
 use tokio::sync::Mutex;
 use tracing::instrument;
 
 use self::bind_watcher_handler::BindWatcherHandler;
 use self::block_handler::{PmemHandler, ScsiHandler, VirtioBlkMmioHandler, VirtioBlkPciHandler};
+pub use self::ephemeral_handler::update_ephemeral_mounts;
 use self::ephemeral_handler::EphemeralHandler;
-use self::fs_handler::{OverlayfsHandler, Virtio9pHandler, VirtioFsHandler};
+use self::fs_handler::{OverlayfsHandler, VirtioFsHandler};
+use self::image_pull_handler::ImagePullHandler;
 use self::local_handler::LocalHandler;
-use crate::device::{
-    DRIVER_9P_TYPE, DRIVER_BLK_MMIO_TYPE, DRIVER_BLK_PCI_TYPE, DRIVER_EPHEMERAL_TYPE,
-    DRIVER_LOCAL_TYPE, DRIVER_NVDIMM_TYPE, DRIVER_OVERLAYFS_TYPE, DRIVER_SCSI_TYPE,
-    DRIVER_VIRTIOFS_TYPE, DRIVER_WATCHABLE_BIND_TYPE,
-};
+use self::multi_layer_erofs::{handle_multi_layer_erofs_group, is_multi_layer_storage};
 use crate::mount::{baremount, is_mounted, remove_mounts};
 use crate::sandbox::Sandbox;
-
-pub use self::ephemeral_handler::update_ephemeral_mounts;
 
 mod bind_watcher_handler;
 mod block_handler;
 mod ephemeral_handler;
 mod fs_handler;
+mod image_pull_handler;
 mod local_handler;
+pub mod multi_layer_erofs;
 
 const RW_MASK: u32 = 0o660;
 const RO_MASK: u32 = 0o440;
@@ -49,6 +56,7 @@ const MODE_SETGID: u32 = 0o2000;
 #[derive(Debug)]
 pub struct StorageContext<'a> {
     cid: &'a Option<String>,
+    is_pod_sandbox: bool,
     logger: &'a Logger,
     sandbox: &'a Arc<Mutex<Sandbox>>,
 }
@@ -127,26 +135,126 @@ pub trait StorageHandler: Send + Sync {
         storage: Storage,
         ctx: &mut StorageContext,
     ) -> Result<Arc<dyn StorageDevice>>;
+
+    /// Return the driver types that the handler manages.
+    fn driver_types(&self) -> &[&str];
 }
 
 #[rustfmt::skip]
 lazy_static! {
     pub static ref STORAGE_HANDLERS: StorageHandlerManager<Arc<dyn StorageHandler>> = {
         let mut manager: StorageHandlerManager<Arc<dyn StorageHandler>> = StorageHandlerManager::new();
-        manager.add_handler(DRIVER_9P_TYPE, Arc::new(Virtio9pHandler{})).unwrap();
-        #[cfg(target_arch = "s390x")]
-        manager.add_handler(crate::device::DRIVER_BLK_CCW_TYPE, Arc::new(self::block_handler::VirtioBlkCcwHandler{})).unwrap();
-        manager.add_handler(DRIVER_BLK_MMIO_TYPE, Arc::new(VirtioBlkMmioHandler{})).unwrap();
-        manager.add_handler(DRIVER_BLK_PCI_TYPE, Arc::new(VirtioBlkPciHandler{})).unwrap();
-        manager.add_handler(DRIVER_EPHEMERAL_TYPE, Arc::new(EphemeralHandler{})).unwrap();
-        manager.add_handler(DRIVER_LOCAL_TYPE, Arc::new(LocalHandler{})).unwrap();
-        manager.add_handler(DRIVER_NVDIMM_TYPE, Arc::new(PmemHandler{})).unwrap();
-        manager.add_handler(DRIVER_OVERLAYFS_TYPE, Arc::new(OverlayfsHandler{})).unwrap();
-        manager.add_handler(DRIVER_SCSI_TYPE, Arc::new(ScsiHandler{})).unwrap();
-        manager.add_handler(DRIVER_VIRTIOFS_TYPE, Arc::new(VirtioFsHandler{})).unwrap();
-        manager.add_handler(DRIVER_WATCHABLE_BIND_TYPE, Arc::new(BindWatcherHandler{})).unwrap();
+        let handlers: Vec<Arc<dyn StorageHandler>> = vec![
+            Arc::new(VirtioBlkMmioHandler {}),
+            Arc::new(VirtioBlkPciHandler {}),
+            Arc::new(EphemeralHandler {}),
+            Arc::new(LocalHandler {}),
+            Arc::new(PmemHandler {}),
+            Arc::new(OverlayfsHandler {}),
+            Arc::new(ScsiHandler {}),
+            Arc::new(VirtioFsHandler {}),
+            Arc::new(BindWatcherHandler {}),
+            #[cfg(target_arch = "s390x")]
+            Arc::new(self::block_handler::VirtioBlkCcwHandler {}),
+            Arc::new(ImagePullHandler {}),
+            Arc::new(self::multi_layer_erofs::MultiLayerErofsHandler {}),
+        ];
+
+        for handler in handlers {
+            manager.add_handler(handler.driver_types(), handler.clone()).unwrap();
+        }
+
         manager
     };
+}
+
+/// Result of multi-layer storage handling
+struct MultiLayerProcessResult {
+    /// The primary device created
+    device: Arc<dyn StorageDevice>,
+    /// All mount points that were processed as part of this group
+    processed_mount_points: Vec<String>,
+    /// Temporary mount points (upper/lower) backing the overlay, needed for
+    /// container-scoped cleanup via `container_mounts`.
+    temp_mount_points: Vec<String>,
+    /// dm-verity device paths that need to be destroyed during cleanup
+    verity_devices: Vec<String>,
+}
+
+/// Handle multi-layer storage by creating the overlay device.
+/// Returns None if the storage is not a multi-layer storage.
+/// Returns Some(Ok(result)) if successfully processed.
+/// Returns Some(Err(e)) if there was an error.
+async fn handle_multi_layer_storage(
+    logger: &Logger,
+    storage: &Storage,
+    storages: &[Storage],
+    sandbox: &Arc<Mutex<Sandbox>>,
+    cid: &Option<String>,
+    processed_mount_points: &HashSet<String>,
+) -> Result<Option<MultiLayerProcessResult>> {
+    if !is_multi_layer_storage(storage) {
+        return Ok(None);
+    }
+
+    // Skip if already processed as part of a previous multi-layer group
+    if processed_mount_points.contains(&storage.mount_point) {
+        return Ok(None);
+    }
+
+    info!(
+        logger,
+        "Processing multi-layer EROFS storage";
+        "mount-point" => &storage.mount_point,
+        "source" => &storage.source,
+        "driver" => &storage.driver,
+        "fstype" => &storage.fstype,
+    );
+
+    let result = handle_multi_layer_erofs_group(storage, storages, cid, sandbox, logger).await?;
+
+    // Create device for the mount point
+    let device = new_device(result.mount_point.clone())?;
+
+    Ok(Some(MultiLayerProcessResult {
+        device,
+        processed_mount_points: result.processed_mount_points,
+        temp_mount_points: result.temp_mount_points,
+        verity_devices: result.verity_devices,
+    }))
+}
+
+/// Update sandbox storage with the created device.
+/// Handles cleanup on failure.
+async fn update_storage_device(
+    sandbox: &Arc<Mutex<Sandbox>>,
+    mount_point: &str,
+    device: Arc<dyn StorageDevice>,
+    logger: &Logger,
+) -> Result<()> {
+    if let Err(device) = sandbox
+        .lock()
+        .await
+        .update_sandbox_storage(mount_point, device)
+    {
+        error!(logger, "failed to update device for storage"; "mount-point" => mount_point);
+        if let Err(e) = sandbox
+            .lock()
+            .await
+            .remove_sandbox_storage(mount_point)
+            .await
+        {
+            warn!(logger, "failed to remove dummy sandbox storage"; "error" => ?e);
+        }
+        if let Err(e) = device.cleanup() {
+            error!(logger, "failed to clean state for storage device"; "mount-point" => mount_point, "error" => ?e);
+        }
+        return Err(anyhow!(
+            "failed to update device for storage: {}",
+            mount_point
+        ));
+    }
+    Ok(())
 }
 
 // add_storages takes a list of storages passed by the caller, and perform the
@@ -159,75 +267,128 @@ pub async fn add_storages(
     storages: Vec<Storage>,
     sandbox: &Arc<Mutex<Sandbox>>,
     cid: Option<String>,
+    is_pod_sandbox: bool,
 ) -> Result<Vec<String>> {
     let mut mount_list = Vec::new();
+    let mut processed_mount_points = HashSet::new();
 
-    for storage in storages {
-        let path = storage.mount_point.clone();
-        let state = sandbox.lock().await.add_sandbox_storage(&path).await;
-        if state.ref_count().await > 1 {
-            if let Some(path) = state.path() {
+    for storage in &storages {
+        // Try multi-layer storage handling first
+        if let Some(result) = handle_multi_layer_storage(
+            &logger,
+            storage,
+            &storages,
+            sandbox,
+            &cid,
+            &processed_mount_points,
+        )
+        .await?
+        {
+            // Register all processed mount points
+            for mp in &result.processed_mount_points {
+                processed_mount_points.insert(mp.clone());
+            }
+
+            // Add sandbox storage for each mount point in the group.
+            // Derive the shared flag from the matching storage in the
+            // group rather than assuming all members share the trigger's
+            // flag.
+            for mp in &result.processed_mount_points {
+                let shared = storages
+                    .iter()
+                    .find(|s| s.mount_point == *mp)
+                    .map_or(storage.shared, |s| s.shared);
+                let state = sandbox.lock().await.add_sandbox_storage(mp, shared).await;
+
+                // Only update device for the first occurrence
+                if state.ref_count().await == 1 {
+                    update_storage_device(sandbox, mp, result.device.clone(), &logger).await?;
+                }
+            }
+
+            // Add the primary mount point to the list first, followed by
+            // the temporary backing mounts (upper, lower-*).  Cleanup
+            // iterates in order, so the overlay target is unmounted before
+            // the mounts it depends on.
+            if let Some(path) = result.device.path() {
                 if !path.is_empty() {
                     mount_list.push(path.to_string());
+                }
+            }
+            mount_list.extend(result.temp_mount_points);
+            mount_list.extend(result.verity_devices.clone());
+
+            // Record verity devices for cleanup
+            if let Some(ref cid) = cid {
+                if !result.verity_devices.is_empty() {
+                    let mut sandbox_guard = sandbox.lock().await;
+                    sandbox_guard
+                        .container_verity_devices
+                        .entry(cid.clone())
+                        .or_insert_with(Vec::new)
+                        .extend(result.verity_devices.clone());
+                }
+            }
+
+            continue;
+        }
+
+        // Skip if already processed as part of multi-layer group
+        if processed_mount_points.contains(&storage.mount_point) {
+            continue;
+        }
+
+        // Standard storage handling
+        let path = storage.mount_point.clone();
+        let state = sandbox
+            .lock()
+            .await
+            .add_sandbox_storage(&path, storage.shared)
+            .await;
+        if state.ref_count().await > 1 {
+            if let Some(p) = state.path() {
+                if !p.is_empty() {
+                    mount_list.push(p.to_string());
                 }
             }
             // The device already exists.
             continue;
         }
 
-        if let Some(handler) = STORAGE_HANDLERS.handler(&storage.driver) {
+        // Create device using handler
+        let device = if let Some(handler) = STORAGE_HANDLERS.handler(&storage.driver) {
             let logger =
-                logger.new(o!( "subsystem" => "storage", "storage-type" => storage.driver.clone()));
+                logger.new(o!("subsystem" => "storage", "storage-type" => storage.driver.clone()));
             let mut ctx = StorageContext {
                 cid: &cid,
+                is_pod_sandbox,
                 logger: &logger,
                 sandbox,
             };
-
-            match handler.create_device(storage, &mut ctx).await {
-                Ok(device) => {
-                    match sandbox
-                        .lock()
-                        .await
-                        .update_sandbox_storage(&path, device.clone())
-                    {
-                        Ok(d) => {
-                            if let Some(path) = device.path() {
-                                if !path.is_empty() {
-                                    mount_list.push(path.to_string());
-                                }
-                            }
-                            drop(d);
-                        }
-                        Err(device) => {
-                            error!(logger, "failed to update device for storage");
-                            if let Err(e) = sandbox.lock().await.remove_sandbox_storage(&path).await
-                            {
-                                warn!(logger, "failed to remove dummy sandbox storage {:?}", e);
-                            }
-                            if let Err(e) = device.cleanup() {
-                                error!(
-                                    logger,
-                                    "failed to clean state for storage device {}, {}", path, e
-                                );
-                            }
-                            return Err(anyhow!("failed to update device for storage"));
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!(logger, "failed to create device for storage, error: {e:?}");
-                    if let Err(e) = sandbox.lock().await.remove_sandbox_storage(&path).await {
-                        warn!(logger, "failed to remove dummy sandbox storage {e:?}");
-                    }
-                    return Err(e);
-                }
-            }
+            handler.create_device(storage.clone(), &mut ctx).await
         } else {
             return Err(anyhow!(
                 "Failed to find the storage handler {}",
                 storage.driver
             ));
+        };
+
+        match device {
+            Ok(device) => {
+                update_storage_device(sandbox, &path, device.clone(), &logger).await?;
+                if let Some(p) = device.path() {
+                    if !p.is_empty() {
+                        mount_list.push(p.to_string());
+                    }
+                }
+            }
+            Err(e) => {
+                error!(logger, "failed to create device for storage"; "error" => ?e);
+                if let Err(e) = sandbox.lock().await.remove_sandbox_storage(&path).await {
+                    warn!(logger, "failed to remove dummy sandbox storage"; "error" => ?e);
+                }
+                return Err(e);
+            }
         }
     }
 
@@ -244,6 +405,83 @@ pub(crate) fn common_storage_handler(logger: &Logger, storage: &Storage) -> Resu
     mount_storage(logger, storage)?;
     set_ownership(logger, storage)?;
     Ok(storage.mount_point.clone())
+}
+
+fn split_lowerdirs(lowerdirs: &str) -> Vec<String> {
+    let mut dirs = vec![String::new()];
+    let mut chars = lowerdirs.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            if let Some(next @ (':' | '\\')) = chars.peek().copied() {
+                dirs.last_mut().unwrap().push(next);
+                chars.next();
+                continue;
+            }
+        } else if ch == ':' {
+            dirs.push(String::new());
+            continue;
+        }
+        dirs.last_mut().unwrap().push(ch);
+    }
+
+    dirs
+}
+
+fn mount_overlay_new_api(storage: &Storage) -> Result<()> {
+    let fs_fd = fsopen("overlay", FsOpenFlags::FSOPEN_CLOEXEC)?;
+    let mut flags = MsFlags::empty();
+
+    for option in &storage.options {
+        if let Some(lowerdirs) = option.strip_prefix("lowerdir=") {
+            for lowerdir in split_lowerdirs(lowerdirs) {
+                fsconfig_set_string(fs_fd.as_fd(), "lowerdir+", lowerdir)?;
+            }
+        } else if !option.contains('=') {
+            if let Some(next) = parse_mount_flags(flags, option) {
+                flags = next;
+            } else {
+                fsconfig_set_flag(fs_fd.as_fd(), option)?;
+            }
+        } else if let Some((key, value)) = option.split_once('=') {
+            fsconfig_set_string(fs_fd.as_fd(), key, value)?;
+        }
+    }
+
+    let mut attrs = MountAttrFlags::empty();
+    if flags.contains(MsFlags::MS_RDONLY) {
+        attrs.insert(MountAttrFlags::MOUNT_ATTR_RDONLY);
+    }
+    if flags.contains(MsFlags::MS_NOSUID) {
+        attrs.insert(MountAttrFlags::MOUNT_ATTR_NOSUID);
+    }
+    if flags.contains(MsFlags::MS_NODEV) {
+        attrs.insert(MountAttrFlags::MOUNT_ATTR_NODEV);
+    }
+    if flags.contains(MsFlags::MS_NOEXEC) {
+        attrs.insert(MountAttrFlags::MOUNT_ATTR_NOEXEC);
+    }
+    if flags.contains(MsFlags::MS_NODIRATIME) {
+        attrs.insert(MountAttrFlags::MOUNT_ATTR_NODIRATIME);
+    }
+    if flags.contains(MsFlags::MS_STRICTATIME) {
+        attrs.insert(MountAttrFlags::MOUNT_ATTR_STRICTATIME);
+    } else if flags.contains(MsFlags::MS_NOATIME) {
+        attrs.insert(MountAttrFlags::MOUNT_ATTR_NOATIME);
+    } else if flags.contains(MsFlags::MS_RELATIME) {
+        attrs.insert(MountAttrFlags::MOUNT_ATTR_RELATIME);
+    }
+
+    fsconfig_create(fs_fd.as_fd())?;
+    let mount_fd = fsmount(fs_fd.as_fd(), FsMountFlags::FSMOUNT_CLOEXEC, attrs)?;
+    move_mount(
+        mount_fd.as_fd(),
+        "",
+        CWD,
+        storage.mount_point.as_str(),
+        MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
+    )?;
+    Ok(())
 }
 
 // mount_storage performs the mount described by the storage structure.
@@ -263,12 +501,25 @@ fn mount_storage(logger: &Logger, storage: &Storage) -> Result<()> {
         return Ok(());
     }
 
-    let (flags, options) = parse_mount_options(&storage.options)?;
     let mount_path = Path::new(&storage.mount_point);
     let src_path = Path::new(&storage.source);
     create_mount_destination(src_path, mount_path, "", &storage.fstype)
         .context("Could not create mountpoint")?;
 
+    let mount_options = parse_mount_options(&storage.options);
+    if storage.fstype == "overlay"
+        && matches!(&mount_options, Err(MountError::MountOptionTooBig))
+        && storage.options.iter().any(|option| {
+            option
+                .strip_prefix("lowerdir=")
+                .is_some_and(|lowerdirs| split_lowerdirs(lowerdirs).len() > 1)
+        })
+    {
+        mount_overlay_new_api(storage).context("failed to mount overlay with new mount API")?;
+        return Ok(());
+    }
+
+    let (flags, options) = mount_options?;
     info!(logger, "mounting storage";
         "mount-source" => src_path.display(),
         "mount-destination" => mount_path.display(),
@@ -310,12 +561,11 @@ pub fn set_ownership(logger: &Logger, storage: &Storage) -> Result<()> {
     let fs_group = storage.fs_group();
     let read_only = storage.options.contains(&String::from("ro"));
     let mount_path = Path::new(&storage.mount_point);
-    let metadata = mount_path.metadata().map_err(|err| {
+    let metadata = mount_path.metadata().inspect_err(|err| {
         error!(logger, "failed to obtain metadata for mount path";
             "mount-path" => mount_path.to_str(),
             "error" => err.to_string(),
-        );
-        err
+        )
     })?;
 
     if fs_group.group_change_policy == FSGroupChangePolicy::OnRootMismatch.into()
@@ -460,7 +710,7 @@ mod tests {
         ];
 
         for (i, d) in tests.iter().enumerate() {
-            let msg = format!("test[{}]: {:?}", i, d);
+            let msg = format!("test[{i}]: {d:?}");
 
             skip_loop_by_user!(msg, d.test_user);
 
@@ -508,7 +758,7 @@ mod tests {
                 nix::mount::umount(&mount_point).unwrap();
             }
 
-            let msg = format!("{}: result: {:?}", msg, result);
+            let msg = format!("{msg}: result: {result:?}");
             if d.error_contains.is_empty() {
                 assert!(result.is_ok(), "{}", msg);
             } else {
@@ -569,7 +819,7 @@ mod tests {
         let tempdir = tempdir().expect("failed to create tmpdir");
 
         for (i, d) in tests.iter().enumerate() {
-            let msg = format!("test[{}]: {:?}", i, d);
+            let msg = format!("test[{i}]: {d:?}");
 
             let mount_dir = tempdir.path().join(d.mount_path);
             fs::create_dir(&mount_dir)
@@ -656,7 +906,7 @@ mod tests {
         let tempdir = tempdir().expect("failed to create tmpdir");
 
         for (i, d) in tests.iter().enumerate() {
-            let msg = format!("test[{}]: {:?}", i, d);
+            let msg = format!("test[{i}]: {d:?}");
 
             let mount_dir = tempdir.path().join(d.path);
             fs::create_dir(&mount_dir)
@@ -667,12 +917,12 @@ mod tests {
 
             // create testing directories and files
             for n in 1..COUNT {
-                let nest_dir = mount_dir.join(format!("nested{}", n));
+                let nest_dir = mount_dir.join(format!("nested{n}"));
                 fs::create_dir(&nest_dir)
                     .unwrap_or_else(|_| panic!("{}: failed to create nest directory", msg));
 
                 for f in 1..COUNT {
-                    let filename = nest_dir.join(format!("file{}", f));
+                    let filename = nest_dir.join(format!("file{f}"));
                     File::create(&filename)
                         .unwrap_or_else(|_| panic!("{}: failed to create file", msg));
                     file_mode = filename.as_path().metadata().unwrap().permissions().mode();
@@ -700,9 +950,9 @@ mod tests {
             );
 
             for n in 1..COUNT {
-                let nest_dir = mount_dir.join(format!("nested{}", n));
+                let nest_dir = mount_dir.join(format!("nested{n}"));
                 for f in 1..COUNT {
-                    let filename = nest_dir.join(format!("file{}", f));
+                    let filename = nest_dir.join(format!("file{f}"));
                     let file = Path::new(&filename);
 
                     assert_eq!(file.metadata().unwrap().gid(), d.gid);

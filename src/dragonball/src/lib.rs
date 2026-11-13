@@ -32,6 +32,10 @@ pub mod metric;
 pub mod resource_manager;
 /// Signal handler for virtual machines.
 pub mod signal_handler;
+/// Checkpoint/restore (snapshot) support.
+pub mod snapshot;
+/// Dragonball Tracer.
+pub mod tracer;
 /// Virtual CPU manager for virtual machines.
 pub mod vcpu;
 /// Virtual machine manager for virtual machines.
@@ -46,7 +50,7 @@ mod vmm;
 
 pub use self::error::StartMicroVmError;
 pub use self::io_manager::IoManagerCached;
-pub use self::vmm::Vmm;
+pub use self::vmm::{Vmm, ALL_THREADS, VCPU_THREAD, VMM_THREAD};
 
 /// Success exit code.
 pub const EXIT_CODE_OK: u8 = 0;

@@ -4,7 +4,9 @@
 //
 
 pub mod check_ops;
+pub mod cp_ops;
 pub mod env_ops;
 pub mod exec_ops;
+pub mod factory_ops;
 pub mod version;
 pub mod volume_ops;

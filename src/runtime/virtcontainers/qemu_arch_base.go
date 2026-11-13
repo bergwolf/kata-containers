@@ -18,7 +18,6 @@ import (
 	"strings"
 
 	govmmQemu "github.com/kata-containers/kata-containers/src/runtime/pkg/govmm/qemu"
-	"gitlab.com/nvidia/cloud-native/go-nvlib/pkg/nvpci"
 
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
@@ -62,8 +61,10 @@ type qemuArch interface {
 	// bridges sets the number bridges for the machine type
 	bridges(number uint32)
 
-	// cpuTopology returns the CPU topology for the given amount of vcpus
-	cpuTopology(vcpus, maxvcpus uint32) govmmQemu.SMP
+	// cpuTopology returns the CPU topology for the given amount of vcpus.
+	// numNUMANodes > 1 restructures the topology so vCPUs are grouped by socket per NUMA node.
+	// When confidentialGuest is true, CPU hotplug is disabled by setting MaxCPUs to 0.
+	cpuTopology(vcpus, maxvcpus uint32, numNUMANodes uint32, confidentialGuest bool) govmmQemu.SMP
 
 	// cpuModel returns the CPU model for the machine type
 	cpuModel() string
@@ -116,6 +117,12 @@ type qemuArch interface {
 	// appendRNGDevice appends a RNG device to devices
 	appendRNGDevice(ctx context.Context, devices []govmmQemu.Device, rngDevice config.RNGDev) ([]govmmQemu.Device, error)
 
+	// appendBalloonDevice appends a Balloon device to devices
+	appendBalloonDevice(ctx context.Context, devices []govmmQemu.Device, BalloonDevice config.BalloonDev) ([]govmmQemu.Device, error)
+
+	// setEndpointDevicePath sets the appropriate PCI or CCW device path for an endpoint
+	setEndpointDevicePath(endpoint Endpoint, bridge types.Bridge, devAddr string) error
+
 	// addDeviceToBridge adds devices to the bus
 	addDeviceToBridge(ctx context.Context, ID string, t types.Type) (string, types.Bridge, error)
 
@@ -147,10 +154,10 @@ type qemuArch interface {
 	setIgnoreSharedMemoryMigrationCaps(context.Context, *govmmQemu.QMP) error
 
 	// appendPCIeRootPortDevice appends a pcie-root-port device to pcie.0 bus
-	appendPCIeRootPortDevice(devices []govmmQemu.Device, number uint32, memSize32bit uint64, memSize64bit uint64) []govmmQemu.Device
+	appendPCIeRootPortDevice(devices []govmmQemu.Device, number uint32) []govmmQemu.Device
 
 	// appendPCIeSwitch appends a ioh3420 device to a pcie-root-port
-	appendPCIeSwitchPortDevice(devices []govmmQemu.Device, number uint32, memSize32bit uint64, memSize64bit uint64) []govmmQemu.Device
+	appendPCIeSwitchPortDevice(devices []govmmQemu.Device, number uint32) []govmmQemu.Device
 
 	// append vIOMMU device
 	appendIOMMU(devices []govmmQemu.Device) ([]govmmQemu.Device, error)
@@ -162,17 +169,16 @@ type qemuArch interface {
 	// This implementation is architecture specific, some archs may need
 	// a firmware, returns a string containing the path to the firmware that should
 	// be used with the -bios option, ommit -bios option if the path is empty.
-	appendProtectionDevice(devices []govmmQemu.Device, firmware, firmwareVolume string) ([]govmmQemu.Device, string, error)
-
-	// scans the PCIe space and returns the biggest BAR sizes for 32-bit
-	// and 64-bit addressable memory
-	getBARsMaxAddressableMemory() (uint64, uint64)
+	appendProtectionDevice(devices []govmmQemu.Device, firmware, firmwareVolume string, initdataDigest []byte) ([]govmmQemu.Device, string, error)
 
 	// Query QMP to find a device's PCI path given its QOM path or ID
 	qomGetPciPath(qemuID string, qmpCh *qmpChannel) (types.PciPath, error)
 
 	// Query QMP to find the PCI slot of a device, given its QOM path or ID
 	qomGetSlot(qomPath string, qmpCh *qmpChannel) (types.PciSlot, error)
+
+	// buildInitdataDevice creates an initdata device for the given architecture.
+	buildInitdataDevice(ctx context.Context, devices []govmmQemu.Device, initdataImage string) []govmmQemu.Device
 }
 
 type qemuArchBase struct {
@@ -218,7 +224,7 @@ const (
 	// QemuMicrovm is the QEMU microvm machine type for amd64
 	QemuMicrovm = "microvm"
 
-	// QemuVirt is the QEMU virt machine type for aarch64 or amd64
+	// QemuVirt is the QEMU virt machine type for aarch64 or arm
 	QemuVirt = "virt"
 
 	// QemuPseries is a QEMU virt machine type for ppc64le
@@ -320,13 +326,40 @@ func (q *qemuArchBase) bridges(number uint32) {
 	}
 }
 
-func (q *qemuArchBase) cpuTopology(vcpus, maxvcpus uint32) govmmQemu.SMP {
-	smp := govmmQemu.SMP{
-		CPUs:    vcpus,
-		Sockets: maxvcpus,
-		Cores:   defaultCores,
-		Threads: defaultThreads,
-		MaxCPUs: maxvcpus,
+func (q *qemuArchBase) cpuTopology(vcpus, maxvcpus uint32, numNUMANodes uint32, confidentialGuest bool) govmmQemu.SMP {
+	var smp govmmQemu.SMP
+
+	if numNUMANodes > 1 {
+		coresPerSocket := (maxvcpus + numNUMANodes - 1) / numNUMANodes
+		if coresPerSocket == 0 {
+			coresPerSocket = 1
+		}
+		smpMaxCPUs := numNUMANodes * coresPerSocket * defaultThreads
+		smp = govmmQemu.SMP{
+			CPUs:    vcpus,
+			Sockets: numNUMANodes,
+			Cores:   coresPerSocket,
+			Threads: defaultThreads,
+			MaxCPUs: smpMaxCPUs,
+		}
+	} else {
+		smp = govmmQemu.SMP{
+			CPUs:    vcpus,
+			Sockets: maxvcpus,
+			Cores:   defaultCores,
+			Threads: defaultThreads,
+			MaxCPUs: maxvcpus,
+		}
+	}
+
+	// Disable CPU hotplug for confidential guests: zero MaxCPUs and Sockets so
+	// govmmQemu omits them, causing QEMU to set maxcpus=cpus. Cores is reset to
+	// defaultCores (1) so QEMU can infer a valid sockets value (cpus/cores/threads);
+	// a NUMA-derived coresPerSocket left here would violate the topology constraint.
+	if confidentialGuest {
+		smp.MaxCPUs = 0
+		smp.Sockets = 0
+		smp.Cores = defaultCores
 	}
 
 	return smp
@@ -659,6 +692,7 @@ func genericBlockDevice(drive config.BlockDrive, nestedRun bool) (govmmQemu.Bloc
 		DisableModern: nestedRun,
 		ShareRW:       drive.ShareRW,
 		ReadOnly:      drive.ReadOnly,
+		DiscardUnmap:  drive.DiscardUnmap,
 	}, nil
 }
 
@@ -708,10 +742,13 @@ func (q *qemuArchBase) appendVFIODevice(devices []govmmQemu.Device, vfioDev conf
 
 	devices = append(devices,
 		govmmQemu.VFIODevice{
+			ID:       vfioDev.ID,
 			BDF:      vfioDev.BDF,
 			VendorID: vfioDev.VendorID,
 			DeviceID: vfioDev.DeviceID,
 			Bus:      vfioDev.Bus,
+			SysfsDev: vfioDev.SysfsDev,
+			DevfsDev: vfioDev.DevfsDev,
 		},
 	)
 
@@ -729,9 +766,64 @@ func (q *qemuArchBase) appendRNGDevice(_ context.Context, devices []govmmQemu.De
 	return devices, nil
 }
 
+func (q *qemuArchBase) appendBalloonDevice(_ context.Context, devices []govmmQemu.Device, balloonDev config.BalloonDev) ([]govmmQemu.Device, error) {
+	devices = append(devices,
+		govmmQemu.BalloonDevice{
+			ID:                balloonDev.ID,
+			DeflateOnOOM:      balloonDev.DeflateOnOOM,
+			DisableModern:     balloonDev.DisableModern,
+			FreePageReporting: balloonDev.FreePageReporting,
+		},
+	)
+
+	return devices, nil
+}
+
+func (q *qemuArchBase) setEndpointDevicePath(endpoint Endpoint, bridge types.Bridge, devAddr string) error {
+	pciPath, err := bridgePciPath(bridge, devAddr)
+	if err != nil {
+		return err
+	}
+	endpoint.SetPciPath(pciPath)
+	return nil
+}
+
+// bridgePciPath returns the guest PCI path for a device hot-plugged onto a
+// given bridge at slot devAddr. For a top-level bridge (directly on
+// pcie.0/pci.0) the path has two components (bridge_slot/dev_slot). For a
+// bridge nested behind a parent device on the root bus (e.g. a pcie-pci-bridge
+// sitting on a pcie-root-port) the path has three components
+// (parent_slot/bridge_slot/dev_slot), which the kata-agent walks via sysfs.
+func bridgePciPath(bridge types.Bridge, devAddr string) (types.PciPath, error) {
+	devSlot, err := types.PciSlotFromString(devAddr)
+	if err != nil {
+		return types.PciPath{}, err
+	}
+
+	bridgeSlot, err := types.PciSlotFromInt(bridge.Addr)
+	if err != nil {
+		return types.PciPath{}, err
+	}
+
+	if !bridge.HasParent() {
+		return types.PciPathFromSlots(bridgeSlot, devSlot)
+	}
+
+	parentSlot, err := types.PciSlotFromInt(bridge.ParentAddr)
+	if err != nil {
+		return types.PciPath{}, err
+	}
+	return types.PciPathFromSlots(parentSlot, bridgeSlot, devSlot)
+}
+
 func (q *qemuArchBase) handleImagePath(config HypervisorConfig) error {
 	if config.ImagePath != "" {
-		kernelRootParams, err := GetKernelRootParams(config.RootfsType, q.disableNvdimm, false)
+		kernelRootParams, err := GetKernelRootParams(
+			config.RootfsType,
+			q.disableNvdimm,
+			false,
+			config.KernelVerityParams,
+		)
 		if err != nil {
 			return err
 		}
@@ -739,7 +831,12 @@ func (q *qemuArchBase) handleImagePath(config HypervisorConfig) error {
 			q.qemuMachine.Options = strings.Join([]string{
 				q.qemuMachine.Options, qemuNvdimmOption,
 			}, ",")
-			kernelRootParams, err = GetKernelRootParams(config.RootfsType, q.disableNvdimm, q.dax)
+			kernelRootParams, err = GetKernelRootParams(
+				config.RootfsType,
+				q.disableNvdimm,
+				q.dax,
+				config.KernelVerityParams,
+			)
 			if err != nil {
 				return err
 			}
@@ -823,46 +920,13 @@ func (q *qemuArchBase) addBridge(b types.Bridge) {
 }
 
 // appendPCIeRootPortDevice appends to devices the given pcie-root-port
-func (q *qemuArchBase) appendPCIeRootPortDevice(devices []govmmQemu.Device, number uint32, memSize32bit uint64, memSize64bit uint64) []govmmQemu.Device {
-	return genericAppendPCIeRootPort(devices, number, q.qemuMachine.Type, memSize32bit, memSize64bit)
+func (q *qemuArchBase) appendPCIeRootPortDevice(devices []govmmQemu.Device, number uint32) []govmmQemu.Device {
+	return genericAppendPCIeRootPort(devices, number, q.qemuMachine.Type)
 }
 
 // appendPCIeSwitchPortDevice appends a PCIe Switch with <number> ports
-func (q *qemuArchBase) appendPCIeSwitchPortDevice(devices []govmmQemu.Device, number uint32, memSize32bit uint64, memSize64bit uint64) []govmmQemu.Device {
-	return genericAppendPCIeSwitchPort(devices, number, q.qemuMachine.Type, memSize32bit, memSize64bit)
-}
-
-// getBARsMaxAddressableMemory we need to know the BAR sizes to configure the
-// PCIe Root Port or PCIe Downstream Port attaching a device with huge BARs.
-func (q *qemuArchBase) getBARsMaxAddressableMemory() (uint64, uint64) {
-
-	pci := nvpci.New()
-	devs, _ := pci.GetAllDevices()
-
-	// Since we do not know which devices are going to be hotplugged,
-	// we're going to use the GPU with the biggest BARs to initialize the
-	// root port, this should work for all other devices as well.
-	// defaults are 2MB for both, if no suitable devices found
-	max32bit := uint64(2 * 1024 * 1024)
-	max64bit := uint64(2 * 1024 * 1024)
-
-	for _, dev := range devs {
-		if !dev.IsGPU() {
-			continue
-		}
-		memSize32bit, memSize64bit := dev.Resources.GetTotalAddressableMemory(true)
-		if max32bit < memSize32bit {
-			max32bit = memSize32bit
-		}
-		if max64bit < memSize64bit {
-			max64bit = memSize64bit
-		}
-	}
-	// The actual 32bit is most of the time a power of 2 but we need some
-	// buffer so double that to leave space for other IO functions.
-	// The 64bit size is not a power of 2 and hence is already rounded up
-	// to the higher value.
-	return max32bit * 2, max64bit
+func (q *qemuArchBase) appendPCIeSwitchPortDevice(devices []govmmQemu.Device, number uint32) []govmmQemu.Device {
+	return genericAppendPCIeSwitchPort(devices, number, q.qemuMachine.Type)
 }
 
 // appendIOMMU appends a virtual IOMMU device
@@ -897,7 +961,7 @@ func (q *qemuArchBase) setPFlash(p []string) {
 }
 
 // append protection device
-func (q *qemuArchBase) appendProtectionDevice(devices []govmmQemu.Device, firmware, firmwareVolume string) ([]govmmQemu.Device, string, error) {
+func (q *qemuArchBase) appendProtectionDevice(devices []govmmQemu.Device, firmware, firmwareVolume string, initdataDigest []byte) ([]govmmQemu.Device, string, error) {
 	hvLogger.WithField("arch", runtime.GOARCH).Warnf("Confidential Computing has not been implemented for this architecture")
 	return devices, firmware, nil
 }
@@ -924,6 +988,24 @@ func (q *qemuArchBase) qomGetSlot(qomPath string, qmpCh *qmpChannel) (types.PciS
 	}
 
 	return types.PciSlotFromInt(slotNum)
+}
+
+// build initdata device
+func (q *qemuArchBase) buildInitdataDevice(ctx context.Context, devices []govmmQemu.Device, initdataImage string) []govmmQemu.Device {
+	device := govmmQemu.BlockDevice{
+		Driver:    govmmQemu.VirtioBlock,
+		Transport: govmmQemu.TransportPCI,
+		ID:        "initdata",
+		File:      initdataImage,
+		SCSI:      false,
+		WCE:       false,
+		AIO:       govmmQemu.Threads,
+		Interface: "none",
+		Format:    "raw",
+	}
+
+	devices = append(devices, device)
+	return devices
 }
 
 // Query QMP to find a device's PCI path given its QOM path or ID

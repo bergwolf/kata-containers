@@ -3,13 +3,16 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+#[macro_use]
+extern crate lazy_static;
+use arc_swap::ArcSwap;
 use slog::{o, record_static, BorrowedKV, Drain, Key, OwnedKV, OwnedKVList, Record, KV};
 use std::collections::HashMap;
 use std::io;
 use std::io::Write;
 use std::process;
 use std::result;
-use std::sync::Mutex;
+use std::sync::Arc;
 
 mod file_rotate;
 mod log_writer;
@@ -17,12 +20,19 @@ mod log_writer;
 pub use file_rotate::FileRotator;
 pub use log_writer::LogWriter;
 
+lazy_static! {
+    pub static ref FILTER_RULE: ArcSwap<HashMap<String, slog::Level>> =
+        ArcSwap::from(Arc::new(HashMap::new()));
+    pub static ref LOGGERS: ArcSwap<HashMap<String, slog::Logger>> =
+        ArcSwap::from(Arc::new(HashMap::new()));
+}
+
 #[macro_export]
 macro_rules! logger_with_subsystem {
     ($name: ident, $subsystem: expr) => {
         macro_rules! $name {
                             () => {
-                                    slog_scope::logger().new(slog::o!("subsystem" => $subsystem))
+                                    slog::Logger::clone(logging::LOGGERS.load().get($subsystem).unwrap_or(&slog_scope::logger().new(slog::o!("subsystem" => $subsystem))))
                             };
                         }
     };
@@ -46,8 +56,19 @@ pub fn create_term_logger(level: slog::Level) -> (slog::Logger, slog_async::Asyn
     // Ensure only a unique set of key/value fields is logged
     let unique_drain = UniqueDrain::new(term_drain).fuse();
 
+    // Adjust the level which will be applied to the log-system
+    // Info is the default level, but if Debug flag is set, the overall log level will be changed to Debug here
+    FILTER_RULE.rcu(|inner| {
+        let mut updated_inner = HashMap::new();
+        updated_inner.clone_from(inner);
+        for v in updated_inner.values_mut() {
+            *v = level;
+        }
+        updated_inner
+    });
+
     // Allow runtime filtering of records by log level
-    let filter_drain = RuntimeLevelFilter::new(unique_drain, level).fuse();
+    let filter_drain = RuntimeComponentLevelFilter::new(unique_drain, level).fuse();
 
     // Ensure the logger is thread-safe
     let (async_drain, guard) = slog_async::Async::new(filter_drain)
@@ -58,6 +79,11 @@ pub fn create_term_logger(level: slog::Level) -> (slog::Logger, slog_async::Asyn
     let logger = slog::Logger::root(async_drain.fuse(), o!("subsystem" => DEFAULT_SUBSYSTEM));
 
     (logger, guard)
+}
+
+pub enum LogDestination {
+    File(Box<dyn Write + Send + Sync>),
+    Journal,
 }
 
 // Creates a logger which prints output as JSON
@@ -71,31 +97,84 @@ pub fn create_logger<W>(
 where
     W: Write + Send + Sync + 'static,
 {
-    let json_drain = slog_json::Json::new(writer)
-        .add_default_keys()
-        .build()
-        .fuse();
+    create_logger_with_destination(name, source, level, LogDestination::File(Box::new(writer)))
+}
+
+// Creates a logger which prints output as JSON or to systemd journal
+pub fn create_logger_with_destination(
+    name: &str,
+    source: &str,
+    level: slog::Level,
+    destination: LogDestination,
+) -> (slog::Logger, slog_async::AsyncGuard) {
+    // Check the destination type before consuming it.
+    // The `matches` macro performs a non-consuming check (it borrows).
+    let is_journal_destination = matches!(destination, LogDestination::Journal);
+
+    // The target type for boxed drain. Note that Err = slog::Never.
+    // Both `.fuse()` and `.ignore_res()` convert potential errors into a non-returning path
+    //  (panic or ignore), so they never return an Err.
+    let drain: Box<dyn Drain<Ok = (), Err = slog::Never> + Send> = match destination {
+        LogDestination::File(writer) => {
+            // `destination` is `File`.
+            let json_drain = slog_json::Json::new(writer)
+                .add_default_keys()
+                .build()
+                .fuse();
+
+            Box::new(json_drain)
+        }
+        LogDestination::Journal => {
+            // `destination` is `Journal`.
+            let journal_drain = slog_journald::JournaldDrain.ignore_res();
+
+            Box::new(journal_drain)
+        }
+    };
 
     // Ensure only a unique set of key/value fields is logged
-    let unique_drain = UniqueDrain::new(json_drain).fuse();
+    let unique_drain = UniqueDrain::new(drain).fuse();
+
+    // Adjust the level which will be applied to the log-system
+    // Info is the default level, but if Debug flag is set, the overall log level will be changed to Debug here
+    FILTER_RULE.rcu(|inner| {
+        let mut updated_inner = HashMap::new();
+        updated_inner.clone_from(inner);
+        for v in updated_inner.values_mut() {
+            *v = level;
+        }
+        updated_inner
+    });
 
     // Allow runtime filtering of records by log level
-    let filter_drain = RuntimeLevelFilter::new(unique_drain, level).fuse();
+    let filter_drain = RuntimeComponentLevelFilter::new(unique_drain, level).fuse();
 
     // Ensure the logger is thread-safe
     let (async_drain, guard) = slog_async::Async::new(filter_drain)
         .thread_name("slog-async-logger".into())
         .build_with_guard();
 
-    // Add some "standard" fields
-    let logger = slog::Logger::root(
+    // Create a base logger with common fields.
+    let base_logger = slog::Logger::root(
         async_drain.fuse(),
-        o!("version" => env!("CARGO_PKG_VERSION"),
+        o!(
+            "version" => env!("CARGO_PKG_VERSION"),
             "subsystem" => DEFAULT_SUBSYSTEM,
             "pid" => process::id().to_string(),
             "name" => name.to_string(),
-            "source" => source.to_string()),
+            "source" => source.to_string()
+        ),
     );
+
+    // If not journal destination, the logger remains the base_logger.
+    let logger = if is_journal_destination {
+        // Use the .new() method to build a child logger which inherits all existing
+        // key-value pairs from its parent and supplements them with additional ones.
+        // This is the idiomatic way.
+        base_logger.new(o!("SYSLOG_IDENTIFIER" => "kata"))
+    } else {
+        base_logger
+    };
 
     (logger, guard)
 }
@@ -124,6 +203,37 @@ pub fn slog_level_to_level_name(level: slog::Level) -> Result<&'static str, &'st
     }
 
     Err("invalid slog level")
+}
+
+pub fn register_component_logger(component_name: &str) {
+    let component = String::from(component_name);
+    LOGGERS.rcu(|inner| {
+        let mut updated_inner = HashMap::new();
+        updated_inner.clone_from(inner);
+        updated_inner.insert(
+            component_name.to_string(),
+            slog_scope::logger()
+                .new(slog::o!("component" => component.clone(), "subsystem" => component.clone())),
+        );
+        updated_inner
+    });
+}
+
+pub fn register_subsystem_logger(component_name: &str, subsystem_name: &str) {
+    let subsystem = String::from(subsystem_name);
+    LOGGERS.rcu(|inner| {
+        let mut updated_inner = HashMap::new();
+        updated_inner.clone_from(inner);
+        updated_inner.insert(
+            subsystem_name.to_string(),
+            // This will update the original `subsystem` field.
+            inner
+                .get(component_name)
+                .unwrap_or(&slog_scope::logger())
+                .new(slog::o!("subsystem" => subsystem.clone())),
+        );
+        updated_inner
+    });
 }
 
 // Used to convert an slog::OwnedKVList into a hash map.
@@ -163,7 +273,7 @@ impl KV for HashSerializer {
 
 impl slog::Serializer for HashSerializer {
     fn emit_arguments(&mut self, key: Key, value: &std::fmt::Arguments) -> slog::Result {
-        self.add_field(format!("{}", key), format!("{}", value));
+        self.add_field(format!("{key}"), format!("{value}"));
         Ok(())
     }
 }
@@ -192,7 +302,7 @@ where
         let mut record_serializer = HashSerializer::new();
         record.kv().serialize(record, &mut record_serializer)?;
 
-        for (key, _) in record_serializer.fields.iter() {
+        for key in record_serializer.fields.keys() {
             logger_serializer.remove_field(key);
         }
 
@@ -208,31 +318,25 @@ where
 
         match result {
             Ok(_) => Ok(()),
-            Err(_) => Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "failed to drain log".to_string(),
-            )),
+            Err(_) => Err(io::Error::other("failed to drain log")),
         }
     }
 }
 
-// A RuntimeLevelFilter will discard all log records whose log level is less than the level
-// specified in the struct.
-struct RuntimeLevelFilter<D> {
+// A RuntimeComponentLevelFilter will discard all log records whose log level is less than the level
+// specified in the struct according to the component it belongs to.
+struct RuntimeComponentLevelFilter<D> {
     drain: D,
-    level: Mutex<slog::Level>,
+    log_level: slog::Level,
 }
 
-impl<D> RuntimeLevelFilter<D> {
-    fn new(drain: D, level: slog::Level) -> Self {
-        RuntimeLevelFilter {
-            drain,
-            level: Mutex::new(level),
-        }
+impl<D> RuntimeComponentLevelFilter<D> {
+    fn new(drain: D, log_level: slog::Level) -> Self {
+        RuntimeComponentLevelFilter { drain, log_level }
     }
 }
 
-impl<D> Drain for RuntimeLevelFilter<D>
+impl<D> Drain for RuntimeComponentLevelFilter<D>
 where
     D: Drain,
 {
@@ -244,9 +348,34 @@ where
         record: &slog::Record,
         values: &slog::OwnedKVList,
     ) -> result::Result<Self::Ok, Self::Err> {
-        let log_level = self.level.lock().unwrap();
+        let component_level_config = FILTER_RULE.load();
 
-        if record.level().is_at_least(*log_level) {
+        let mut logger_serializer = HashSerializer::new();
+        values
+            .serialize(record, &mut logger_serializer)
+            .expect("log values serialization failed");
+
+        let mut record_serializer = HashSerializer::new();
+        record
+            .kv()
+            .serialize(record, &mut record_serializer)
+            .expect("log record serialization failed");
+
+        let mut component = None;
+        for (k, v) in record_serializer
+            .fields
+            .iter()
+            .chain(logger_serializer.fields.iter())
+        {
+            if k == "component" {
+                component = Some(v.to_string());
+                break;
+            }
+        }
+        let according_level = component_level_config
+            .get(&component.unwrap_or(DEFAULT_SUBSYSTEM.to_string()))
+            .unwrap_or(&self.log_level);
+        if record.level().is_at_least(*according_level) {
             self.drain.log(record, values)?;
         }
 
@@ -324,11 +453,11 @@ mod tests {
         ];
 
         for (i, d) in tests.iter().enumerate() {
-            let msg = format!("test[{}]: {:?}", i, d);
+            let msg = format!("test[{i}]: {d:?}");
 
             let result = level_name_to_slog_level(d.name);
 
-            let msg = format!("{}, result: {:?}", msg, result);
+            let msg = format!("{msg}, result: {result:?}");
 
             if d.result.is_ok() {
                 assert!(result.is_ok());
@@ -384,11 +513,11 @@ mod tests {
         ];
 
         for (i, d) in tests.iter().enumerate() {
-            let msg = format!("test[{}]: {:?}", i, d);
+            let msg = format!("test[{i}]: {d:?}");
 
             let result = slog_level_to_level_name(d.level);
 
-            let msg = format!("{}, result: {:?}", msg, result);
+            let msg = format!("{msg}, result: {result:?}");
 
             if d.result.is_ok() {
                 assert!(result == d.result, "{}", msg);
@@ -417,7 +546,12 @@ mod tests {
         let record_key = "record-key-1";
         let record_value = "record-key-2";
 
-        let (logger, guard) = create_logger(name, source, level, writer);
+        let (logger, guard) = create_logger_with_destination(
+            name,
+            source,
+            level,
+            LogDestination::File(Box::new(writer)),
+        );
 
         let msg = "foo, bar, baz";
 
@@ -565,7 +699,7 @@ mod tests {
         ];
 
         for (i, d) in tests.iter().enumerate() {
-            let msg = format!("test[{}]", i);
+            let msg = format!("test[{i}]");
 
             // Create a writer for the logger drain to use
             let writer = NamedTempFile::new()
@@ -576,7 +710,12 @@ mod tests {
                 .reopen()
                 .unwrap_or_else(|_| panic!("{:?}: failed to clone tempfile", msg));
 
-            let (logger, logger_guard) = create_logger(name, source, d.slog_level, writer);
+            let (logger, logger_guard) = create_logger_with_destination(
+                name,
+                source,
+                d.slog_level,
+                LogDestination::File(Box::new(writer)),
+            );
 
             // Call the logger (which calls the drain)
             (d.closure)(&logger, d.msg.to_owned());
@@ -599,44 +738,44 @@ mod tests {
             let field_ts = fields
                 .get("ts")
                 .unwrap_or_else(|| panic!("{:?}: failed to find timestamp field", msg));
-            assert_ne!(field_ts, "", "{}", msg);
+            assert_ne!(field_ts, "", "{msg}");
 
             let field_version = fields
                 .get("version")
                 .unwrap_or_else(|| panic!("{:?}: failed to find version field", msg));
-            assert_eq!(field_version, env!("CARGO_PKG_VERSION"), "{}", msg);
+            assert_eq!(field_version, env!("CARGO_PKG_VERSION"), "{msg}");
 
             let field_pid = fields
                 .get("pid")
                 .unwrap_or_else(|| panic!("{:?}: failed to find pid field", msg));
-            assert_ne!(field_pid, "", "{}", msg);
+            assert_ne!(field_pid, "", "{msg}");
 
             let field_level = fields
                 .get("level")
                 .unwrap_or_else(|| panic!("{:?}: failed to find level field", msg));
-            assert_eq!(field_level, d.slog_level_tag, "{}", msg);
+            assert_eq!(field_level, d.slog_level_tag, "{msg}");
 
             let field_msg = fields
                 .get("msg")
                 .unwrap_or_else(|| panic!("{:?}: failed to find msg field", msg));
-            assert_eq!(field_msg, &json!(d.msg), "{}", msg);
+            assert_eq!(field_msg, &json!(d.msg), "{msg}");
 
             let field_name = fields
                 .get("name")
                 .unwrap_or_else(|| panic!("{:?}: failed to find name field", msg));
-            assert_eq!(field_name, name, "{}", msg);
+            assert_eq!(field_name, name, "{msg}");
 
             let field_source = fields
                 .get("source")
                 .unwrap_or_else(|| panic!("{:?}: failed to find source field", msg));
-            assert_eq!(field_source, source, "{}", msg);
+            assert_eq!(field_source, source, "{msg}");
 
             let field_subsystem = fields
                 .get("subsystem")
                 .unwrap_or_else(|| panic!("{:?}: failed to find subsystem field", msg));
 
             // No explicit subsystem, so should be the default
-            assert_eq!(field_subsystem, &json!(DEFAULT_SUBSYSTEM), "{}", msg);
+            assert_eq!(field_subsystem, &json!(DEFAULT_SUBSYSTEM), "{msg}");
         }
     }
 }

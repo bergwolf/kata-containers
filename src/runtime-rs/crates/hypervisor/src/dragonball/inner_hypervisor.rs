@@ -4,28 +4,47 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use std::{
-    collections::{HashMap, HashSet},
-    iter::FromIterator,
-};
+use std::collections::{HashMap, HashSet};
+use std::iter::FromIterator;
 
-use anyhow::{Context, Ok, Result};
+use anyhow::{anyhow, Context, Ok, Result};
+use dragonball::ALL_THREADS;
 use kata_types::capabilities::Capabilities;
 
 use super::inner::DragonballInner;
-use crate::{
-    utils::{self, get_hvsock_path, get_jailer_root, get_sandbox_path},
-    VcpuThreadIds, VmmState,
-};
+use crate::dragonball::seccomp::get_seccomp_filter;
+use crate::utils::{self, get_hvsock_path, get_jailer_root, get_sandbox_path};
+use crate::{VcpuThreadIds, VmmState};
 
 impl DragonballInner {
-    pub(crate) async fn prepare_vm(&mut self, id: &str, netns: Option<String>) -> Result<()> {
+    pub(crate) async fn prepare_vm(
+        &mut self,
+        id: &str,
+        netns: Option<String>,
+        selinux_label: Option<String>,
+    ) -> Result<()> {
         self.id = id.to_string();
         self.state = VmmState::NotReady;
 
         self.vm_path = get_sandbox_path(id);
         self.jailer_root = get_jailer_root(id);
         self.netns = netns;
+
+        // Dragonball is a built-in VMM that runs as a thread inside the
+        // runtime. Because it is not a standalone process, Dragonball cannot
+        // independently set per-VM SELinux exec labels; any provided
+        // selinux_label will be ignored.
+        if selinux_label.is_some() {
+            warn!(sl!(),
+                    "SELinux label is provided for Dragonball VM, but Dragonball does not support SELinux; the label will be ignored",
+            );
+        }
+
+        if !self.config.security_info.disable_seccomp {
+            let seccomp =
+                HashMap::from([(ALL_THREADS.to_string(), get_seccomp_filter(ALL_THREADS))]);
+            self.vmm_instance.set_seccomp(seccomp);
+        }
 
         Ok(())
     }
@@ -63,8 +82,35 @@ impl DragonballInner {
         Ok(())
     }
 
+    /// Save the microVM state into the VM template files configured in
+    /// `[hypervisor].vm_template` (boot-to-be-template flow): guest memory
+    /// contents to `memory_path`, vCPU/device state to `device_state_path`.
+    /// A running VM is paused while the state is captured and resumed
+    /// afterwards; an already-paused VM remains paused.
     pub(crate) async fn save_vm(&self) -> Result<()> {
-        todo!()
+        #[cfg(target_arch = "x86_64")]
+        {
+            let template = &self.config.vm_template;
+            if template.device_state_path.is_empty() || template.memory_path.is_empty() {
+                return Err(anyhow!(
+                    "vm_template memory_path/device_state_path are not configured"
+                ));
+            }
+            info!(
+                sl!(),
+                "saving microVM snapshot to template";
+                "device_state_path" => &template.device_state_path,
+                "memory_path" => &template.memory_path,
+            );
+            self.vmm_instance
+                .save_microvm(
+                    template.device_state_path.clone(),
+                    template.memory_path.clone(),
+                )
+                .context("save microvm")
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        Err(anyhow!("save_vm is not supported on this architecture"))
     }
 
     pub(crate) async fn get_agent_socket(&self) -> Result<String> {
@@ -74,6 +120,15 @@ impl DragonballInner {
             HYBRID_VSOCK_SCHEME,
             get_hvsock_path(&self.id),
         ))
+    }
+
+    /// Get the address of agent vsock server used to init connections for io
+    pub(crate) async fn get_passfd_listener_addr(&self) -> Result<(String, u32)> {
+        if let Some(passfd_port) = self.passfd_listener_port {
+            Ok((get_hvsock_path(&self.id), passfd_port))
+        } else {
+            Err(anyhow!("passfd io listener port not set"))
+        }
     }
 
     pub(crate) async fn get_hypervisor_metrics(&self) -> Result<String> {
@@ -98,8 +153,7 @@ impl DragonballInner {
     }
 
     pub(crate) async fn cleanup(&self) -> Result<()> {
-        self.cleanup_resource();
-        Ok(())
+        self.cleanup_resource()
     }
 
     pub(crate) async fn get_pids(&self) -> Result<Vec<u32>> {
@@ -117,7 +171,7 @@ impl DragonballInner {
         }
 
         info!(sl!(), "get pids {:?}", pids);
-        Ok(Vec::from_iter(pids.into_iter()))
+        Ok(Vec::from_iter(pids))
     }
 
     pub(crate) async fn get_vmm_master_tid(&self) -> Result<u32> {

@@ -11,45 +11,26 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/containerd/cgroups"
+	"github.com/containerd/cgroups/v3"
+	cgroup1 "github.com/containerd/cgroups/v3/cgroup1"
 	systemdDbus "github.com/coreos/go-systemd/v22/dbus"
 	"github.com/godbus/dbus/v5"
-	"github.com/opencontainers/runc/libcontainer/cgroups/systemd"
+	"github.com/opencontainers/cgroups/systemd"
 	"golang.org/x/sys/unix"
 )
 
 // DefaultResourceControllerID runtime-determined location in the cgroups hierarchy.
 const DefaultResourceControllerID = "/vc"
 
-// ValidCgroupPathV1 returns a valid cgroup path for cgroup v1.
+// ValidCgroupPath returns a valid cgroup path.
 // see https://github.com/opencontainers/runtime-spec/blob/master/config-linux.md#cgroups-path
-func ValidCgroupPathV1(path string, systemdCgroup bool) (string, error) {
+func ValidCgroupPath(path string, isCgroupV2 bool, systemdCgroup bool) (string, error) {
 	if IsSystemdCgroup(path) {
-		return path, nil
-	}
-
-	if systemdCgroup {
-		return "", fmt.Errorf("malformed systemd path '%v': expected to be of form 'slice:prefix:name'", path)
-	}
-
-	// In the case of an absolute path (starting with /), the runtime MUST
-	// take the path to be relative to the cgroups mount point.
-	if filepath.IsAbs(path) {
-		return filepath.Clean(path), nil
-	}
-
-	// In the case of a relative path (not starting with /), the runtime MAY
-	// interpret the path relative to a runtime-determined location in the cgroups hierarchy.
-	// clean up path and return a new path relative to DefaultResourceControllerID
-	return filepath.Join(DefaultResourceControllerID, filepath.Clean("/"+path)), nil
-}
-
-// ValidCgroupPathV2 returns a valid cgroup path for cgroup v2.
-// see https://github.com/opencontainers/runtime-spec/blob/master/config-linux.md#cgroups-path
-func ValidCgroupPathV2(path string, systemdCgroup bool) (string, error) {
-	// In cgroup v2，path must be a "clean" absolute path starts with "/".
-	if IsSystemdCgroup(path) {
-		return filepath.Join("/", path), nil
+		if isCgroupV2 {
+			return filepath.Join("/", path), nil
+		} else {
+			return path, nil
+		}
 	}
 
 	if systemdCgroup {
@@ -75,22 +56,20 @@ func newProperty(name string, units interface{}) systemdDbus.Property {
 	}
 }
 
-func cgroupHierarchy(path string) (cgroups.Hierarchy, cgroups.Path, error) {
+// cgroupHierarchyPath returns the cgroup1 Path for the given cgroup path.
+func cgroupHierarchyPath(path string) (cgroup1.Path, error) {
 	if !IsSystemdCgroup(path) {
-		return cgroups.V1, cgroups.StaticPath(path), nil
-	} else {
-		slice, unit, err := getSliceAndUnit(path)
-		if err != nil {
-			return nil, nil, err
-		}
-
-		cgroupSlicePath, _ := systemd.ExpandSlice(slice)
-		if err != nil {
-			return nil, nil, err
-		}
-
-		return cgroups.Systemd, cgroups.Slice(cgroupSlicePath, unit), nil
+		return cgroup1.StaticPath(path), nil
 	}
+
+	slice, unit, err := getSliceAndUnit(path)
+	if err != nil {
+		return nil, err
+	}
+
+	cgroupSlicePath, _ := systemd.ExpandSlice(slice)
+
+	return cgroup1.Slice(cgroupSlicePath, unit), nil
 }
 
 func createCgroupsSystemd(slice string, unit string, pid int) error {

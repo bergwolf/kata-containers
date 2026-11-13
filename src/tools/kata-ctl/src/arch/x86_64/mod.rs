@@ -171,14 +171,10 @@ mod arch_specific {
             Ok(())
         } else {
             let error_msg = format!(
-                "Kernel Module: '{:}' parameter '{:}' should have value '{:}', but found '{:}.'.",
-                module, param_name, expected_param_value, param_value_host
+                "Kernel Module: '{module:}' parameter '{param_name:}' should have value '{expected_param_value:}', but found '{param_value_host:}.'."
             );
 
-            let action_msg = format!("Remove the '{:}' module using `rmmod` and then reload using `modprobe`, setting '{:}={:}'",
-                module,
-                param_name,
-                expected_param_value
+            let action_msg = format!("Remove the '{module:}' module using `rmmod` and then reload using `modprobe`, setting '{param_name:}={expected_param_value:}'"
             );
 
             Err(anyhow!("{} {}", error_msg, action_msg))
@@ -250,11 +246,8 @@ mod arch_specific {
 
             match module_loaded {
                 Ok(_) => {
-                    let check = check_kernel_params(module);
-                    match check {
-                        Ok(_v) => info!(sl!(), "{} Ok", module.name),
-                        Err(e) => return Err(e),
-                    }
+                    check_kernel_params(module)?;
+                    info!(sl!(), "{} Ok", module.name);
                 }
                 Err(err) => {
                     warn!(sl!(), "{:}", err.replace('\n', ""))

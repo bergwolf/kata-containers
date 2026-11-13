@@ -4,29 +4,21 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use std::{
-    fs,
-    os::unix::io::{FromRawFd, RawFd},
-    process::Stdio,
-    sync::Arc,
-};
+use std::fs;
+use std::os::unix::io::RawFd;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use common::message::{Action, Event, Message};
-use containerd_shim_protos::{
-    protobuf::{well_known_types::any::Any, Message as ProtobufMessage},
-    shim_async,
-};
-use kata_types::config::KATA_PATH;
-use runtimes::RuntimeHandlerManager;
-use tokio::{
-    io::AsyncWriteExt,
-    process::Command,
-    sync::mpsc::{channel, Receiver},
-};
+use common::message::{Action, Message};
+use containerd_shim_protos::shim_async;
+use runtimes::{CleanupOutcome, RuntimeHandlerManager};
+use tokio::sync::mpsc::{channel, Receiver};
 use ttrpc::asynchronous::Server;
 
+use crate::event::{new_event_publisher, Forwarder};
+use crate::sandbox_service::SandboxService;
 use crate::task_service::TaskService;
+use containerd_shim_protos::sandbox_async;
 
 /// message buffer size
 const MESSAGE_BUFFER_SIZE: usize = 8;
@@ -34,10 +26,11 @@ const MESSAGE_BUFFER_SIZE: usize = 8;
 pub struct ServiceManager {
     receiver: Option<Receiver<Message>>,
     handler: Arc<RuntimeHandlerManager>,
-    task_server: Option<Server>,
+    server: Option<Server>,
     binary: String,
     address: String,
     namespace: String,
+    event_publisher: Box<dyn Forwarder>,
 }
 
 impl std::fmt::Debug for ServiceManager {
@@ -45,7 +38,7 @@ impl std::fmt::Debug for ServiceManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ServiceManager")
             .field("receiver", &self.receiver)
-            .field("task_server.is_some()", &self.task_server.is_some())
+            .field("server.is_some()", &self.server.is_some())
             .field("binary", &self.binary)
             .field("address", &self.address)
             .field("namespace", &self.namespace)
@@ -62,18 +55,26 @@ impl ServiceManager {
         namespace: &str,
         task_server_fd: RawFd,
     ) -> Result<Self> {
+        // Regist service logger for later use.
+        logging::register_subsystem_logger("runtimes", "service");
+
         let (sender, receiver) = channel::<Message>(MESSAGE_BUFFER_SIZE);
         let rt_mgr = RuntimeHandlerManager::new(id, sender).context("new runtime handler")?;
         let handler = Arc::new(rt_mgr);
-        let mut task_server = unsafe { Server::from_raw_fd(task_server_fd) };
-        task_server = task_server.set_domain_unix();
+        // SAFETY: containerd passes a valid unix listener fd when starting the shim.
+        let server = unsafe { Server::new().add_unix_listener(task_server_fd)? };
+        let event_publisher = new_event_publisher(namespace)
+            .await
+            .context("new event publisher")?;
+
         Ok(Self {
             receiver: Some(receiver),
             handler,
-            task_server: Some(task_server),
+            server: Some(server),
             binary: containerd_binary.to_string(),
             address: address.to_string(),
             namespace: namespace.to_string(),
+            event_publisher,
         })
     }
 
@@ -96,7 +97,10 @@ impl ServiceManager {
                     }
                     Action::Event(event) => {
                         info!(sl!(), "get event {:?}", &event);
-                        self.send_event(event).await.context("send event")
+                        self.event_publisher
+                            .forward(event)
+                            .await
+                            .context("forward event")
                     }
                 };
 
@@ -117,14 +121,50 @@ impl ServiceManager {
     pub async fn cleanup(sid: &str) -> Result<()> {
         let (sender, _receiver) = channel::<Message>(MESSAGE_BUFFER_SIZE);
         let handler = RuntimeHandlerManager::new(sid, sender).context("new runtime handler")?;
-        if let Err(e) = handler.cleanup().await {
+        let state_dir = persist::state_dir(sid).context("sandbox state directory")?;
+        // Whether there was a state to clean up from is decided before the
+        // attempt: a failed cleanup keeps the state for a retry, but if it
+        // could not, a missing state after the failure is not a reason to
+        // remove the directory as well. Without a state to begin with there
+        // is nothing to retry from, so the directory goes either way.
+        let had_state = state_dir.join(persist::PERSIST_FILE).exists();
+        let outcome = handler.cleanup().await;
+        if let Ok(CleanupOutcome::Skipped) = outcome {
+            // keep_abnormal left the sandbox's resources where they are, and
+            // the state is the only record of them: whoever inspects the
+            // sandbox, or cleans it up later, needs it.
+            info!(
+                sl!(),
+                "cleanup skipped, keeping {} as the record of what is left",
+                state_dir.display()
+            );
+            return Ok(());
+        }
+        if let Err(e) = outcome {
+            if had_state {
+                // The state is the only record of what is left on the host, so a
+                // later delete can still retry.
+                error!(
+                    sl!(),
+                    "failed to clean up runtime state, keeping {} for a retry: {:#}",
+                    state_dir.display(),
+                    e
+                );
+                if !state_dir.join(persist::PERSIST_FILE).exists() {
+                    error!(
+                        sl!(),
+                        "the sandbox state of {} is gone, a retry cannot recover what is left",
+                        state_dir.display()
+                    );
+                }
+                return Ok(());
+            }
             warn!(sl!(), "failed to clean up runtime state, {}", e);
         }
 
-        let temp_dir = [KATA_PATH, sid].join("/");
-        if fs::metadata(temp_dir.as_str()).is_ok() {
+        if fs::metadata(&state_dir).is_ok() {
             // try to remove dir and skip the result
-            if let Err(e) = fs::remove_dir_all(temp_dir) {
+            if let Err(e) = fs::remove_dir_all(&state_dir) {
                 warn!(sl!(), "failed to clean up sandbox tmp dir, {}", e);
             }
         }
@@ -133,62 +173,30 @@ impl ServiceManager {
     }
 
     fn registry_service(&mut self) -> Result<()> {
-        if let Some(t) = self.task_server.take() {
-            let task_service = Arc::new(Box::new(TaskService::new(self.handler.clone()))
-                as Box<dyn shim_async::Task + Send + Sync>);
-            let t = t.register_service(shim_async::create_task(task_service));
-            self.task_server = Some(t);
+        if let Some(s) = self.server.take() {
+            let sandbox_service: Arc<dyn sandbox_async::Sandbox + Send + Sync> =
+                Arc::new(SandboxService::new(self.handler.clone()));
+            let s = s.register_service(sandbox_async::create_sandbox(sandbox_service));
+
+            let task_service: Arc<dyn shim_async::Task + Send + Sync> =
+                Arc::new(TaskService::new(self.handler.clone()));
+            let s = s.register_service(shim_async::create_task(task_service));
+            self.server = Some(s);
         }
         Ok(())
     }
 
     async fn start_service(&mut self) -> Result<()> {
-        if let Some(t) = self.task_server.as_mut() {
-            t.start().await.context("task server start")?;
+        if let Some(s) = self.server.as_mut() {
+            s.start().await.context("task server start")?;
         }
         Ok(())
     }
 
     async fn stop_service(&mut self) -> Result<()> {
-        if let Some(t) = self.task_server.as_mut() {
-            t.stop_listen().await;
+        if let Some(s) = self.server.as_mut() {
+            s.stop_listen().await;
         }
-        Ok(())
-    }
-
-    async fn send_event(&self, event: Arc<dyn Event>) -> Result<()> {
-        let any = Any {
-            type_url: event.type_url(),
-            value: event.value().context("get event value")?,
-            ..Default::default()
-        };
-        let data = any.write_to_bytes().context("write to any")?;
-        let mut child = Command::new(&self.binary)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .args([
-                "--address",
-                &self.address,
-                "publish",
-                "--topic",
-                &event.r#type(),
-                "--namespace",
-                &self.namespace,
-            ])
-            .spawn()
-            .context("spawn containerd cmd to publish event")?;
-
-        let stdin = child.stdin.as_mut().context("failed to open stdin")?;
-        stdin
-            .write_all(&data)
-            .await
-            .context("failed to write to stdin")?;
-        let output = child
-            .wait_with_output()
-            .await
-            .context("failed to read stdout")?;
-        info!(sl!(), "get output: {:?}", output);
         Ok(())
     }
 }

@@ -14,6 +14,7 @@
 //! by CNI plugins. They might have some slight differences, and may be revised in
 //! the future.
 
+use std::collections::HashSet;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -24,22 +25,37 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use hypervisor::device::device_manager::DeviceManager;
 use hypervisor::Hypervisor;
+use kata_sys_util::netns::NetnsGuard;
 use kata_types::config::TomlConfig;
 use scopeguard::defer;
 use serde::{Deserialize, Serialize};
 use tokio::fs;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use super::network_entity::NetworkEntity;
 use super::utils::address::{ip_family_from_ip_addr, parse_ip_cidr};
-use super::{EndpointState, NetnsGuard, Network};
-use crate::network::endpoint::TapEndpoint;
+use super::{AttachProgress, EndpointState, Network};
+use crate::network::endpoint::{TapEndpoint, VhostUserEndpoint};
 use crate::network::network_info::network_info_from_dan::NetworkInfoFromDan;
 use crate::network::utils::generate_private_mac_addr;
+use crate::network::Endpoint;
 
 /// Directly attachable network
 pub struct Dan {
     inner: Arc<RwLock<DanInner>>,
+    /// The endpoints setup() got to attaching; see `AttachProgress`.
+    attach_progress: AttachProgress,
+    cleanup: Mutex<DanCleanup>,
+}
+
+#[derive(Default)]
+struct DanCleanup {
+    /// Once a removal has begun, nothing may attach any more: setup() runs
+    /// on a thread the caller may have been cancelled away from, and an
+    /// attach after (or interleaved with) the removal would leave devices
+    /// attached with their records gone.
+    removal_started: bool,
+    detached: HashSet<usize>,
 }
 
 pub struct DanInner {
@@ -54,6 +70,8 @@ impl Dan {
     ) -> Result<Self> {
         Ok(Self {
             inner: Arc::new(RwLock::new(DanInner::new(config, &dev_mgr).await?)),
+            attach_progress: AttachProgress::default(),
+            cleanup: Mutex::new(DanCleanup::default()),
         })
     }
 }
@@ -66,8 +84,9 @@ impl DanInner {
         let json_str = fs::read_to_string(&config.dan_conf_path)
             .await
             .context("Read DAN config from file")?;
-        let config: DanConfig = serde_json::from_str(&json_str).context("Invalid DAN config")?;
-        info!(sl!(), "Dan config is loaded = {:?}", config);
+        let dan_config: DanConfig =
+            serde_json::from_str(&json_str).context("Invalid DAN config")?;
+        info!(sl!(), "Dan config is loaded = {:?}", dan_config);
 
         let (connection, handle, _) = rtnetlink::new_connection().context("New connection")?;
         let thread_handler = tokio::spawn(connection);
@@ -75,36 +94,31 @@ impl DanInner {
             thread_handler.abort();
         });
 
-        let mut entity_list = Vec::with_capacity(config.devices.len());
-        for (idx, device) in config.devices.iter().enumerate() {
-            let name = format!("eth{}", idx);
-            let endpoint = match &device.device {
-                // TODO: Support VhostUserNet protocol
-                Device::VhostUser {
-                    path,
-                    queue_num: _,
-                    queue_size: _,
-                } => {
-                    warn!(sl!(), "A DAN device whose type is \"vhost-user\" and socket path is {} is ignored.", path);
-                    continue;
-                }
-                Device::HostTap {
-                    tap_name,
-                    queue_num,
-                    queue_size,
-                } => Arc::new(
+        let mut entity_list = Vec::with_capacity(dan_config.devices.len());
+        for (idx, device) in dan_config.devices.iter().enumerate() {
+            let name = format!("eth{idx}");
+            // DAN queue_num overrides the configured default (both count RX/TX pairs),
+            // then the hypervisor limit applies to the selected request.
+            let (qnum, qsize) = device.device.get_effective_queues(config.network_queues);
+            let qnum = dev_mgr.read().await.network_queue_pairs(qnum).await;
+            let endpoint: Arc<dyn Endpoint> = match &device.device {
+                Device::VhostUser { path, .. } => Arc::new(
+                    VhostUserEndpoint::new(dev_mgr, &name, &device.guest_mac, path, qnum, qsize)
+                        .await
+                        .with_context(|| format!("create a vhost user endpoint, path: {path}"))?,
+                ),
+                Device::HostTap { tap_name, .. } => Arc::new(
                     TapEndpoint::new(
                         &handle,
-                        idx as u32,
                         &name,
                         tap_name,
                         &device.guest_mac,
-                        *queue_num,
-                        *queue_size,
+                        qnum,
+                        qsize,
                         dev_mgr,
                     )
                     .await
-                    .with_context(|| format!("New a {} tap endpoint", tap_name))?,
+                    .with_context(|| format!("create a {tap_name} tap endpoint"))?,
                 ),
             };
 
@@ -121,7 +135,7 @@ impl DanInner {
         }
 
         Ok(Self {
-            netns: config.netns,
+            netns: dan_config.netns,
             entity_list,
         })
     }
@@ -130,13 +144,32 @@ impl DanInner {
 #[async_trait]
 impl Network for Dan {
     async fn setup(&self) -> Result<()> {
+        // Held for the whole attach, so the removal of a sandbox whose
+        // attach_network() caller was cancelled waits for this thread
+        // instead of racing it, and an attach can never follow a removal.
+        let cleanup = self.cleanup.lock().await;
+        if cleanup.removal_started {
+            return Err(anyhow!("the network is being removed, nothing may attach"));
+        }
         let inner = self.inner.read().await;
         let _netns_guard;
         if let Some(netns) = inner.netns.as_ref() {
             _netns_guard = NetnsGuard::new(netns).context("New netns guard")?;
         }
-        for e in inner.entity_list.iter() {
-            e.endpoint.attach().await.context("Attach")?;
+        for (index, e) in inner.entity_list.iter().enumerate() {
+            // A retried setup resumes after the endpoints it finished:
+            // replaying an attach would hotplug its device a second time.
+            if self.attach_progress.is_finished(index) {
+                continue;
+            }
+            self.attach_progress.begin(index);
+            if let Some(device_path) = e.endpoint.attach().await.context("Attach")? {
+                e.network_info
+                    .set_device_path(device_path)
+                    .await
+                    .context("set device path")?;
+            }
+            self.attach_progress.finish(index);
         }
         Ok(())
     }
@@ -173,7 +206,10 @@ impl Network for Dan {
     async fn save(&self) -> Option<Vec<EndpointState>> {
         let inner = self.inner.read().await;
         let mut ep_states = vec![];
-        for e in &inner.entity_list {
+        for (index, e) in inner.entity_list.iter().enumerate() {
+            if !self.attach_progress.includes(index) {
+                break;
+            }
             if let Some(state) = e.endpoint.save().await {
                 ep_states.push(state);
             }
@@ -182,13 +218,37 @@ impl Network for Dan {
     }
 
     async fn remove(&self, h: &dyn Hypervisor) -> Result<()> {
+        let mut cleanup = self.cleanup.lock().await;
+        cleanup.removal_started = true;
+        let detached = &mut cleanup.detached;
         let inner = self.inner.read().await;
+        if (0..inner.entity_list.len())
+            .filter(|index| self.attach_progress.includes(*index))
+            .all(|index| detached.contains(&index))
+        {
+            return Ok(());
+        }
         let _netns_guard;
         if let Some(netns) = inner.netns.as_ref() {
             _netns_guard = NetnsGuard::new(netns).context("New netns guard")?;
         }
-        for e in inner.entity_list.iter() {
-            e.endpoint.detach(h).await.context("Detach")?;
+        let mut errors = Vec::new();
+        for (index, e) in inner.entity_list.iter().enumerate() {
+            if detached.contains(&index) || !self.attach_progress.includes(index) {
+                continue;
+            }
+            match e.endpoint.detach(h).await {
+                Ok(()) => {
+                    detached.insert(index);
+                }
+                Err(e) => errors.push(e),
+            }
+        }
+        if !errors.is_empty() {
+            for error in &errors {
+                warn!(sl!(), "failed to detach DAN endpoint: {error:#}");
+            }
+            return Err(anyhow!("{} DAN endpoint(s) failed to detach", errors.len()));
         }
         Ok(())
     }
@@ -198,6 +258,9 @@ impl Network for Dan {
 #[derive(Debug)]
 pub struct DanNetworkConfig {
     pub dan_conf_path: PathBuf,
+    /// Number of virtio queue pairs (each pair = 1 RX + 1 TX).
+    /// Derived from `network_queues` in the hypervisor TOML config.
+    pub network_queues: usize,
 }
 
 /// Directly attachable network config written by CNI plugins
@@ -246,6 +309,34 @@ pub(crate) enum Device {
     },
 }
 
+impl Device {
+    /// get the effective queue-pair count and queue size.
+    pub(crate) fn get_effective_queues(&self, network_queues: usize) -> (usize, usize) {
+        // The `network_queues` comes from hypervisor configurations, and we need to ensure that it is at least 1,
+        // otherwise the network device will not work.
+        let network_queues = network_queues.max(1);
+        let (queue_num, queue_size) = match self {
+            Device::VhostUser {
+                queue_num,
+                queue_size,
+                ..
+            }
+            | Device::HostTap {
+                queue_num,
+                queue_size,
+                ..
+            } => (queue_num, queue_size),
+        };
+        let qnum = if *queue_num == 0 {
+            network_queues
+        } else {
+            *queue_num
+        };
+        let qsize = if *queue_size == 0 { 256 } else { *queue_size };
+        (qnum, qsize)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct NetworkInfo {
     pub(crate) interface: Interface,
@@ -282,6 +373,10 @@ pub(crate) struct Route {
     // Scope
     #[serde(default)]
     pub scope: u32,
+    #[serde(default)]
+    pub flags: u32,
+    #[serde(default)]
+    pub mtu: u32,
 }
 
 impl Route {
@@ -329,7 +424,7 @@ fn default_mtu() -> u64 {
 /// Path of DAN config, the file contains an array of DanDevices.
 #[inline]
 pub fn dan_config_path(config: &TomlConfig, sandbox_id: &str) -> PathBuf {
-    PathBuf::from(config.runtime.dan_conf.as_str()).join(format!("{}.json", sandbox_id))
+    PathBuf::from(config.runtime.dan_conf.as_str()).join(format!("{sandbox_id}.json"))
 }
 
 #[cfg(test)]
@@ -359,7 +454,8 @@ mod tests {
                     "source": "172.18.0.1",
                     "gateway": "172.18.31.1",
                     "scope": 0,
-                    "flags": 0
+                    "flags": 0,
+                    "mtu": 1450
                 }],
                 "neighbors": [{
                     "ip_address": "192.168.0.3/16",
@@ -391,6 +487,8 @@ mod tests {
                     source: "172.18.0.1".to_owned(),
                     gateway: "172.18.31.1".to_owned(),
                     scope: 0,
+                    flags: 0,
+                    mtu: 1450,
                 }],
                 neighbors: vec![ARPNeighbor {
                     ip_address: Some("192.168.0.3/16".to_owned()),

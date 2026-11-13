@@ -7,26 +7,39 @@
 // found in the THIRD-PARTY file.
 
 //! Device manager for virtio-blk and vhost-user-blk devices.
-use std::collections::{vec_deque, VecDeque};
 use std::convert::TryInto;
 use std::fs::OpenOptions;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::Sender;
 use std::sync::Arc;
+use std::{
+    collections::{vec_deque, HashSet, VecDeque},
+    sync::mpsc,
+};
 
+use dbs_device::DeviceIo;
+use dbs_pci::VirtioPciDevice;
+use dbs_upcall::{DevMgrResponse, UpcallClientResponse};
 use dbs_virtio_devices as virtio;
 use dbs_virtio_devices::block::{aio::Aio, io_uring::IoUring, Block, LocalFile, Ufile};
+#[cfg(feature = "vhost-user-blk")]
+use dbs_virtio_devices::vhost::vhost_user::block::VhostUserBlock;
 use serde_derive::{Deserialize, Serialize};
+use virtio_queue::QueueSync;
+use vm_memory::GuestRegionMmap;
 
 use crate::address_space_manager::GuestAddressSpaceImpl;
+#[cfg(target_arch = "x86_64")]
+use crate::api::v1::ConfidentialVmType;
 use crate::config_manager::{ConfigItem, DeviceConfigInfo, RateLimiterConfigInfo};
 use crate::device_manager::blk_dev_mgr::BlockDeviceError::InvalidDeviceId;
 use crate::device_manager::{DeviceManager, DeviceMgrError, DeviceOpContext};
 use crate::get_bucket_update;
 use crate::vm::KernelConfigInfo;
 
-use super::DbsMmioV2Device;
+use super::{persist, DbsMmioV2Device};
 
 // The flag of whether to use the shared irq.
 const USE_SHARED_IRQ: bool = true;
@@ -45,7 +58,7 @@ macro_rules! error(
     };
 );
 
-/// Default queue size for VirtIo block devices.
+/// Default queue size for Virtio block devices.
 pub const QUEUE_SIZE: u16 = 128;
 
 /// Errors associated with the operations allowed on a drive.
@@ -62,6 +75,18 @@ pub enum BlockDeviceError {
     /// The block device type is invalid.
     #[error("invalid block device type")]
     InvalidBlockDeviceType,
+
+    /// Snapshotting this block device class is not supported.
+    #[error(
+        "cannot snapshot block device '{drive_id}': {device_type:?} devices are not supported; \
+         only RawBlock (virtio-blk) devices can be saved and restored"
+    )]
+    UnsupportedDeviceType {
+        /// Drive id of the offending device.
+        drive_id: String,
+        /// Low-level device type that cannot be snapshotted.
+        device_type: BlockDeviceType,
+    },
 
     /// The block device path was already used for a different drive.
     #[error("block device path '{0}' already exists")]
@@ -159,6 +184,9 @@ impl BlockDeviceConfigUpdateInfo {
 pub struct BlockDeviceConfigInfo {
     /// Unique identifier of the drive.
     pub drive_id: String,
+    /// Optional guest-visible virtio-blk serial, at most 20 bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serial: Option<String>,
     /// Type of low level storage/protocol.
     pub device_type: BlockDeviceType,
     /// Path of the drive.
@@ -178,6 +206,9 @@ pub struct BlockDeviceConfigInfo {
     pub is_direct: bool,
     /// Don't close `path_on_host` file when dropping the device.
     pub no_drop: bool,
+    /// If set to true, the virtio-blk device will support virtio's "discard" cmd.
+    #[serde(default)]
+    pub sparse: bool,
     /// Block device multi-queue
     pub num_queues: usize,
     /// Virtio queue size. Size: byte
@@ -188,12 +219,15 @@ pub struct BlockDeviceConfigInfo {
     pub use_shared_irq: Option<bool>,
     /// Use generic irq
     pub use_generic_irq: Option<bool>,
+    /// Use pci bus
+    pub use_pci_bus: Option<bool>,
 }
 
 impl std::default::Default for BlockDeviceConfigInfo {
     fn default() -> Self {
         Self {
             drive_id: String::default(),
+            serial: None,
             device_type: BlockDeviceType::RawBlock,
             path_on_host: PathBuf::default(),
             is_root_device: false,
@@ -201,11 +235,13 @@ impl std::default::Default for BlockDeviceConfigInfo {
             is_read_only: false,
             is_direct: Self::default_direct(),
             no_drop: Self::default_no_drop(),
+            sparse: false,
             num_queues: Self::default_num_queues(),
             queue_size: 256,
             rate_limiter: None,
             use_shared_irq: None,
             use_generic_irq: None,
+            use_pci_bus: None,
         }
     }
 }
@@ -298,11 +334,13 @@ pub struct BlockDeviceMgr {
     read_only_root: bool,
     part_uuid: Option<String>,
     use_shared_irq: bool,
+    /// Drive IDs that were attached through the runtime hotplug path.
+    hotplug_drive_ids: HashSet<String>,
 }
 
 impl BlockDeviceMgr {
     /// returns a front-to-back iterator.
-    pub fn iter(&self) -> vec_deque::Iter<BlockDeviceInfo> {
+    pub fn iter(&self) -> vec_deque::Iter<'_, BlockDeviceInfo> {
         self.info_list.iter()
     }
 
@@ -347,6 +385,7 @@ impl BlockDeviceMgr {
         &mut self,
         mut ctx: DeviceOpContext,
         config: BlockDeviceConfigInfo,
+        sender: mpsc::Sender<Option<i32>>,
     ) -> std::result::Result<(), BlockDeviceError> {
         if !cfg!(feature = "hotplug") && ctx.is_hotplug {
             return Err(BlockDeviceError::UpdateNotAllowedPostBoot);
@@ -377,10 +416,74 @@ impl BlockDeviceMgr {
                 if !ctx.is_hotplug {
                     return Ok(());
                 }
+                self.hotplug_drive_ids.insert(config.drive_id.clone());
+
+                let mut slot = 0;
+
+                let use_generic_irq = config.use_generic_irq.unwrap_or(USE_GENERIC_IRQ);
 
                 match config.device_type {
                     BlockDeviceType::RawBlock => {
                         let device = Self::create_blk_device(&config, &mut ctx)
+                            .map_err(BlockDeviceError::Virtio)?;
+
+                        let dev = if let Some(true) = config.use_pci_bus {
+                            let pci_dev = DeviceManager::create_virtio_pci_device(
+                                device,
+                                &mut ctx,
+                                use_generic_irq,
+                            )
+                            .map_err(BlockDeviceError::DeviceManager)?;
+
+                            let (_, devfn) = DeviceManager::get_pci_device_info(&pci_dev)?;
+                            slot = devfn >> 3;
+
+                            pci_dev
+                        } else {
+                            DeviceManager::create_mmio_virtio_device(
+                                device,
+                                &mut ctx,
+                                config.use_shared_irq.unwrap_or(self.use_shared_irq),
+                                use_generic_irq,
+                            )
+                            .map_err(BlockDeviceError::DeviceManager)?
+                        };
+
+                        let callback: Option<Box<dyn Fn(UpcallClientResponse) + Send>> =
+                            Some(Box::new(move |_| {
+                                // send the pci device slot to caller.
+                                let _ = sender.send(Some(slot as i32));
+                            }));
+
+                        self.update_device_by_index(index, dev.clone())?;
+                        // live-upgrade need save/restore device from info.device.
+                        self.info_list[index].set_device(dev.clone());
+
+                        let mut cleanup = |e, ctx: DeviceOpContext| -> BlockDeviceError {
+                            let logger = ctx.logger().new(slog::o!());
+                            self.remove_device(ctx, &config.drive_id).unwrap();
+                            error!(
+                                logger,
+                                "failed to hot-add pci virtio block device {}, {:?}",
+                                &config.drive_id,
+                                e
+                            );
+                            BlockDeviceError::DeviceManager(e)
+                        };
+
+                        if let Some(true) = config.use_pci_bus {
+                            let _ = ctx
+                                .insert_hotplug_pci_device(&dev, callback)
+                                .map_err(|e| cleanup(e, ctx))?;
+                            Ok(())
+                        } else {
+                            ctx.insert_hotplug_mmio_device(&dev, callback)
+                                .map_err(|e| cleanup(e, ctx))
+                        }
+                    }
+                    #[cfg(feature = "vhost-user-blk")]
+                    BlockDeviceType::Spool | BlockDeviceType::Spdk => {
+                        let device = Self::create_vhost_user_device(&config, &mut ctx)
                             .map_err(BlockDeviceError::Virtio)?;
                         let dev = DeviceManager::create_mmio_virtio_device(
                             device,
@@ -389,10 +492,13 @@ impl BlockDeviceMgr {
                             config.use_generic_irq.unwrap_or(USE_GENERIC_IRQ),
                         )
                         .map_err(BlockDeviceError::DeviceManager)?;
+                        let callback: Option<Box<dyn Fn(UpcallClientResponse) + Send>> =
+                            Some(Box::new(move |_| {
+                                let _ = sender.send(None);
+                            }));
+
                         self.update_device_by_index(index, Arc::clone(&dev))?;
-                        // live-upgrade need save/restore device from info.device.
-                        self.info_list[index].set_device(dev.clone());
-                        ctx.insert_hotplug_mmio_device(&dev, None).map_err(|e| {
+                        ctx.insert_hotplug_mmio_device(&dev, callback).map_err(|e| {
                             let logger = ctx.logger().new(slog::o!());
                             self.remove_device(ctx, &config.drive_id).unwrap();
                             error!(
@@ -403,10 +509,6 @@ impl BlockDeviceMgr {
                             );
                             BlockDeviceError::DeviceManager(e)
                         })
-                    }
-                    BlockDeviceType::Spool | BlockDeviceType::Spdk => {
-                        // TBD
-                        todo!()
                     }
                     _ => Err(BlockDeviceError::InvalidBlockDeviceType),
                 }
@@ -419,7 +521,39 @@ impl BlockDeviceMgr {
         &mut self,
         ctx: &mut DeviceOpContext,
     ) -> std::result::Result<(), BlockDeviceError> {
+        self.attach_devices_matching(ctx, |_| true)
+    }
+
+    /// Attach devices that exist at boot while preserving configured order.
+    pub fn attach_boot_devices(
+        &mut self,
+        ctx: &mut DeviceOpContext,
+    ) -> std::result::Result<(), BlockDeviceError> {
+        let hotplug_drive_ids = self.hotplug_drive_ids.clone();
+        self.attach_devices_matching(ctx, |config| !hotplug_drive_ids.contains(&config.drive_id))
+    }
+
+    /// Hotplug snapshot restored devices after the VM's boot-time devices.
+    pub fn attach_restored_devices(
+        &mut self,
+        ctx: &mut DeviceOpContext,
+    ) -> std::result::Result<(), BlockDeviceError> {
+        let hotplug_drive_ids = self.hotplug_drive_ids.clone();
+        self.attach_devices_matching(ctx, |config| hotplug_drive_ids.contains(&config.drive_id))
+    }
+
+    fn attach_devices_matching<F>(
+        &mut self,
+        ctx: &mut DeviceOpContext,
+        matches: F,
+    ) -> std::result::Result<(), BlockDeviceError>
+    where
+        F: Fn(&BlockDeviceConfigInfo) -> bool,
+    {
         for info in self.info_list.iter_mut() {
+            if !matches(&info.config) {
+                continue;
+            }
             match info.config.device_type {
                 BlockDeviceType::RawBlock => {
                     info!(
@@ -428,7 +562,36 @@ impl BlockDeviceMgr {
                         info.config.drive_id,
                         info.config.path_on_host.to_str().unwrap_or("<unknown>")
                     );
+
+                    let use_shared_irq = info.config.use_shared_irq.unwrap_or(self.use_shared_irq);
+                    let use_generic_irq = info.config.use_generic_irq.unwrap_or(USE_GENERIC_IRQ);
                     let device = Self::create_blk_device(&info.config, ctx)
+                        .map_err(BlockDeviceError::Virtio)?;
+
+                    let device = if let Some(true) = info.config.use_pci_bus {
+                        DeviceManager::create_virtio_pci_device(device, ctx, use_generic_irq)
+                            .map_err(BlockDeviceError::RegisterBlockDevice)?
+                    } else {
+                        DeviceManager::create_mmio_virtio_device(
+                            device,
+                            ctx,
+                            use_shared_irq,
+                            use_generic_irq,
+                        )
+                        .map_err(BlockDeviceError::RegisterBlockDevice)?
+                    };
+
+                    info.device = Some(device);
+                }
+                #[cfg(feature = "vhost-user-blk")]
+                BlockDeviceType::Spool | BlockDeviceType::Spdk => {
+                    info!(
+                        ctx.logger(),
+                        "attach vhost-user-blk device, drive_id {}, path {}",
+                        info.config.drive_id,
+                        info.config.path_on_host.to_str().unwrap_or("<unknown>")
+                    );
+                    let device = Self::create_vhost_user_device(&info.config, ctx)
                         .map_err(BlockDeviceError::Virtio)?;
                     let device = DeviceManager::create_mmio_virtio_device(
                         device,
@@ -455,7 +618,7 @@ impl BlockDeviceMgr {
         while let Some(mut info) = self.info_list.pop_back() {
             info!(ctx.logger(), "remove drive {}", info.config.drive_id);
             if let Some(device) = info.device.take() {
-                DeviceManager::destroy_mmio_virtio_device(device, ctx)?;
+                DeviceManager::destroy_virtio_device(device, ctx)?;
             }
         }
 
@@ -463,10 +626,67 @@ impl BlockDeviceMgr {
     }
 
     fn remove(&mut self, drive_id: &str) -> Option<BlockDeviceInfo> {
+        self.hotplug_drive_ids.remove(drive_id);
         match self.get_index_of_drive_id(drive_id) {
             Some(index) => self.info_list.remove(index),
             None => None,
         }
+    }
+
+    /// prepare to remove device
+    pub fn prepare_remove_device(
+        &self,
+        ctx: &DeviceOpContext,
+        blockdev_id: &str,
+        result_sender: Sender<Option<i32>>,
+    ) -> Result<(), BlockDeviceError> {
+        if !cfg!(feature = "hotplug") {
+            return Err(BlockDeviceError::UpdateNotAllowedPostBoot);
+        }
+
+        info!(ctx.logger(), "prepare remove block device");
+
+        let callback: Option<Box<dyn Fn(UpcallClientResponse) + Send>> =
+            Some(Box::new(move |result| match result {
+                UpcallClientResponse::DevMgr(response) => {
+                    if let DevMgrResponse::Other(resp) = response {
+                        if let Err(e) = result_sender.send(Some(resp.result)) {
+                            log::error!("send upcall result failed, due to {e:?}!");
+                        }
+                    }
+                }
+                UpcallClientResponse::UpcallReset => {
+                    if let Err(e) = result_sender.send(None) {
+                        log::error!("send upcall result failed, due to {e:?}!");
+                    }
+                }
+                #[allow(unreachable_patterns)]
+                _ => {
+                    log::debug!("this arm should only be triggered under test");
+                }
+            }));
+
+        let device_index = self
+            .get_index_of_drive_id(blockdev_id)
+            .ok_or(BlockDeviceError::InvalidDeviceId(blockdev_id.to_string()))?;
+
+        let info = &self.info_list[device_index];
+        if let Some(device) = info.device.as_ref() {
+            if let Some(_mmio_dev) = device.as_any().downcast_ref::<DbsMmioV2Device>() {
+                if callback.is_some() {
+                    ctx.remove_hotplug_mmio_device(device, callback)?;
+                }
+            } else if let Some(_pci_dev) = device.as_any().downcast_ref::<VirtioPciDevice<
+                GuestAddressSpaceImpl,
+                QueueSync,
+                GuestRegionMmap,
+            >>() {
+                if callback.is_some() {
+                    ctx.remove_hotplug_pci_device(device, callback)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// remove a block device, it basically is the inverse operation of `insert_device``
@@ -483,7 +703,7 @@ impl BlockDeviceMgr {
             Some(mut info) => {
                 info!(ctx.logger(), "remove drive {}", info.config.drive_id);
                 if let Some(device) = info.device.take() {
-                    DeviceManager::destroy_mmio_virtio_device(device, &mut ctx)
+                    DeviceManager::destroy_virtio_device(device, &mut ctx)
                         .map_err(BlockDeviceError::DeviceManager)?;
                 }
             }
@@ -564,12 +784,42 @@ impl BlockDeviceMgr {
             }
         }
 
-        Ok(Box::new(Block::new(
+        #[cfg(not(target_arch = "x86_64"))]
+        let f_access_platform = false;
+        #[cfg(target_arch = "x86_64")]
+        let f_access_platform = ctx.get_confidential_vm_type() == Some(ConfidentialVmType::TDX);
+
+        let mut block = Block::new(
             block_files,
             cfg.is_read_only,
+            cfg.sparse,
             Arc::new(cfg.queue_sizes()),
             epoll_mgr,
             limiters,
+            f_access_platform,
+        )?;
+        if let Some(serial) = &cfg.serial {
+            block.set_serial(serial)?;
+        }
+        Ok(Box::new(block))
+    }
+
+    #[cfg(feature = "vhost-user-blk")]
+    fn create_vhost_user_device(
+        cfg: &BlockDeviceConfigInfo,
+        ctx: &mut DeviceOpContext,
+    ) -> std::result::Result<Box<VhostUserBlock<GuestAddressSpaceImpl>>, virtio::Error> {
+        info!(
+            ctx.logger(),
+            "new vhost user block device {:?}", cfg.path_on_host
+        );
+        let epoll_mgr = ctx.epoll_mgr.clone().ok_or(virtio::Error::InvalidInput)?;
+        let path = cfg.path_on_host.to_str().unwrap().to_string();
+
+        Ok(Box::new(VhostUserBlock::new(
+            path,
+            Arc::new(cfg.queue_sizes()),
+            epoll_mgr,
         )?))
     }
 
@@ -591,7 +841,7 @@ impl BlockDeviceMgr {
             let cmdline = kernel_config.kernel_cmdline_mut();
             if let Some(ref uuid) = self.part_uuid {
                 cmdline
-                    .insert("root", &format!("PART_UUID={}", uuid))
+                    .insert("root", &format!("PART_UUID={uuid}"))
                     .map_err(DeviceMgrError::Cmdline)?;
             } else {
                 cmdline
@@ -723,7 +973,7 @@ impl BlockDeviceMgr {
     pub fn update_device_by_index(
         &mut self,
         index: usize,
-        device: Arc<DbsMmioV2Device>,
+        device: Arc<dyn DeviceIo>,
     ) -> Result<(), BlockDeviceError> {
         if let Some(info) = self.info_list.get_mut(index) {
             info.device = Some(device);
@@ -758,12 +1008,211 @@ impl BlockDeviceMgr {
                             .map(|_p| ())
                             .map_err(|_e| BlockDeviceError::BlockEpollHanderSendFail);
                     }
+                } else if let Some(pci_dev) = device.as_any().downcast_ref::<VirtioPciDevice<
+                    GuestAddressSpaceImpl,
+                    QueueSync,
+                    GuestRegionMmap,
+                >>() {
+                    let inner_dev = pci_dev.device();
+                    if let Some(blk_dev) = inner_dev
+                        .as_any()
+                        .downcast_ref::<virtio::block::Block<GuestAddressSpaceImpl>>()
+                    {
+                        return blk_dev
+                            .set_patch_rate_limiters(new_cfg.bytes(), new_cfg.ops())
+                            .map(|_p| ())
+                            .map_err(|_e| BlockDeviceError::BlockEpollHanderSendFail);
+                    }
                 }
                 Ok(())
             }
             None => Err(BlockDeviceError::InvalidDeviceId(new_cfg.drive_id)),
         }
     }
+}
+
+impl<'a> dbs_snapshot::Persist<'a> for BlockDeviceMgr {
+    type State = BlockDeviceMgrState;
+    type SaveArgs = ();
+    type RestoreArgs = ();
+    type Error = BlockDeviceError;
+
+    /// Capture the state of all block devices.
+    ///
+    /// The virtual machine must be paused when this is called. Only MMIO
+    /// virtio-blk devices are supported; vhost-user/PCI block devices are
+    /// refused.
+    fn save_state(&mut self, _args: ()) -> std::result::Result<Self::State, Self::Error> {
+        let mut devices = Vec::new();
+        for info in self.info_list.iter() {
+            let device = info
+                .device
+                .as_ref()
+                .ok_or_else(|| InvalidDeviceId(info.config.drive_id.clone()))?;
+            // Dispatch on the recorded device type rather than probing with a
+            // downcast: vhost-user drives (Spool/Spdk) share this info_list and
+            // this transport, and their backend state lives in another process,
+            // so they are refused by name instead of failing opaquely.
+            match info.config.device_type {
+                BlockDeviceType::RawBlock => {}
+                device_type => {
+                    return Err(BlockDeviceError::UnsupportedDeviceType {
+                        drive_id: info.config.drive_id.clone(),
+                        device_type,
+                    })
+                }
+            }
+            let (device_info, transport) =
+                persist::save_device_state::<Block<GuestAddressSpaceImpl>>(device, ())
+                    .map_err(BlockDeviceError::Virtio)?;
+            devices.push(BlockDevState {
+                config: info.config.clone(),
+                device_info: BlockDeviceState::RawBlock(device_info),
+                transport,
+                was_hotplugged: self.hotplug_drive_ids.contains(&info.config.drive_id),
+            });
+        }
+        Ok(BlockDeviceMgrState { devices })
+    }
+
+    /// Restore the runtime state of all block devices.
+    ///
+    /// The devices must have been re-created from the same configuration
+    /// (matched by drive id) and must not have been activated yet. Replays
+    /// device activation for devices the guest had activated. Must be called
+    /// before the guest vCPUs resume.
+    fn restore_state(
+        &mut self,
+        state: &Self::State,
+        _args: (),
+    ) -> std::result::Result<(), Self::Error> {
+        let indices = self.restore_device_indices(state)?;
+        for (dev_state, index) in state.devices.iter().zip(indices) {
+            // The saved type must match the device that was re-created from
+            // config, or the saved state belongs to a different device.
+            if self.info_list[index].config.device_type != dev_state.config.device_type {
+                return Err(BlockDeviceError::UnsupportedDeviceType {
+                    drive_id: dev_state.config.drive_id.clone(),
+                    device_type: dev_state.config.device_type,
+                });
+            }
+            let BlockDeviceState::RawBlock(device_info) = &dev_state.device_info;
+            let device = self.info_list[index]
+                .device
+                .as_ref()
+                .ok_or_else(|| InvalidDeviceId(dev_state.config.drive_id.clone()))?;
+            persist::restore_device_state::<Block<GuestAddressSpaceImpl>>(
+                device,
+                device_info,
+                &dev_state.transport,
+                (),
+            )
+            .map_err(BlockDeviceError::Virtio)?;
+        }
+        Ok(())
+    }
+}
+
+impl BlockDeviceMgr {
+    /// Apply the source attachment phase to the newly configured target
+    /// devices before they are created. The phase is snapshot state; it must
+    /// not be guessed from root or read-only properties.
+    pub fn prepare_restore_layout(
+        &mut self,
+        state: &BlockDeviceMgrState,
+    ) -> std::result::Result<(), BlockDeviceError> {
+        let indices = self.restore_device_indices(state)?;
+        self.hotplug_drive_ids.clear();
+        for (dev_state, index) in state.devices.iter().zip(indices) {
+            if dev_state.was_hotplugged {
+                self.hotplug_drive_ids
+                    .insert(self.info_list[index].config.drive_id.clone());
+            }
+        }
+        Ok(())
+    }
+
+    fn restore_device_indices(
+        &self,
+        state: &BlockDeviceMgrState,
+    ) -> std::result::Result<Vec<usize>, BlockDeviceError> {
+        let exact_targets: HashSet<usize> = state
+            .devices
+            .iter()
+            .filter_map(|dev_state| self.get_index_of_drive_id(&dev_state.config.drive_id))
+            .collect();
+        let mut restored = vec![false; self.info_list.len()];
+        let mut indices = Vec::with_capacity(state.devices.len());
+
+        for dev_state in &state.devices {
+            let index = match self.get_index_of_drive_id(&dev_state.config.drive_id) {
+                Some(index) if !restored[index] => index,
+                _ if self.info_list.len() == state.devices.len() => self
+                    .info_list
+                    .iter()
+                    .enumerate()
+                    .find(|(index, info)| {
+                        !restored[*index]
+                            // A fallback must not consume a target reserved by
+                            // another snapshot entry's exact drive ID.
+                            && !exact_targets.contains(index)
+                            && info.config.device_type == dev_state.config.device_type
+                            && info.config.is_read_only == dev_state.config.is_read_only
+                            && info.config.is_root_device == dev_state.config.is_root_device
+                            && (!dev_state.config.is_read_only
+                                || info.config.path_on_host == dev_state.config.path_on_host)
+                    })
+                    .map(|(index, _)| index)
+                    .ok_or_else(|| InvalidDeviceId(dev_state.config.drive_id.clone()))?,
+                _ => return Err(InvalidDeviceId(dev_state.config.drive_id.clone())),
+            };
+            if dev_state.config.drive_id != self.info_list[index].config.drive_id {
+                log::warn!(
+                    "block device id '{}' not found, matched restored device at position {}",
+                    dev_state.config.drive_id,
+                    index,
+                );
+            }
+            restored[index] = true;
+            indices.push(index);
+        }
+        Ok(indices)
+    }
+}
+
+/// Snapshot state of one block device, tagged by the low-level device kind.
+///
+/// Wired as an enum from the start so support for a further kind is an added
+/// variant rather than a change to [`persist::VirtioDevState`]'s shape. Only
+/// `RawBlock` (virtio-blk) can be snapshotted today: vhost-user drives
+/// (Spool/Spdk) keep their state in the backend process, so a `VhostUser`
+/// variant has to carry that too and is added with the support, not before.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub enum BlockDeviceState {
+    /// State of a local-file-backed virtio-blk device.
+    RawBlock(virtio::persist::VirtioDeviceInfoState),
+}
+
+/// Snapshot state of one block device.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct BlockDevState {
+    /// Static block-device configuration captured in the snapshot.
+    pub config: BlockDeviceConfigInfo,
+    /// Device-specific virtio state.
+    pub device_info: BlockDeviceState,
+    /// Guest-visible transport state.
+    pub transport: persist::VirtioTransportState,
+    /// Whether this device acquired guest-visible resources through hotplug.
+    /// Older snapshots default to the existing boot-device behavior.
+    #[serde(default)]
+    pub was_hotplugged: bool,
+}
+
+/// Snapshot state of the block device manager.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct BlockDeviceMgrState {
+    /// Per-device state, in insertion order.
+    pub devices: Vec<BlockDevState>,
 }
 
 impl Default for BlockDeviceMgr {
@@ -776,17 +1225,38 @@ impl Default for BlockDeviceMgr {
             read_only_root: false,
             part_uuid: None,
             use_shared_irq: USE_SHARED_IRQ,
+            hotplug_drive_ids: HashSet::new(),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use test_utils::skip_if_not_root;
+    use test_utils::skip_if_kvm_unaccessable;
     use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
+    use crate::device_manager::tests::create_address_space;
     use crate::test_utils::tests::create_vm_for_test;
+    use std::sync::mpsc::channel;
+
+    #[test]
+    fn test_block_serial_config_compatibility() {
+        let config = BlockDeviceConfigInfo::default();
+        let legacy = serde_json::to_value(&config).unwrap();
+        assert!(legacy.get("serial").is_none());
+        let restored: BlockDeviceConfigInfo = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.serial, None);
+
+        let config = BlockDeviceConfigInfo {
+            serial: Some("extension-coco".into()),
+            ..config
+        };
+        let json = serde_json::to_value(&config).unwrap();
+        assert_eq!(json["serial"], "extension-coco");
+        let restored: BlockDeviceConfigInfo = serde_json::from_value(json).unwrap();
+        assert_eq!(restored, config);
+    }
 
     #[test]
     fn test_block_device_type() {
@@ -808,7 +1278,7 @@ mod tests {
 
     #[test]
     fn test_add_non_root_block_device() {
-        skip_if_not_root!();
+        skip_if_kvm_unaccessable!();
         let dummy_file = TempFile::new().unwrap();
         let dummy_path = dummy_file.as_path().to_owned();
         let dummy_id = String::from("1");
@@ -822,18 +1292,22 @@ mod tests {
             no_drop: false,
             drive_id: dummy_id.clone(),
             rate_limiter: None,
+            sparse: false,
             num_queues: BlockDeviceConfigInfo::default_num_queues(),
             queue_size: 128,
             use_shared_irq: None,
             use_generic_irq: None,
+            use_pci_bus: Some(true),
+            serial: None,
         };
 
         let mut vm = crate::vm::tests::create_vm_instance();
         let ctx = DeviceOpContext::create_boot_ctx(&vm, None);
+        let (sender, _receiver) = channel();
         assert!(vm
             .device_manager_mut()
             .block_manager
-            .insert_device(ctx, dummy_block_device.clone(),)
+            .insert_device(ctx, dummy_block_device.clone(), sender)
             .is_ok());
 
         assert_eq!(vm.device_manager().block_manager.info_list.len(), 1);
@@ -870,14 +1344,14 @@ mod tests {
 
     #[test]
     fn test_update_blk_device_ratelimiters() {
-        skip_if_not_root!();
+        skip_if_kvm_unaccessable!();
         //Init vm for test.
         let mut vm = create_vm_for_test();
         let device_op_ctx = DeviceOpContext::new(
             Some(vm.epoll_manager().clone()),
             vm.device_manager(),
             Some(vm.vm_as().unwrap().clone()),
-            None,
+            Some(create_address_space()),
             false,
             Some(vm.vm_config().clone()),
             vm.shared_info().clone(),
@@ -896,14 +1370,18 @@ mod tests {
             no_drop: false,
             drive_id: String::from("1"),
             rate_limiter: None,
+            sparse: false,
             num_queues: BlockDeviceConfigInfo::default_num_queues(),
             queue_size: 128,
             use_shared_irq: None,
             use_generic_irq: None,
+            use_pci_bus: Some(true),
+            serial: None,
         };
+        let (sender, _receiver) = channel();
         vm.device_manager_mut()
             .block_manager
-            .insert_device(device_op_ctx, dummy_block_device)
+            .insert_device(device_op_ctx, dummy_block_device, sender)
             .unwrap();
 
         let cfg = BlockDeviceConfigUpdateInfo {
@@ -915,7 +1393,7 @@ mod tests {
             Some(vm.epoll_manager().clone()),
             vm.device_manager(),
             Some(vm.vm_as().unwrap().clone()),
-            None,
+            Some(create_address_space()),
             false,
             Some(vm.vm_config().clone()),
             vm.shared_info().clone(),
@@ -959,7 +1437,7 @@ mod tests {
 
     #[test]
     fn test_add_one_root_block_device() {
-        skip_if_not_root!();
+        skip_if_kvm_unaccessable!();
         let dummy_file = TempFile::new().unwrap();
         let dummy_path = dummy_file.as_path().to_owned();
         let dummy_block_device = BlockDeviceConfigInfo {
@@ -972,18 +1450,22 @@ mod tests {
             no_drop: false,
             drive_id: String::from("1"),
             rate_limiter: None,
+            sparse: false,
             num_queues: BlockDeviceConfigInfo::default_num_queues(),
             queue_size: 128,
             use_shared_irq: None,
             use_generic_irq: None,
+            use_pci_bus: Some(true),
+            serial: None,
         };
 
         let mut vm = crate::vm::tests::create_vm_instance();
         let ctx = DeviceOpContext::create_boot_ctx(&vm, None);
+        let (sender, _receiver) = channel();
         assert!(vm
             .device_manager_mut()
             .block_manager
-            .insert_device(ctx, dummy_block_device.clone(),)
+            .insert_device(ctx, dummy_block_device.clone(), sender)
             .is_ok());
 
         assert_eq!(vm.device_manager().block_manager.info_list.len(), 1);
@@ -999,7 +1481,7 @@ mod tests {
 
     #[test]
     fn test_add_two_root_block_devices_configs() {
-        skip_if_not_root!();
+        skip_if_kvm_unaccessable!();
         let dummy_file_1 = TempFile::new().unwrap();
         let dummy_path_1 = dummy_file_1.as_path().to_owned();
         let root_block_device_1 = BlockDeviceConfigInfo {
@@ -1012,10 +1494,13 @@ mod tests {
             no_drop: false,
             drive_id: String::from("1"),
             rate_limiter: None,
+            sparse: false,
             num_queues: BlockDeviceConfigInfo::default_num_queues(),
             queue_size: 128,
             use_shared_irq: None,
             use_generic_irq: None,
+            use_pci_bus: Some(true),
+            serial: None,
         };
 
         let dummy_file_2 = TempFile::new().unwrap();
@@ -1030,30 +1515,34 @@ mod tests {
             no_drop: false,
             drive_id: String::from("2"),
             rate_limiter: None,
+            sparse: false,
             num_queues: BlockDeviceConfigInfo::default_num_queues(),
             queue_size: 128,
             use_shared_irq: None,
             use_generic_irq: None,
+            use_pci_bus: Some(true),
+            serial: None,
         };
 
         let mut vm = crate::vm::tests::create_vm_instance();
         let ctx = DeviceOpContext::create_boot_ctx(&vm, None);
+        let (sender, _receiver) = channel();
         vm.device_manager_mut()
             .block_manager
-            .insert_device(ctx, root_block_device_1)
+            .insert_device(ctx, root_block_device_1, sender.clone())
             .unwrap();
         let ctx = DeviceOpContext::create_boot_ctx(&vm, None);
         assert!(vm
             .device_manager_mut()
             .block_manager
-            .insert_device(ctx, root_block_device_2)
+            .insert_device(ctx, root_block_device_2, sender)
             .is_err());
     }
 
     #[test]
     // Test BlockDevicesConfigs::add when you first add the root device and then the other devices.
     fn test_add_root_block_device_first() {
-        skip_if_not_root!();
+        skip_if_kvm_unaccessable!();
         let dummy_file_1 = TempFile::new().unwrap();
         let dummy_path_1 = dummy_file_1.as_path().to_owned();
         let root_block_device = BlockDeviceConfigInfo {
@@ -1066,10 +1555,13 @@ mod tests {
             no_drop: false,
             drive_id: String::from("1"),
             rate_limiter: None,
+            sparse: false,
             num_queues: BlockDeviceConfigInfo::default_num_queues(),
             queue_size: 128,
             use_shared_irq: None,
             use_generic_irq: None,
+            use_pci_bus: Some(true),
+            serial: None,
         };
 
         let dummy_file_2 = TempFile::new().unwrap();
@@ -1084,10 +1576,13 @@ mod tests {
             no_drop: false,
             drive_id: String::from("2"),
             rate_limiter: None,
+            sparse: false,
             num_queues: BlockDeviceConfigInfo::default_num_queues(),
             queue_size: 128,
             use_shared_irq: None,
             use_generic_irq: None,
+            use_pci_bus: Some(true),
+            serial: None,
         };
 
         let dummy_file_3 = TempFile::new().unwrap();
@@ -1102,10 +1597,13 @@ mod tests {
             no_drop: false,
             drive_id: String::from("3"),
             rate_limiter: None,
+            sparse: false,
             num_queues: BlockDeviceConfigInfo::default_num_queues(),
             queue_size: 128,
             use_shared_irq: None,
             use_generic_irq: None,
+            use_pci_bus: Some(true),
+            serial: None,
         };
 
         let mut vm = crate::vm::tests::create_vm_instance();
@@ -1125,30 +1623,31 @@ mod tests {
         assert!(vm.device_manager().block_manager.has_root_block_device(),);
         assert!(!vm.device_manager().block_manager.has_part_uuid_root());
         assert_eq!(vm.device_manager().block_manager.info_list.len(), 3);
+        let (sender, _receiver) = channel();
 
         let ctx = DeviceOpContext::create_boot_ctx(&vm, None);
         vm.device_manager_mut()
             .block_manager
-            .insert_device(ctx, root_block_device)
+            .insert_device(ctx, root_block_device, sender.clone())
             .unwrap();
 
         let ctx = DeviceOpContext::create_boot_ctx(&vm, None);
         vm.device_manager_mut()
             .block_manager
-            .insert_device(ctx, dummy_block_device_2)
+            .insert_device(ctx, dummy_block_device_2, sender.clone())
             .unwrap();
 
         let ctx = DeviceOpContext::create_boot_ctx(&vm, None);
         vm.device_manager_mut()
             .block_manager
-            .insert_device(ctx, dummy_block_device_3)
+            .insert_device(ctx, dummy_block_device_3, sender.clone())
             .unwrap();
     }
 
     #[test]
     // Test BlockDevicesConfigs::add when you add other devices first and then the root device.
     fn test_root_block_device_add_last() {
-        skip_if_not_root!();
+        skip_if_kvm_unaccessable!();
         let dummy_file_1 = TempFile::new().unwrap();
         let dummy_path_1 = dummy_file_1.as_path().to_owned();
         let root_block_device = BlockDeviceConfigInfo {
@@ -1161,10 +1660,13 @@ mod tests {
             no_drop: false,
             drive_id: String::from("1"),
             rate_limiter: None,
+            sparse: false,
             num_queues: BlockDeviceConfigInfo::default_num_queues(),
             queue_size: 128,
             use_shared_irq: None,
             use_generic_irq: None,
+            use_pci_bus: Some(true),
+            serial: None,
         };
 
         let dummy_file_2 = TempFile::new().unwrap();
@@ -1179,10 +1681,13 @@ mod tests {
             no_drop: false,
             drive_id: String::from("2"),
             rate_limiter: None,
+            sparse: false,
             num_queues: BlockDeviceConfigInfo::default_num_queues(),
             queue_size: 128,
             use_shared_irq: None,
             use_generic_irq: None,
+            use_pci_bus: Some(true),
+            serial: None,
         };
 
         let dummy_file_3 = TempFile::new().unwrap();
@@ -1197,28 +1702,32 @@ mod tests {
             no_drop: false,
             drive_id: String::from("3"),
             rate_limiter: None,
+            sparse: false,
             num_queues: BlockDeviceConfigInfo::default_num_queues(),
             queue_size: 128,
             use_shared_irq: None,
             use_generic_irq: None,
+            use_pci_bus: Some(true),
+            serial: None,
         };
 
         let mut vm = crate::vm::tests::create_vm_instance();
 
         let ctx = DeviceOpContext::create_boot_ctx(&vm, None);
+        let (sender, _receiver) = channel();
         vm.device_manager_mut()
             .block_manager
-            .insert_device(ctx, dummy_block_device_2.clone())
+            .insert_device(ctx, dummy_block_device_2.clone(), sender.clone())
             .unwrap();
         let ctx = DeviceOpContext::create_boot_ctx(&vm, None);
         vm.device_manager_mut()
             .block_manager
-            .insert_device(ctx, dummy_block_device_3.clone())
+            .insert_device(ctx, dummy_block_device_3.clone(), sender.clone())
             .unwrap();
         let ctx = DeviceOpContext::create_boot_ctx(&vm, None);
         vm.device_manager_mut()
             .block_manager
-            .insert_device(ctx, root_block_device.clone())
+            .insert_device(ctx, root_block_device.clone(), sender.clone())
             .unwrap();
 
         assert!(vm.device_manager().block_manager.has_root_block_device(),);
@@ -1244,7 +1753,7 @@ mod tests {
 
     #[test]
     fn test_block_device_update() {
-        skip_if_not_root!();
+        skip_if_kvm_unaccessable!();
         let dummy_file_1 = TempFile::new().unwrap();
         let dummy_path_1 = dummy_file_1.as_path().to_owned();
         let root_block_device = BlockDeviceConfigInfo {
@@ -1257,10 +1766,13 @@ mod tests {
             no_drop: false,
             drive_id: String::from("1"),
             rate_limiter: None,
+            sparse: false,
             num_queues: BlockDeviceConfigInfo::default_num_queues(),
             queue_size: 128,
             use_shared_irq: None,
             use_generic_irq: None,
+            use_pci_bus: Some(true),
+            serial: None,
         };
 
         let dummy_file_2 = TempFile::new().unwrap();
@@ -1275,24 +1787,28 @@ mod tests {
             no_drop: false,
             drive_id: String::from("2"),
             rate_limiter: None,
+            sparse: false,
             num_queues: BlockDeviceConfigInfo::default_num_queues(),
             queue_size: 128,
             use_shared_irq: None,
             use_generic_irq: None,
+            use_pci_bus: Some(true),
+            serial: None,
         };
 
         let mut vm = crate::vm::tests::create_vm_instance();
+        let (sender, _receiver) = channel();
 
         // Add 2 block devices.
         let ctx = DeviceOpContext::create_boot_ctx(&vm, None);
         vm.device_manager_mut()
             .block_manager
-            .insert_device(ctx, root_block_device)
+            .insert_device(ctx, root_block_device, sender.clone())
             .unwrap();
         let ctx = DeviceOpContext::create_boot_ctx(&vm, None);
         vm.device_manager_mut()
             .block_manager
-            .insert_device(ctx, dummy_block_device_2.clone())
+            .insert_device(ctx, dummy_block_device_2.clone(), sender.clone())
             .unwrap();
 
         // Get index zero.
@@ -1323,7 +1839,7 @@ mod tests {
         let ctx = DeviceOpContext::create_boot_ctx(&vm, None);
         vm.device_manager_mut()
             .block_manager
-            .insert_device(ctx, dummy_block_device_2.clone())
+            .insert_device(ctx, dummy_block_device_2.clone(), sender.clone())
             .unwrap();
 
         let index = vm
@@ -1346,7 +1862,7 @@ mod tests {
         assert!(vm
             .device_manager_mut()
             .block_manager
-            .insert_device(ctx, dummy_block_device_2.clone(),)
+            .insert_device(ctx, dummy_block_device_2.clone(), sender.clone())
             .is_err());
 
         // Update with 2 root block devices.
@@ -1356,7 +1872,7 @@ mod tests {
         assert!(vm
             .device_manager_mut()
             .block_manager
-            .insert_device(ctx, dummy_block_device_2,)
+            .insert_device(ctx, dummy_block_device_2, sender.clone())
             .is_err(),);
 
         // Switch roots and add a PARTUUID for the new one.
@@ -1370,10 +1886,13 @@ mod tests {
             no_drop: false,
             drive_id: String::from("1"),
             rate_limiter: None,
+            sparse: false,
             num_queues: BlockDeviceConfigInfo::default_num_queues(),
             queue_size: 128,
             use_shared_irq: None,
             use_generic_irq: None,
+            use_pci_bus: Some(true),
+            serial: None,
         };
         let root_block_device_new = BlockDeviceConfigInfo {
             path_on_host: dummy_path_2,
@@ -1385,21 +1904,82 @@ mod tests {
             no_drop: false,
             drive_id: String::from("2"),
             rate_limiter: None,
+            sparse: false,
             num_queues: BlockDeviceConfigInfo::default_num_queues(),
             queue_size: 128,
             use_shared_irq: None,
             use_generic_irq: None,
+            use_pci_bus: Some(true),
+            serial: None,
         };
         let ctx = DeviceOpContext::create_boot_ctx(&vm, None);
         vm.device_manager_mut()
             .block_manager
-            .insert_device(ctx, root_block_device_old)
+            .insert_device(ctx, root_block_device_old, sender.clone())
             .unwrap();
         let ctx = DeviceOpContext::create_boot_ctx(&vm, None);
         vm.device_manager_mut()
             .block_manager
-            .insert_device(ctx, root_block_device_new)
+            .insert_device(ctx, root_block_device_new, sender.clone())
             .unwrap();
         assert!(vm.device_manager().block_manager.has_part_uuid_root);
+    }
+
+    fn snapshot_block_state(config: BlockDeviceConfigInfo, was_hotplugged: bool) -> BlockDevState {
+        BlockDevState {
+            config,
+            device_info: BlockDeviceState::RawBlock(Default::default()),
+            transport: persist::VirtioTransportState::Mmio(Default::default()),
+            was_hotplugged,
+        }
+    }
+
+    #[test]
+    fn test_restore_layout_reserves_exact_ids_and_preserves_attachment_phase() {
+        let exact = BlockDeviceConfigInfo {
+            drive_id: "exact".to_string(),
+            path_on_host: "/target/exact".into(),
+            ..Default::default()
+        };
+        let fallback_target = BlockDeviceConfigInfo {
+            drive_id: "target-new-id".to_string(),
+            path_on_host: "/target/fallback".into(),
+            ..Default::default()
+        };
+        let mut manager = BlockDeviceMgr::default();
+        manager
+            .info_list
+            .push_back(BlockDeviceInfo::new(exact.clone()));
+        manager
+            .info_list
+            .push_back(BlockDeviceInfo::new(fallback_target));
+
+        // The ID-miss entry is intentionally first. It must not consume the
+        // target reserved for the later exact-ID entry.
+        let state = BlockDeviceMgrState {
+            devices: vec![
+                snapshot_block_state(
+                    BlockDeviceConfigInfo {
+                        drive_id: "source-old-id".to_string(),
+                        path_on_host: "/source/old".into(),
+                        ..Default::default()
+                    },
+                    true,
+                ),
+                snapshot_block_state(exact, false),
+            ],
+        };
+
+        assert_eq!(manager.restore_device_indices(&state).unwrap(), vec![1, 0]);
+        manager.prepare_restore_layout(&state).unwrap();
+        assert!(manager.hotplug_drive_ids.contains("target-new-id"));
+        assert!(!manager.hotplug_drive_ids.contains("exact"));
+
+        // Snapshots predating phase tracking keep the prior boot-device
+        // behavior without adding a new compatibility policy.
+        let mut legacy = serde_json::to_value(&state.devices[0]).unwrap();
+        legacy.as_object_mut().unwrap().remove("was_hotplugged");
+        let legacy: BlockDevState = serde_json::from_value(legacy).unwrap();
+        assert!(!legacy.was_hotplugged);
     }
 }

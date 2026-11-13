@@ -9,6 +9,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path"
 	"path/filepath"
@@ -176,10 +177,14 @@ func TestKataAgentSendReq(t *testing.T) {
 	assert.Nil(err)
 
 	_, err = k.readProcessStdout(ctx, container, execid, []byte{})
-	assert.Nil(err)
+	if err != nil {
+		assert.ErrorIs(err, io.EOF)
+	}
 
 	_, err = k.readProcessStderr(ctx, container, execid, []byte{})
-	assert.Nil(err)
+	if err != nil {
+		assert.ErrorIs(err, io.EOF)
+	}
 
 	_, err = k.getOOMEvent(ctx)
 	assert.Nil(err)
@@ -200,7 +205,7 @@ func TestHandleEphemeralStorage(t *testing.T) {
 	assert.Nil(t, err)
 
 	epheMountPoint := epheStorages[0].MountPoint
-	expected := filepath.Join(ephemeralPath(), filepath.Base(mountSource))
+	expected := filepath.Join(defaultEphemeralPath, filepath.Base(mountSource))
 	assert.Equal(t, epheMountPoint, expected,
 		"Ephemeral mount point didn't match: got %s, expecting %s", epheMountPoint, expected)
 }
@@ -330,6 +335,46 @@ func TestHandleDeviceBlockVolume(t *testing.T) {
 				FsGroup: &pb.FSGroup{
 					GroupId:           uint32(gid),
 					GroupChangePolicy: pbTypes.FSGroupChangePolicy_OnRootMismatch,
+				},
+			},
+		},
+		{
+			BlockDeviceDriver: config.VirtioBlock,
+			inputMount: Mount{
+				BlockDeviceCreateFs: true,
+				Options:             []string{blockVolumeDiscardOption},
+			},
+			inputDev: &drivers.BlockDevice{
+				BlockDrive: &config.BlockDrive{
+					PCIPath:  testPCIPath,
+					VirtPath: testVirtPath,
+				},
+			},
+			resultVol: &pb.Storage{
+				Driver:        kataBlkDevType,
+				Source:        testPCIPath.String(),
+				DriverOptions: []string{volume.BlockVolumeCreateFsDriverKey},
+				Options:       []string{blockVolumeDiscardOption},
+			},
+		},
+		{
+			BlockDeviceDriver: config.VirtioBlock,
+			inputMount: Mount{
+				EncryptionKey:       "ephemeral",
+				BlockDeviceCreateFs: true,
+			},
+			inputDev: &drivers.BlockDevice{
+				BlockDrive: &config.BlockDrive{
+					PCIPath:  testPCIPath,
+					VirtPath: testVirtPath,
+				},
+			},
+			resultVol: &pb.Storage{
+				Driver: kataBlkDevType,
+				Source: testPCIPath.String(),
+				DriverOptions: []string{
+					encryptionKeyDriverOption + "=ephemeral",
+					volume.BlockVolumeCreateFsDriverKey,
 				},
 			},
 		},
@@ -479,15 +524,20 @@ func TestAppendDevicesEmptyContainerDeviceList(t *testing.T) {
 func TestAppendDevices(t *testing.T) {
 	k := kataAgent{}
 
-	id := "test-append-block"
+	testBlockDeviceID := "test-block-device"
+	testCharacterDeviceId := "test-character-device"
+
 	ctrDevices := []api.Device{
 		&drivers.BlockDevice{
 			GenericDevice: &drivers.GenericDevice{
-				ID: id,
+				ID: testBlockDeviceID,
 			},
 			BlockDrive: &config.BlockDrive{
 				PCIPath: testPCIPath,
 			},
+		},
+		&drivers.GenericDevice{
+			ID: testCharacterDeviceId,
 		},
 	}
 
@@ -503,10 +553,16 @@ func TestAppendDevices(t *testing.T) {
 			config:     sandboxConfig,
 		},
 	}
-	c.devices = append(c.devices, ContainerDevice{
-		ID:            id,
-		ContainerPath: testBlockDeviceCtrPath,
-	})
+	c.devices = append(
+		c.devices,
+		ContainerDevice{
+			ID:            testBlockDeviceID,
+			ContainerPath: testBlockDeviceCtrPath,
+		},
+		ContainerDevice{
+			ID: testCharacterDeviceId,
+		},
+	)
 
 	devList := []*pb.Device{}
 	expected := []*pb.Device{
@@ -587,6 +643,10 @@ func TestConstrainGRPCSpec(t *testing.T) {
 					Path: "/abc/123",
 				},
 				{
+					Type: string(specs.TimeNamespace),
+					Path: "/proc/123/ns/time",
+				},
+				{
 					Type: string(specs.MountNamespace),
 					Path: "/abc/123",
 				},
@@ -618,7 +678,7 @@ func TestConstrainGRPCSpec(t *testing.T) {
 	}
 
 	k := kataAgent{}
-	k.constrainGRPCSpec(g, true, true, "", true)
+	k.constrainGRPCSpec(g, true, true, "", true, nil)
 
 	// Check nil fields
 	assert.Nil(g.Hooks)
@@ -667,7 +727,7 @@ func TestHandleShm(t *testing.T) {
 	assert.NotEmpty(ociMounts[0].Destination)
 	assert.Equal(ociMounts[0].Destination, "/dev/shm")
 	assert.Equal(ociMounts[0].Type, "bind")
-	assert.NotEmpty(ociMounts[0].Source, filepath.Join(kataGuestSharedDir(), shmDir))
+	assert.Equal(filepath.Join(defaultKataGuestSandboxDir, shmDir), ociMounts[0].Source)
 	assert.Equal(ociMounts[0].Options, []string{"rbind"})
 
 	sandbox.shmSize = 0
@@ -695,7 +755,7 @@ func TestHandleShm(t *testing.T) {
 	assert.Nil(err)
 
 	epheMountPoint := epheStorages[0].MountPoint
-	expected := filepath.Join(ephemeralPath(), filepath.Base(mountSource))
+	expected := filepath.Join(defaultEphemeralPath, filepath.Base(mountSource))
 	assert.Equal(epheMountPoint, expected,
 		"Ephemeral mount point didn't match: got %s, expecting %s", epheMountPoint, expected)
 
@@ -797,8 +857,15 @@ func TestCmdToKataProcess(t *testing.T) {
 		User:         "1000",
 		PrimaryGroup: "1000",
 	}
-	_, err := cmdToKataProcess(cmd)
+	process, err := cmdToKataProcess(cmd)
 	assert.Nil(err)
+	assert.False(process.NoNewPrivileges)
+
+	restricted := cmd
+	restricted.NoNewPrivileges = true
+	process, err = cmdToKataProcess(restricted)
+	assert.Nil(err)
+	assert.True(process.NoNewPrivileges)
 
 	cmd1 := cmd
 	cmd1.User = "foobar"
@@ -1063,67 +1130,73 @@ func TestKataCleanupSandbox(t *testing.T) {
 }
 
 func TestKataAgentKernelParams(t *testing.T) {
-	assert := assert.New(t)
-
 	// nolint: govet
 	type testData struct {
-		debug             bool
-		trace             bool
-		containerPipeSize uint32
-		expectedParams    []Param
+		name                 string
+		debug                bool
+		trace                bool
+		containerPipeSize    uint32
+		launchProcessTimeout uint32
+		visibleCdiDevices    bool
+		expectedParams       []Param
 	}
 
 	debugParam := Param{Key: "agent.log", Value: "debug"}
 	traceParam := Param{Key: "agent.trace", Value: "true"}
 
 	containerPipeSizeParam := Param{Key: vcAnnotations.ContainerPipeSizeKernelParam, Value: "2097152"}
+	launchProcessTimeoutParam := Param{Key: vcAnnotations.LaunchProcessTimeoutKernelParam, Value: "60"}
+	visibleCdiDevicesParam := Param{Key: "agent.visible_cdi_devices", Value: "true"}
 
 	data := []testData{
-		{false, false, 0, []Param{}},
+		{name: "no options", expectedParams: []Param{}},
 
-		// Debug
-		{true, false, 0, []Param{debugParam}},
+		{name: "debug", debug: true, expectedParams: []Param{debugParam}},
 
-		// Tracing
-		{false, true, 0, []Param{traceParam}},
+		{name: "tracing", trace: true, expectedParams: []Param{traceParam}},
 
-		// Debug + Tracing
-		{true, true, 0, []Param{debugParam, traceParam}},
+		{name: "debug and tracing", debug: true, trace: true, expectedParams: []Param{debugParam, traceParam}},
 
-		// pipesize
-		{false, false, 2097152, []Param{containerPipeSizeParam}},
+		{name: "pipesize", containerPipeSize: 2097152, expectedParams: []Param{containerPipeSizeParam}},
 
-		// Debug + pipesize
-		{true, false, 2097152, []Param{debugParam, containerPipeSizeParam}},
+		{name: "debug and pipesize", debug: true, containerPipeSize: 2097152, expectedParams: []Param{debugParam, containerPipeSizeParam}},
 
-		// Tracing + pipesize
-		{false, true, 2097152, []Param{traceParam, containerPipeSizeParam}},
+		{name: "tracing and pipesize", trace: true, containerPipeSize: 2097152, expectedParams: []Param{traceParam, containerPipeSizeParam}},
 
-		// Debug + Tracing + pipesize
-		{true, true, 2097152, []Param{debugParam, traceParam, containerPipeSizeParam}},
+		{name: "debug, tracing and pipesize", debug: true, trace: true, containerPipeSize: 2097152, expectedParams: []Param{debugParam, traceParam, containerPipeSizeParam}},
+
+		{name: "launch process timeout", launchProcessTimeout: 60, expectedParams: []Param{launchProcessTimeoutParam}},
+
+		{name: "debug and launch process timeout", debug: true, launchProcessTimeout: 60, expectedParams: []Param{debugParam, launchProcessTimeoutParam}},
+
+		{name: "visible cdi devices", visibleCdiDevices: true, expectedParams: []Param{visibleCdiDevicesParam}},
 	}
 
-	for i, d := range data {
-		config := KataAgentConfig{
-			Debug:             d.debug,
-			Trace:             d.trace,
-			ContainerPipeSize: d.containerPipeSize,
-		}
+	for _, d := range data {
+		t.Run(d.name, func(t *testing.T) {
+			assert := assert.New(t)
 
-		count := len(d.expectedParams)
+			config := KataAgentConfig{
+				Debug:                d.debug,
+				Trace:                d.trace,
+				ContainerPipeSize:    d.containerPipeSize,
+				LaunchProcessTimeout: d.launchProcessTimeout,
+				VisibleCdiDevices:    d.visibleCdiDevices,
+			}
 
-		params := KataAgentKernelParams(config)
+			params := KataAgentKernelParams(config)
 
-		if count == 0 {
-			assert.Emptyf(params, "test %d (%+v)", i, d)
-			continue
-		}
+			if len(d.expectedParams) == 0 {
+				assert.Empty(params)
+				return
+			}
 
-		assert.Len(params, count)
+			assert.Len(params, len(d.expectedParams))
 
-		for _, p := range d.expectedParams {
-			assert.Containsf(params, p, "test %d (%+v)", i, d)
-		}
+			for _, p := range d.expectedParams {
+				assert.Contains(params, p)
+			}
+		})
 	}
 }
 
@@ -1169,19 +1242,17 @@ func TestKataAgentDirs(t *testing.T) {
 	uidmap := strings.Fields(string(line))
 	expectedRootless := (uidmap[0] == "0" && uidmap[1] != "0")
 	assert.Equal(expectedRootless, rootless.IsRootless())
+	assert.Equal(defaultKataGuestSandboxDir, kataGuestSandboxDir())
+	assert.Equal(defaultEphemeralPath, ephemeralPath())
 	if expectedRootless {
 		assert.Equal(kataHostSharedDir(), os.Getenv("XDG_RUNTIME_DIR")+defaultKataHostSharedDir)
 		assert.Equal(kataGuestSharedDir(), os.Getenv("XDG_RUNTIME_DIR")+defaultKataGuestSharedDir)
-		assert.Equal(kataGuestSandboxDir(), os.Getenv("XDG_RUNTIME_DIR")+defaultKataGuestSandboxDir)
-		assert.Equal(ephemeralPath(), os.Getenv("XDG_RUNTIME_DIR")+defaultEphemeralPath)
 		assert.Equal(kataGuestNydusRootDir(), os.Getenv("XDG_RUNTIME_DIR")+defaultKataGuestNydusRootDir)
 		assert.Equal(kataGuestNydusImageDir(), os.Getenv("XDG_RUNTIME_DIR")+defaultKataGuestNydusRootDir+"images"+"/")
 		assert.Equal(kataGuestSharedDir(), os.Getenv("XDG_RUNTIME_DIR")+defaultKataGuestNydusRootDir+"containers"+"/")
 	} else {
 		assert.Equal(kataHostSharedDir(), defaultKataHostSharedDir)
 		assert.Equal(kataGuestSharedDir(), defaultKataGuestSharedDir)
-		assert.Equal(kataGuestSandboxDir(), defaultKataGuestSandboxDir)
-		assert.Equal(ephemeralPath(), defaultEphemeralPath)
 		assert.Equal(kataGuestNydusRootDir(), defaultKataGuestNydusRootDir)
 		assert.Equal(kataGuestNydusImageDir(), defaultKataGuestNydusRootDir+"rafs"+"/")
 		assert.Equal(kataGuestSharedDir(), defaultKataGuestNydusRootDir+"containers"+"/")
@@ -1190,4 +1261,226 @@ func TestKataAgentDirs(t *testing.T) {
 	cid := "123"
 	expected := "/rafs/123/lowerdir"
 	assert.Equal(rafsMountPath(cid), expected)
+}
+
+func TestIsNydusRootFSType(t *testing.T) {
+	testCases := map[string]bool{
+		"nydus":                               false,
+		"nydus-overlayfs":                     false,
+		"fuse.nydus-overlayfs":                true,
+		"fuse./usr/local/bin/nydus-overlayfs": true,
+		"fuse.nydus-overlayfs-e0ae398a2":      true,
+	}
+
+	for test, exp := range testCases {
+		t.Run(test, func(t *testing.T) {
+			assert.Equal(t, exp, IsNydusRootFSType(test))
+		})
+	}
+}
+
+func TestKataAgentCreateContainerVFIODevices(t *testing.T) {
+	assert := assert.New(t)
+
+	// Create temporary directory to mock IOMMU filesystem
+	tmpDir := t.TempDir()
+	iommuPath := filepath.Join(tmpDir, "sys", "kernel", "iommu_groups", "2", "devices")
+	err := os.MkdirAll(iommuPath, 0755)
+	assert.NoError(err)
+
+	// Create a dummy device file to satisfy the IOMMU group check
+	dummyDev := filepath.Join(iommuPath, "0000:00:02.0")
+	err = os.WriteFile(dummyDev, []byte(""), 0644)
+	assert.NoError(err)
+
+	// Save original paths and restore after test
+	origConfigSysIOMMUPath := config.SysIOMMUGroupPath
+	config.SysIOMMUGroupPath = filepath.Join(tmpDir, "sys", "kernel", "iommu_groups")
+	defer func() {
+		config.SysIOMMUGroupPath = origConfigSysIOMMUPath
+	}()
+
+	tests := []struct {
+		name          string
+		hotPlugVFIO   config.PCIePort
+		coldPlugVFIO  config.PCIePort
+		vfioMode      config.VFIOModeType
+		containerType ContainerType
+		expectVFIODev bool
+	}{
+		{
+			name:          "VFIO device with cold plug enabled",
+			hotPlugVFIO:   config.NoPort,
+			coldPlugVFIO:  config.BridgePort,
+			vfioMode:      config.VFIOModeVFIO,
+			expectVFIODev: true,
+		},
+		{
+			name:          "VFIO device with hot plug enabled",
+			hotPlugVFIO:   config.BridgePort,
+			coldPlugVFIO:  config.NoPort,
+			vfioMode:      config.VFIOModeVFIO,
+			expectVFIODev: true,
+		},
+		{
+			name:          "VFIO device with cold plug enabled but guest kernel mode",
+			hotPlugVFIO:   config.NoPort,
+			coldPlugVFIO:  config.BridgePort,
+			vfioMode:      config.VFIOModeGuestKernel,
+			expectVFIODev: true,
+		},
+		{
+			// The pause container never owns VFIO devices: cold-plugged
+			// devices are sandbox-level and consumed only by workload
+			// containers.
+			name:          "VFIO device with cold plug enabled skipped for CRI sandbox container",
+			hotPlugVFIO:   config.NoPort,
+			coldPlugVFIO:  config.BridgePort,
+			vfioMode:      config.VFIOModeGuestKernel,
+			containerType: PodSandbox,
+			expectVFIODev: false,
+		},
+		{
+			name:          "VFIO device with cold plug enabled kept for CRI workload container",
+			hotPlugVFIO:   config.NoPort,
+			coldPlugVFIO:  config.BridgePort,
+			vfioMode:      config.VFIOModeGuestKernel,
+			containerType: PodContainer,
+			expectVFIODev: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			vfioGroup := "2"
+			vfioPath := filepath.Join("/dev/vfio", vfioGroup)
+
+			vfioDevice := config.DeviceInfo{
+				ContainerPath: vfioPath,
+				HostPath:      vfioPath,
+				DevType:       "c",
+				Major:         10,
+				Minor:         196,
+				ColdPlug:      tt.coldPlugVFIO != config.NoPort,
+				Port:          tt.coldPlugVFIO,
+			}
+
+			// Setup container config with the VFIO device
+			contConfig := &ContainerConfig{
+				DeviceInfos: []config.DeviceInfo{vfioDevice},
+				Annotations: map[string]string{},
+			}
+			if tt.containerType != "" {
+				contConfig.Annotations[vcAnnotations.ContainerTypeKey] = string(tt.containerType)
+			}
+
+			// Create mock URL for kata agent
+			url, err := mock.GenerateKataMockHybridVSock()
+			assert.NoError(err)
+			defer mock.RemoveKataMockHybridVSock(url)
+
+			hybridVSockTTRPCMock := mock.HybridVSockTTRPCMock{}
+			err = hybridVSockTTRPCMock.Start(url)
+			assert.NoError(err)
+			defer hybridVSockTTRPCMock.Stop()
+
+			k := &kataAgent{
+				ctx: context.Background(),
+				state: KataAgentState{
+					URL: url,
+				},
+			}
+
+			mockReceiver := &api.MockDeviceReceiver{}
+
+			sandbox := &Sandbox{
+				config: &SandboxConfig{
+					VfioMode: tt.vfioMode,
+					HypervisorConfig: HypervisorConfig{
+						HotPlugVFIO:  tt.hotPlugVFIO,
+						ColdPlugVFIO: tt.coldPlugVFIO,
+					},
+				},
+				devManager: manager.NewDeviceManager("virtio-scsi", false, "", 0, nil),
+				agent:      k,
+			}
+
+			container := &Container{
+				sandbox: sandbox,
+				id:      "test-container",
+				config:  contConfig,
+			}
+
+			// Call createDevices which should trigger the full flow
+			err = container.createDevices(context.Background(), contConfig)
+			assert.NoError(err)
+
+			// Find the device in device manager using the original device info
+			dev := sandbox.devManager.FindDevice(&vfioDevice)
+
+			if tt.expectVFIODev {
+				// For cases where VFIO device should be handled
+				assert.NotNil(dev, "VFIO device should be found in device manager")
+				if dev != nil {
+					// Manually attach the device to increase attach count
+					err = dev.Attach(context.Background(), mockReceiver)
+					assert.NoError(err, "Device attachment should succeed")
+
+					assert.True(sandbox.devManager.IsDeviceAttached(dev.DeviceID()),
+						"Device should be marked as attached")
+				}
+			} else {
+				// For cases where VFIO device should be skipped
+				assert.Nil(dev, "VFIO device should not be found in device manager")
+			}
+		})
+	}
+}
+
+func TestTranslateHostMemsToGuest(t *testing.T) {
+	assert := assert.New(t)
+
+	numaNodes := []types.GuestNUMANode{
+		{HostNodes: "0", HostCPUs: "0-3"},
+		{HostNodes: "1", HostCPUs: "4-7"},
+	}
+
+	result := translateHostMemsToGuest("0", numaNodes)
+	assert.Equal("0", result)
+
+	result = translateHostMemsToGuest("1", numaNodes)
+	assert.Equal("1", result)
+
+	result = translateHostMemsToGuest("0-1", numaNodes)
+	assert.Equal("0-1", result)
+
+	result = translateHostMemsToGuest("0,1", numaNodes)
+	assert.Equal("0-1", result)
+
+	result = translateHostMemsToGuest("42", numaNodes)
+	assert.Equal("", result)
+
+	result = translateHostMemsToGuest("invalid", numaNodes)
+	assert.Equal("", result)
+
+	result = translateHostMemsToGuest("", numaNodes)
+	assert.Equal("", result)
+}
+
+func TestTranslateHostMemsToGuestRangeNodes(t *testing.T) {
+	assert := assert.New(t)
+
+	numaNodes := []types.GuestNUMANode{
+		{HostNodes: "0-1", HostCPUs: "0-7"},
+		{HostNodes: "2-3", HostCPUs: "8-15"},
+	}
+
+	result := translateHostMemsToGuest("1", numaNodes)
+	assert.Equal("0", result)
+
+	result = translateHostMemsToGuest("2", numaNodes)
+	assert.Equal("1", result)
+
+	result = translateHostMemsToGuest("0,3", numaNodes)
+	assert.Equal("0-1", result)
 }

@@ -9,6 +9,9 @@ extern crate slog;
 
 logging::logger_with_subsystem!(sl, "service");
 
+mod event;
 mod manager;
-pub use manager::ServiceManager;
+mod sandbox_service;
 mod task_service;
+
+pub use manager::ServiceManager;

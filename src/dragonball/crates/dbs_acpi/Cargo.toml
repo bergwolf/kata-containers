@@ -1,0 +1,14 @@
+[package]
+authors = ["Alibaba Dragonball Team"]
+description = "acpi definitions for virtual machines."
+edition = "2018"
+homepage = "https://github.com/openanolis/dragonball-sandbox"
+keywords = ["acpi", "dragonball", "secure-sandbox", "vmm"]
+license = "Apache-2.0"
+name = "dbs-acpi"
+readme = "README.md"
+repository = "https://github.com/openanolis/dragonball-sandbox"
+version = "0.1.0"
+
+[dependencies]
+vm-memory = { workspace = true }

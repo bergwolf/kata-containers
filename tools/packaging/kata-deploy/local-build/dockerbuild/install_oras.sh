@@ -11,11 +11,23 @@ set -o pipefail
 
 install_dest="/usr/local/bin"
 
-function get_installed_oras_version() {
-	oras version | grep Version | sed -e s/Version:// | tr -d [:blank:]
+# Minimal build containers run as root and may not include sudo.
+function run_as_root() {
+	if [[ "${EUID}" -eq 0 ]]; then
+		"$@"
+	else
+		sudo "$@"
+	fi
 }
 
-oras_required_version="v1.1.0"
+function get_installed_oras_version() {
+	oras version | grep Version | sed -e s/Version:// | tr -d '[:blank:]'
+}
+
+# Docker stages versions.yaml separately; direct callers use the repository copy.
+script_dir=$(dirname "$(readlink -f "$0")")
+versions_file="${1:-${script_dir}/../../../../../versions.yaml}"
+oras_required_version="v$(yq -r '.externals.oras.version' "${versions_file}")"
 if command -v oras; then
 	if [[ "${oras_required_version}" == "v$(get_installed_oras_version)" ]]; then
 		echo "ORAS is already installed in the system"
@@ -24,26 +36,22 @@ if command -v oras; then
 
 	echo "Proceeding to cleanup the previous installed version of ORAS, and install the version specified in the versions.yaml file"
 	oras_system_path=$(which oras)
-	sudo rm -f ${oras_system_path}
+	run_as_root rm -f "${oras_system_path}"
 fi
 
 arch=$(uname -m)
-if [ "${arch}" = "ppc64le" ]; then
-	echo "An ORAS release for ppc64le is not available yet."
-	exit 0
-fi
-if [ "${arch}" = "x86_64" ]; then
+if [[ "${arch}" = "x86_64" ]]; then
 	arch="amd64"
 fi
-if [ "${arch}" = "aarch64" ]; then
+if [[ "${arch}" = "aarch64" ]]; then
 	arch="arm64"
 fi
 oras_tarball="oras_${oras_required_version#v}_linux_${arch}.tar.gz"
 
 echo "Downloading ORAS ${oras_required_version}"
-sudo curl -OL https://github.com/oras-project/oras/releases/download/${oras_required_version}/${oras_tarball}
+curl --fail -OL "https://github.com/oras-project/oras/releases/download/${oras_required_version}/${oras_tarball}"
 
 echo "Installing ORAS to ${install_dest}"
-sudo mkdir -p "${install_dest}"
-sudo tar -C "${install_dest}" -xzf "${oras_tarball}"
-sudo rm -f "${oras_tarball}"
+run_as_root mkdir -p "${install_dest}"
+run_as_root tar -C "${install_dest}" -xzf "${oras_tarball}"
+rm -f "${oras_tarball}"

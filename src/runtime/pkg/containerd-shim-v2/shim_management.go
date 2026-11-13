@@ -18,6 +18,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"google.golang.org/grpc/codes"
 
@@ -34,18 +36,59 @@ import (
 
 const (
 	DirectVolumePathKey   = "path"
-	AgentUrl              = "/agent-url"
-	DirectVolumeStatUrl   = "/direct-volume/stats"
-	DirectVolumeResizeUrl = "/direct-volume/resize"
-	IPTablesUrl           = "/iptables"
-	IP6TablesUrl          = "/ip6tables"
-	MetricsUrl            = "/metrics"
+	AgentURL              = "/agent-url"
+	DirectVolumeStatURL   = "/direct-volume/stats"
+	DirectVolumeResizeURL = "/direct-volume/resize"
+	IPTablesURL           = "/iptables"
+	PolicyURL             = "/policy"
+	IP6TablesURL          = "/ip6tables"
+	MetricsURL            = "/metrics"
+
+	agentMetricsRetryInterval = 30 * time.Second
 )
 
 var (
-	ifSupportAgentMetricsAPI = true
-	shimMgtLog               = shimLog.WithField("subsystem", "shim-management")
+	shimMgtLog = shimLog.WithField("subsystem", "shim-management")
 )
+
+type agentMetricsState struct {
+	mu sync.Mutex
+
+	inFlight    bool
+	unsupported bool
+	retryAfter  time.Time
+}
+
+func (s *agentMetricsState) tryStart(now time.Time) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.inFlight || s.unsupported || now.Before(s.retryAfter) {
+		return false
+	}
+
+	s.inFlight = true
+	return true
+}
+
+func (s *agentMetricsState) finish(now time.Time, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.inFlight = false
+
+	if err == nil {
+		s.retryAfter = time.Time{}
+		return
+	}
+
+	if isGRPCErrorCode(codes.NotFound, err) {
+		s.unsupported = true
+		return
+	}
+
+	s.retryAfter = now.Add(agentMetricsRetryInterval)
+}
 
 type ResizeRequest struct {
 	VolumePath string
@@ -80,26 +123,29 @@ func (s *service) serveMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// encode the metrics
-	encoder := expfmt.NewEncoder(w, expfmt.FmtText)
+	encoder := expfmt.NewEncoder(w, expfmt.NewFormat(expfmt.TypeTextPlain))
 	for _, mf := range mfs {
 		encoder.Encode(mf)
 	}
 
-	// if using an old agent, only collect shim/sandbox metrics.
-	if !ifSupportAgentMetricsAPI {
+	// Allow at most one guest request per sandbox. If a transport ignores
+	// cancellation and remains stuck, the in-flight bit deliberately stays set
+	// so later scrapes cannot accumulate more blocked calls.
+	if !s.agentMetrics.tryStart(time.Now()) {
 		return
 	}
 
 	// get metrics from agent
-	// can not pass context to serveMetrics, so use background context
-	agentMetrics, err := s.sandbox.GetAgentMetrics(context.Background())
-	if err != nil {
-		shimMgtLog.WithError(err).Error("failed GetAgentMetrics")
-		if isGRPCErrorCode(codes.NotFound, err) {
-			shimMgtLog.Warn("metrics API not supportted by this agent.")
-			ifSupportAgentMetricsAPI = false
-			return
+	var agentErr error
+	defer func() { s.agentMetrics.finish(time.Now(), agentErr) }()
+
+	agentMetrics, agentErr := s.sandbox.GetAgentMetrics(r.Context())
+	if agentErr != nil {
+		shimMgtLog.WithError(agentErr).Error("failed GetAgentMetrics")
+		if isGRPCErrorCode(codes.NotFound, agentErr) {
+			shimMgtLog.Warn("metrics API not supported by this agent.")
 		}
+		return
 	}
 
 	// decode and parse metrics from agent
@@ -119,7 +165,7 @@ func (s *service) serveMetrics(w http.ResponseWriter, r *http.Request) {
 func decodeAgentMetrics(body string) []*dto.MetricFamily {
 	// decode agent metrics
 	reader := strings.NewReader(body)
-	decoder := expfmt.NewDecoder(reader, expfmt.FmtText)
+	decoder := expfmt.NewDecoder(reader, expfmt.NewFormat(expfmt.TypeTextPlain))
 	list := make([]*dto.MetricFamily, 0)
 
 	for {
@@ -199,6 +245,32 @@ func (s *service) serveVolumeResize(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(""))
 }
 
+func (s *service) policyHandler(w http.ResponseWriter, r *http.Request) {
+	logger := shimMgtLog.WithFields(logrus.Fields{"handler": "policy"})
+
+	switch r.Method {
+	case http.MethodPut:
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			logger.WithError(err).Error("failed to read request body")
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(err.Error()))
+			return
+		}
+
+		if err = s.sandbox.SetPolicy(context.Background(), string(body)); err != nil {
+			logger.WithError(err).Error("failed to set policy")
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(err.Error()))
+		}
+		w.Write([]byte(""))
+
+	default:
+		w.WriteHeader(http.StatusNotImplemented)
+		return
+	}
+}
+
 func (s *service) ip6TablesHandler(w http.ResponseWriter, r *http.Request) {
 	s.genericIPTablesHandler(w, r, true)
 }
@@ -261,12 +333,13 @@ func (s *service) startManagementServer(ctx context.Context, ociSpec *specs.Spec
 
 	// bind handler
 	m := http.NewServeMux()
-	m.Handle(MetricsUrl, http.HandlerFunc(s.serveMetrics))
-	m.Handle(AgentUrl, http.HandlerFunc(s.agentURL))
-	m.Handle(DirectVolumeStatUrl, http.HandlerFunc(s.serveVolumeStats))
-	m.Handle(DirectVolumeResizeUrl, http.HandlerFunc(s.serveVolumeResize))
-	m.Handle(IPTablesUrl, http.HandlerFunc(s.ipTablesHandler))
-	m.Handle(IP6TablesUrl, http.HandlerFunc(s.ip6TablesHandler))
+	m.Handle(MetricsURL, http.HandlerFunc(s.serveMetrics))
+	m.Handle(AgentURL, http.HandlerFunc(s.agentURL))
+	m.Handle(DirectVolumeStatURL, http.HandlerFunc(s.serveVolumeStats))
+	m.Handle(DirectVolumeResizeURL, http.HandlerFunc(s.serveVolumeResize))
+	m.Handle(IPTablesURL, http.HandlerFunc(s.ipTablesHandler))
+	m.Handle(PolicyURL, http.HandlerFunc(s.policyHandler))
+	m.Handle(IP6TablesURL, http.HandlerFunc(s.ip6TablesHandler))
 	s.mountPprofHandle(m, ociSpec)
 
 	// register shim metrics
@@ -338,12 +411,16 @@ func ServerSocketAddress(id string) string {
 // shim management endpoint
 // NOTE: this code allows various go clients, e.g. kata-runtime or kata-monitor commands, to
 // connect to the rust shim management implementation.
-func ClientSocketAddress(id string) string {
+func ClientSocketAddress(id string) (string, error) {
 	// get the go runtime uds path
 	socketPath := SocketPathGo(id)
 	// if the path not exist, use the rust runtime uds path instead
 	if _, err := os.Stat(socketPath); err != nil {
 		socketPath = SocketPathRust(id)
+		if _, err := os.Stat(socketPath); err != nil {
+			return "", fmt.Errorf("it fails to stat both %s and %s with error %v", SocketPathGo(id), SocketPathRust(id), err)
+		}
 	}
-	return fmt.Sprintf("unix://%s", socketPath)
+
+	return fmt.Sprintf("unix://%s", socketPath), nil
 }

@@ -4,15 +4,89 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use std::collections::HashSet;
+use std::{
+    collections::HashSet,
+    fs::{metadata as fs_metadata, set_permissions, File, OpenOptions, Permissions},
+    io,
+    os::{
+        fd::{BorrowedFd, RawFd},
+        unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
+    },
+    path::{Path, PathBuf},
+    process::Command,
+};
 
-use kata_types::config::KATA_PATH;
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+use std::collections::HashMap;
+
+use anyhow::{anyhow, Context, Result};
+use kata_types::{
+    config::{hypervisor::RootlessUser, Hypervisor, KATA_PATH},
+    prefix_with_rootless_dir,
+};
+use lazy_static::lazy_static;
+use nix::{
+    fcntl,
+    sched::{setns, CloneFlags},
+    sys::stat,
+    unistd::{chown, setgid, setgroups, setuid, Gid, Uid},
+};
+use rand::{rng, RngExt};
+use serde::{Deserialize, Serialize};
+use serde_json;
+
+use crate::device::Tap;
 
 use crate::{DEFAULT_HYBRID_VSOCK_NAME, JAILER_ROOT};
 
+pub fn remove_dir_all_if_exists(path: impl AsRef<Path>) -> Result<()> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// Remove the VM directory of a sandbox. A rootful VMM shares it with the
+/// sandbox state, which has to outlive the rest of the cleanup for a failure
+/// to be retried; the sandbox removes it last.
+pub fn remove_vm_dir(sid: &str, vm_path: &str) -> Result<()> {
+    remove_vm_dir_in(Path::new(KATA_PATH), sid, Path::new(vm_path))
+}
+
+fn remove_vm_dir_in(state_root: &Path, sid: &str, vm_path: &Path) -> Result<()> {
+    if vm_path != state_root.join(sid) {
+        return remove_dir_all_if_exists(vm_path);
+    }
+    let entries = match std::fs::read_dir(vm_path) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_name() == persist::PERSIST_FILE {
+            continue;
+        }
+        let path = entry.path();
+        let removed = if entry.file_type()?.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        match removed {
+            Err(err) if err.kind() != io::ErrorKind::NotFound => {
+                return Err(err).with_context(|| format!("remove {}", path.display()));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 pub fn get_child_threads(pid: u32) -> HashSet<u32> {
     let mut result = HashSet::new();
-    let path_name = format!("/proc/{}/task", pid);
+    let path_name = format!("/proc/{pid}/task");
     let path = std::path::Path::new(path_name.as_str());
     if path.is_dir() {
         if let Ok(dir) = path.read_dir() {
@@ -33,7 +107,10 @@ pub fn get_child_threads(pid: u32) -> HashSet<u32> {
 // Return the path for a _hypothetical_ sandbox: the path does *not* exist
 // yet, and for this reason safe-path cannot be used.
 pub fn get_sandbox_path(sid: &str) -> String {
-    [KATA_PATH, sid].join("/")
+    Path::new(prefix_with_rootless_dir(KATA_PATH).as_str())
+        .join(sid)
+        .to_string_lossy()
+        .to_string()
 }
 
 pub fn get_hvsock_path(sid: &str) -> String {
@@ -46,4 +123,1410 @@ pub fn get_jailer_root(sid: &str) -> String {
     let sandbox_path = get_sandbox_path(sid);
 
     [&sandbox_path, JAILER_ROOT].join("/")
+}
+
+// `sun_path` is 108 bytes, including the terminating NUL.
+pub const MAX_UNIX_SOCKET_PATH_LEN: usize = 107;
+
+pub fn check_unix_socket_path_len(path: &Path) -> Result<()> {
+    let len = path.as_os_str().len();
+    if len > MAX_UNIX_SOCKET_PATH_LEN {
+        return Err(anyhow!(
+            "unix socket path {} is {} bytes, longer than the {} bytes limit",
+            path.display(),
+            len,
+            MAX_UNIX_SOCKET_PATH_LEN
+        ));
+    }
+
+    Ok(())
+}
+
+pub fn get_rootless_symlink_sandbox_path(sid: &str) -> String {
+    prefix_with_rootless_dir(sid)
+}
+
+pub fn get_rootless_symlink_jailer_root(sid: &str) -> String {
+    let sandbox_path = get_rootless_symlink_sandbox_path(sid);
+
+    [&sandbox_path, JAILER_ROOT].join("/")
+}
+
+// Socket paths under the rootless sandbox dir can exceed `sun_path`, so VMMs
+// connect through a symlink in a shorter directory instead.
+pub fn link_rootless_vmm_socket(sid: &str, socket: &Path) -> Result<PathBuf> {
+    link_socket_into_dir(Path::new(&get_rootless_symlink_jailer_root(sid)), socket)
+}
+
+fn link_socket_into_dir(dir: &Path, socket: &Path) -> Result<PathBuf> {
+    let name = socket
+        .file_name()
+        .ok_or_else(|| anyhow!("socket path {} has no file name", socket.display()))?;
+    let link = dir.join(name);
+    check_unix_socket_path_len(&link)?;
+
+    create_dir_all_with_inherit_owner(dir, 0o750)
+        .with_context(|| format!("create socket symlink dir {}", dir.display()))?;
+
+    // A previous start attempt of the same sandbox may have left the link behind.
+    match std::fs::symlink_metadata(&link) {
+        Ok(md) if md.file_type().is_symlink() => std::fs::remove_file(&link)
+            .with_context(|| format!("remove stale socket symlink {}", link.display()))?,
+        Ok(_) => {
+            return Err(anyhow!(
+                "{} exists and is not a socket symlink",
+                link.display()
+            ))
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err).with_context(|| format!("stat socket symlink {}", link.display()))
+        }
+    }
+
+    std::os::unix::fs::symlink(socket, &link)
+        .with_context(|| format!("symlink socket {} to {}", socket.display(), link.display()))?;
+
+    Ok(link)
+}
+
+// Clear the O_CLOEXEC which is set by default by Rust standard library on
+// file descriptors that it opens.  This function is mostly meant to be
+// called on descriptors to be passed to a child (hypervisor) process as
+// O_CLOEXEC would obviously prevent that.
+pub fn clear_cloexec(rawfd: RawFd) -> Result<()> {
+    let borrowed_fd = unsafe { BorrowedFd::borrow_raw(rawfd) };
+    let cur_flags = fcntl::fcntl(borrowed_fd, fcntl::FcntlArg::F_GETFD)?;
+    let mut new_flags = fcntl::FdFlag::from_bits(cur_flags).ok_or(anyhow!(
+        "couldn't construct FdFlag from flags value {:?}",
+        cur_flags
+    ))?;
+    new_flags.remove(fcntl::FdFlag::FD_CLOEXEC);
+    if let Err(err) = fcntl::fcntl(borrowed_fd, fcntl::FcntlArg::F_SETFD(new_flags)) {
+        info!(sl!(), "couldn't clear O_CLOEXEC on fd: {:?}", err);
+        return Err(err.into());
+    }
+
+    Ok(())
+}
+
+pub fn enter_netns(netns_path: &str) -> Result<()> {
+    if !netns_path.is_empty() {
+        let netns =
+            File::open(netns_path).context(anyhow!("open netns path {:?} failed.", netns_path))?;
+        setns(&netns, CloneFlags::CLONE_NEWNET).context("set netns failed")?;
+    }
+
+    Ok(())
+}
+
+/// Replace supplementary groups and drop the child process to the configured
+/// primary GID and UID. This must run before exec while the child is privileged.
+pub fn set_process_credentials(user: &RootlessUser) -> Result<()> {
+    set_process_credentials_with(
+        user,
+        |groups| {
+            let groups = groups
+                .iter()
+                .map(|gid| Gid::from_raw(*gid))
+                .collect::<Vec<_>>();
+            setgroups(&groups).map_err(anyhow::Error::from)
+        },
+        |gid| setgid(Gid::from_raw(gid)).map_err(anyhow::Error::from),
+        |uid| setuid(Uid::from_raw(uid)).map_err(anyhow::Error::from),
+    )
+}
+
+fn set_process_credentials_with<SetGroups, SetGid, SetUid>(
+    user: &RootlessUser,
+    set_groups_fn: SetGroups,
+    set_gid_fn: SetGid,
+    set_uid_fn: SetUid,
+) -> Result<()>
+where
+    SetGroups: Fn(&[u32]) -> Result<()>,
+    SetGid: Fn(u32) -> Result<()>,
+    SetUid: Fn(u32) -> Result<()>,
+{
+    set_groups_fn(&user.groups).context("setgroups failed")?;
+    set_gid_fn(user.gid).context("setgid failed")?;
+    set_uid_fn(user.uid).context("setuid failed")?;
+
+    Ok(())
+}
+
+// Return the non-root owning group that grants `required_permissions`, or
+// None when the resource's other permissions already grant that access.
+fn select_rootless_access_group(
+    path: &Path,
+    mode: u32,
+    gid: u32,
+    required_permissions: u32,
+) -> Result<Option<u32>> {
+    if required_permissions == 0 || required_permissions & !0o7 != 0 {
+        return Err(anyhow!(
+            "invalid rootless VMM permissions {:o} for {}",
+            required_permissions,
+            path.display()
+        ));
+    }
+
+    if mode & required_permissions == required_permissions {
+        return Ok(None);
+    }
+
+    let group_permissions = required_permissions << 3;
+    if mode & group_permissions != group_permissions {
+        return Err(anyhow!(
+            "rootless VMM requires group permissions {:03o} on {} (mode {:04o})",
+            group_permissions,
+            path.display(),
+            mode & 0o7777,
+        ));
+    }
+
+    if gid == 0 {
+        return Err(anyhow!(
+            "rootless VMM refuses group-root access to {}",
+            path.display()
+        ));
+    }
+
+    Ok(Some(gid))
+}
+
+/// Authorize a rootless VMM to access a character device.
+///
+/// Verifies its Unix permissions and adds its non-root owning group to `user`
+/// when that group is required for access.
+pub fn authorize_rootless_device(
+    path: &Path,
+    user: &mut RootlessUser,
+    required_permissions: u32,
+) -> Result<()> {
+    let metadata = fs_metadata(path)
+        .with_context(|| format!("get metadata for rootless device {}", path.display()))?;
+    if !metadata.file_type().is_char_device() {
+        return Err(anyhow!(
+            "rootless VMM device {} is not a character device",
+            path.display()
+        ));
+    }
+
+    authorize_rootless_resource_access(
+        path,
+        metadata.uid(),
+        metadata.gid(),
+        metadata.mode(),
+        required_permissions,
+        user,
+    )
+}
+
+/// Authorize a rootless VMM to access a Unix domain socket.
+///
+/// Validates socket access and traversal of every parent directory, updating
+/// `user` only after all checks succeed.
+pub fn authorize_rootless_socket(
+    path: &Path,
+    user: &mut RootlessUser,
+    required_permissions: u32,
+) -> Result<()> {
+    let metadata = fs_metadata(path)
+        .with_context(|| format!("get metadata for rootless socket {}", path.display()))?;
+    if !metadata.file_type().is_socket() {
+        return Err(anyhow!(
+            "rootless VMM endpoint {} is not a Unix socket",
+            path.display()
+        ));
+    }
+
+    let mut candidate = user.clone();
+    authorize_rootless_resource_access(
+        path,
+        metadata.uid(),
+        metadata.gid(),
+        metadata.mode(),
+        required_permissions,
+        &mut candidate,
+    )?;
+
+    let mut parent = path.parent();
+    while let Some(directory) = parent {
+        let metadata = fs_metadata(directory).with_context(|| {
+            format!(
+                "get metadata for rootless socket parent {}",
+                directory.display()
+            )
+        })?;
+        if !metadata.is_dir() {
+            return Err(anyhow!(
+                "rootless VMM socket parent {} is not a directory",
+                directory.display()
+            ));
+        }
+        if !rootless_user_has_permission(
+            &candidate,
+            metadata.uid(),
+            metadata.gid(),
+            metadata.mode(),
+            0o1,
+        ) {
+            return Err(anyhow!(
+                "rootless VMM cannot traverse socket parent {} (mode {:04o}); configure host ownership and permissions before starting the sandbox",
+                directory.display(),
+                metadata.mode() & 0o7777,
+            ));
+        }
+        parent = directory.parent();
+    }
+
+    user.groups = candidate.groups;
+    Ok(())
+}
+
+fn authorize_rootless_resource_access(
+    path: &Path,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+    required_permissions: u32,
+    user: &mut RootlessUser,
+) -> Result<()> {
+    if rootless_user_has_permission(user, uid, gid, mode, required_permissions) {
+        return Ok(());
+    }
+
+    if uid == user.uid || gid == user.gid || user.groups.contains(&gid) {
+        return Err(anyhow!(
+            "rootless VMM cannot access {} with required permissions {:o} (mode {:04o}); configure host ownership and permissions before starting the sandbox",
+            path.display(),
+            required_permissions,
+            mode & 0o7777,
+        ));
+    }
+
+    if let Some(gid) = select_rootless_access_group(path, mode, gid, required_permissions)? {
+        if !user.groups.contains(&gid) {
+            user.groups.push(gid);
+        }
+    }
+
+    Ok(())
+}
+
+// Evaluate `permission` using Unix owner, group, then other-mode semantics.
+fn rootless_user_has_permission(
+    user: &RootlessUser,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+    permission: u32,
+) -> bool {
+    let permission = if uid == user.uid {
+        permission << 6
+    } else if gid == user.gid || user.groups.contains(&gid) {
+        permission << 3
+    } else {
+        permission
+    };
+
+    mode & permission == permission
+}
+
+pub fn open_named_tuntap(if_name: &str, queues: u32) -> Result<Vec<File>> {
+    let (multi_vq, vq_pairs) = if queues > 1 {
+        (true, queues as usize)
+    } else {
+        (false, 1_usize)
+    };
+
+    let tap: Tap = Tap::open_named(if_name, multi_vq).context("open named tuntap device failed")?;
+    let taps: Vec<Tap> = tap.into_mq_taps(vq_pairs).context("into mq taps failed.")?;
+
+    let mut tap_files: Vec<std::fs::File> = Vec::new();
+    for tap in taps {
+        tap_files.push(tap.tap_file);
+    }
+
+    Ok(tap_files)
+}
+
+// /dev/tap$(cat /sys/class/net/macvtap1/ifindex)
+// for example: /dev/tap2381
+#[allow(dead_code)]
+pub fn create_macvtap_fds(ifindex: u32, queues: u32) -> Result<Vec<File>> {
+    let macvtap = format!("/dev/tap{ifindex}");
+    create_fds(macvtap.as_str(), queues as usize)
+}
+
+pub fn create_vhost_net_fds(queues: u32) -> Result<Vec<File>> {
+    let vhost_dev = "/dev/vhost-net";
+    let num_fds = if queues > 1 { queues as usize } else { 1_usize };
+
+    create_fds(vhost_dev, num_fds)
+}
+
+// For example: if num_fds = 3; fds = {0xc000012028, 0xc000012030, 0xc000012038}
+fn create_fds(device: &str, num_fds: usize) -> Result<Vec<File>> {
+    let mut fds: Vec<File> = Vec::with_capacity(num_fds);
+
+    for i in 0..num_fds {
+        match OpenOptions::new().read(true).write(true).open(device) {
+            Ok(f) => {
+                fds.push(f);
+            }
+            Err(e) => {
+                fds.clear();
+                return Err(anyhow!(
+                    "Failed to open {device} fd index {i}, with error {e}"
+                ));
+            }
+        };
+    }
+
+    Ok(fds)
+}
+
+pub fn create_dir_all_with_inherit_owner<P: AsRef<Path>>(path: P, perm: u32) -> io::Result<()> {
+    let path = path.as_ref();
+
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the path must be absolute",
+        ));
+    }
+
+    let mut uid = Uid::current();
+    let mut gid = Gid::current();
+
+    let mut current_path = PathBuf::new();
+
+    for p in path.components() {
+        current_path.push(p);
+        let current = current_path.as_path();
+
+        match stat::stat(current) {
+            Ok(s) => {
+                if !current.is_dir() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotADirectory,
+                        format!("{} exists but is not a directory", current.display()),
+                    ));
+                }
+                uid = Uid::from_raw(s.st_uid);
+                gid = Gid::from_raw(s.st_gid);
+            }
+            Err(nix::Error::ENOENT) => {
+                std::fs::create_dir(current)?;
+                set_permissions(current, Permissions::from_mode(perm))?;
+                chown(current, Some(uid), Some(gid))?;
+            }
+            Err(e) => {
+                return Err(io::Error::from_raw_os_error(e as i32));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// chown_to_parent changes the owners of the path to the same of parent directory.
+pub fn chown_to_parent<P: AsRef<Path>>(path: P) -> io::Result<()> {
+    // This relies on the process's current working directory to resolve relative paths.
+    let path = std::path::absolute(path.as_ref())?;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("no parent directory"))?;
+
+    let st = stat::stat(parent).map_err(|e| io::Error::from_raw_os_error(e as i32))?;
+    let uid = Uid::from_raw(st.st_uid);
+    let gid = Gid::from_raw(st.st_gid);
+
+    chown(&path, Some(uid), Some(gid)).map_err(|e| io::Error::from_raw_os_error(e as i32))
+}
+
+fn first_valid_executable_path(paths: &[&str]) -> Result<String> {
+    for p in paths {
+        if let Ok(m) = fs_metadata(p) {
+            if m.is_file() && m.mode() & 0o111 != 0 {
+                return Ok(p.to_string());
+            }
+        }
+    }
+    Err(anyhow!("No valid executable found in paths: {:?}", paths))
+}
+
+const VMM_USER_RUNTIME_BASE_DIR: &str = "/run/user";
+
+pub fn vmm_user_runtime_dir(uid: u32) -> PathBuf {
+    Path::new(VMM_USER_RUNTIME_BASE_DIR).join(uid.to_string())
+}
+
+pub fn remove_vmm_user_runtime_dir(uid: u32) -> Result<()> {
+    remove_dir_all_if_exists(vmm_user_runtime_dir(uid))
+}
+
+/// Whether the recorded VMM user's runtime directory is still the recorded
+/// user's to remove. Once the user is gone its UID can be reassigned, and
+/// /run/user/<uid> with it: the directory may only be removed while the UID
+/// maps to nothing (the leftover is the record's) or still to the recorded
+/// account (a cleanup retry that has not removed the user yet).
+pub fn vmm_user_runtime_dir_is_recorded(uid: u32, user_name: &str) -> Result<bool> {
+    match nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid)) {
+        Ok(None) | Err(nix::errno::Errno::ENOENT | nix::errno::Errno::ESRCH) => Ok(true),
+        Ok(Some(found)) => Ok(found.name == user_name),
+        Err(e) => Err(e).with_context(|| format!("look up uid {uid}")),
+    }
+}
+
+/// The UID recorded for a VMM user that may not exist yet. The record has
+/// to land before useradd runs, and the real UID only exists after it did.
+/// Cleanup matches such a record by name and by [`VMM_USER_COMMENT`]: the
+/// name carries the sandbox id, and the comment keeps a record whose
+/// useradd never ran from matching an account someone else created.
+pub const VMM_USER_UID_UNKNOWN: u32 = u32::MAX;
+
+/// The comment useradd stores for every VMM user, before the sandbox id is
+/// appended. Cleanup of a record with no UID accepts only an account that
+/// carries its own sandbox's comment.
+pub const VMM_USER_COMMENT: &str = "Kata Containers temporary hypervisor user";
+
+/// The comment useradd stores for sandbox `sid`'s VMM user. It carries the
+/// whole sandbox id: the user name only holds a prefix of it, so the name
+/// alone cannot say whose account it is.
+pub fn vmm_user_comment(sid: &str) -> String {
+    format!("{VMM_USER_COMMENT} for {sid}")
+}
+
+/// Whether `found` is the account sandbox `sid`'s record names. A record
+/// made once useradd ran carries the UID, which no other account holds
+/// while the user exists. One made before useradd carries none, and is only
+/// trusted when the account also carries this sandbox's creation comment:
+/// an account the recorded useradd never created is somebody else's, another
+/// Kata sandbox's included.
+pub fn is_recorded_vmm_user(recorded_uid: u32, found: &nix::unistd::User, sid: &str) -> bool {
+    if recorded_uid == VMM_USER_UID_UNKNOWN {
+        found.gecos.to_str() == Ok(vmm_user_comment(sid).as_str())
+    } else {
+        found.uid.as_raw() == recorded_uid
+    }
+}
+
+/// Create the VMM user, telling `record` each candidate name before useradd
+/// may create it: a crash between the two must not leave a user no record
+/// names.
+pub fn create_vmm_user(sid: &str, record: &mut dyn FnMut(&str) -> Result<()>) -> Result<String> {
+    let useradd_path =
+        first_valid_executable_path(&["/usr/sbin/useradd", "/sbin/useradd", "/bin/useradd"])?;
+    let nologin_path =
+        first_valid_executable_path(&["/usr/sbin/nologin", "/sbin/nologin", "/bin/nologin"])?;
+
+    // Enough of the sandbox id to make the name this sandbox's own: a record
+    // left by a crash must never name another sandbox's user.
+    let sid_tag: String = sid.chars().take(8).collect();
+    let max_attempt = 5;
+    for _ in 0..max_attempt {
+        let user_name = format!("kata-{}-{}", sid_tag, rng().random_range(0..10000));
+        record(&user_name)?;
+        let status = Command::new(&useradd_path)
+            .arg("-M")
+            .arg("-s")
+            .arg(&nologin_path)
+            .arg(&user_name)
+            .arg("-c")
+            .arg(vmm_user_comment(sid))
+            .status()?;
+        if status.success() {
+            return Ok(user_name);
+        }
+    }
+    Err(anyhow!("could not create VMM user"))
+}
+
+pub fn remove_vmm_user(user: &str) -> Result<()> {
+    let userdel_path =
+        first_valid_executable_path(&["/usr/sbin/userdel", "/sbin/userdel", "/bin/userdel"])?;
+
+    for _ in 0..5 {
+        let status = Command::new(&userdel_path).arg("-r").arg(user).status()?;
+        if status.success() {
+            return Ok(());
+        }
+    }
+    Err(anyhow!("failed to remove VMM user"))
+}
+
+/// getpwnam_r() may report a missing user as an error rather than no entry.
+pub fn find_user(name: &str) -> Result<Option<nix::unistd::User>> {
+    match nix::unistd::User::from_name(name) {
+        Ok(user) => Ok(user),
+        Err(nix::errno::Errno::ENOENT | nix::errno::Errno::ESRCH) => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("look up user {name}")),
+    }
+}
+
+pub fn vm_cleanup(config: &Hypervisor, sid: &str, vm_path: &str) -> Result<()> {
+    let path_result = remove_vm_dir(sid, vm_path);
+    if kata_types::rootless::is_rootless() {
+        let symlink_result = remove_dir_all_if_exists(get_rootless_symlink_sandbox_path(sid));
+        let user = config
+            .security_info
+            .rootless_user
+            .as_ref()
+            .ok_or_else(|| anyhow!("rootless user not specified in security_info"))?;
+        match find_user(&user.user_name)? {
+            Some(found) if is_recorded_vmm_user(user.uid, &found, sid) => {
+                remove_vmm_user(&user.user_name)?;
+            }
+            Some(_) => {
+                // The recorded user is already gone and the name was taken
+                // again: the account is not the sandbox's to remove.
+                warn!(
+                    sl!(),
+                    "user {} is not the one this sandbox created, leaving it", user.user_name
+                );
+            }
+            None => {
+                error!(
+                    sl!(),
+                    "failed to find user: {}, it might have been removed", user.user_name
+                );
+            }
+        }
+        symlink_result?;
+    }
+    path_result
+}
+
+// QGS_SOCKET_PATH: the Unix Domain Socket Path served by Intel TDX Quote Generation Service
+const QGS_SOCKET_PATH: &str = "/var/run/tdx-qgs/qgs.socket";
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SocketAddress {
+    #[serde(rename = "type")]
+    pub typ: String,
+
+    #[serde(rename = "cid", skip_serializing_if = "String::is_empty")]
+    pub cid: String,
+
+    #[serde(rename = "port", skip_serializing_if = "String::is_empty")]
+    pub port: String,
+
+    #[serde(rename = "path", skip_serializing_if = "String::is_empty")]
+    pub path: String,
+}
+
+impl SocketAddress {
+    pub fn new(port: u32) -> Self {
+        Self::new_with_socket_path(port, QGS_SOCKET_PATH)
+    }
+
+    fn new_with_socket_path(port: u32, socket_path: &str) -> Self {
+        if port == 0 {
+            match std::fs::metadata(socket_path) {
+                Ok(_) => {
+                    return Self {
+                        typ: "unix".to_string(),
+                        cid: "".to_string(),
+                        port: "".to_string(),
+                        path: socket_path.to_string(),
+                    };
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // Socket not present; fall back to vsock for backwards compatibility.
+                    warn!(
+                        sl!(),
+                        "QGS socket {} not found, falling back to vsock port 4050", socket_path
+                    );
+                }
+                Err(e) => {
+                    // Unexpected error (e.g. permission denied) — log it so misconfiguration
+                    // is not silently masked, then fall back to vsock.
+                    warn!(
+                        sl!(),
+                        "QGS socket {} inaccessible ({}), falling back to vsock port 4050",
+                        socket_path,
+                        e
+                    );
+                }
+            }
+            return Self {
+                typ: "vsock".to_string(),
+                cid: format!("{}", 2),
+                port: "4050".to_string(),
+                path: "".to_string(),
+            };
+        }
+
+        Self {
+            typ: "vsock".to_string(),
+            cid: format!("{}", 2),
+            port: port.to_string(),
+            path: "".to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for SocketAddress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        serde_json::to_string(self)
+            .map_err(|_| std::fmt::Error)
+            .and_then(|s| write!(f, "{s}"))
+    }
+}
+
+pub fn bytes_to_megs(bytes: u64) -> u32 {
+    (bytes / (1 << 20)) as u32
+}
+
+pub fn megs_to_bytes(bytes: u32) -> u64 {
+    bytes as u64 * (1 << 20)
+}
+
+#[allow(dead_code)]
+pub fn get_cmd_output(cmd: &str, args: &[&str]) -> Result<String> {
+    let mut cmd = std::process::Command::new(cmd);
+    if !args.is_empty() {
+        cmd.args(args);
+    }
+    let result = cmd.output()?;
+    Ok(String::from_utf8(result.stdout)?)
+}
+
+// The presence of this sysfs directory is the fundamental architectural proof.
+const CCW_BUS_PATH: &str = "/sys/bus/ccw/devices";
+
+// These drivers are specific to traditional mainframe I/O and prove
+// native CCW support, even in virtualized environments.
+const NATIVE_CCW_DRIVERS: [&str; 3] = [
+    "3270",      // IBM 3270 Terminal Driver
+    "dasd-eckd", // Mainframe DASD (Disk) Driver
+    "zfcp",      // Fibre Channel Protocol Driver (FICON)
+];
+
+lazy_static! {
+    static ref NATIVE_CCW_BUS_CACHE: bool = {
+        if !Path::new(CCW_BUS_PATH).exists() {
+            false
+        } else {
+            let drivers_path = PathBuf::from("/sys/bus/ccw/drivers");
+            let mut native_driver_found = false;
+
+            for driver_name in NATIVE_CCW_DRIVERS.iter() {
+                let driver_path = drivers_path.join(driver_name);
+
+                if driver_path.exists() {
+                    native_driver_found = true;
+                    break;
+                }
+            }
+
+            native_driver_found
+        }
+    };
+}
+
+/// Detects if the system uses native CCW (Channel Command Word) bus.
+/// This function checks for the presence of CCW bus infrastructure in sysfs
+/// and verifies that native mainframe drivers are available.
+///
+/// The result is cached after the first call to avoid repeated IO operations.
+///
+/// # Returns
+/// `true` if native CCW bus is detected, `false` otherwise.
+pub fn uses_native_ccw_bus() -> bool {
+    *NATIVE_CCW_BUS_CACHE
+}
+
+/// Scan the threads of the process rooted at `proc_path` (for example
+/// "/proc/1234") and return a map of vCPU index to host thread ID.
+///
+/// VMMs that run guest vCPUs on dedicated host threads name those threads
+/// "<prefix><index>" and expose the name via `/proc/<pid>/task/<tid>/comm`
+/// (Cloud Hypervisor uses the prefix "vcpu", OpenVMM uses "vp-"). Threads whose
+/// name does not start with `prefix` are ignored. The returned map may be empty;
+/// callers decide whether that is an error.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+pub(crate) fn get_vcpu_tids(proc_path: &str, prefix: &str) -> Result<HashMap<u32, u32>> {
+    let src = std::fs::canonicalize(proc_path)
+        .map_err(|e| anyhow!("Invalid proc path: {proc_path}: {e}"))?;
+
+    let tid_path = src.join("task");
+
+    let mut vcpus = HashMap::new();
+
+    for entry in std::fs::read_dir(&tid_path)? {
+        let entry = entry?;
+
+        let tid_str = match entry.file_name().into_string() {
+            Ok(id) => id,
+            Err(_) => continue,
+        };
+
+        let tid = tid_str
+            .parse::<u32>()
+            .map_err(|e| anyhow!(e).context("invalid tid."))?;
+
+        let comm_path = tid_path.join(&tid_str).join("comm");
+
+        if !comm_path.exists() {
+            return Err(anyhow!("comm path was not found."));
+        }
+
+        let p_name = std::fs::read_to_string(comm_path)?;
+
+        if !p_name.starts_with(prefix) {
+            continue;
+        }
+
+        let vcpu_id = p_name
+            .trim_start_matches(prefix)
+            .trim()
+            .parse::<u32>()
+            .map_err(|e| anyhow!(e).context("Invalid vcpu id."))?;
+
+        vcpus.insert(vcpu_id, tid);
+    }
+
+    Ok(vcpus)
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::anyhow;
+    use kata_types::config::hypervisor::RootlessUser;
+    use std::cell::{Cell, RefCell};
+    use std::fs;
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
+    use std::path::{Path, PathBuf};
+
+    use nix::unistd::chown;
+    use nix::unistd::geteuid;
+    use nix::unistd::Gid;
+    use nix::unistd::Uid;
+    use rstest::rstest;
+    use tempfile::Builder;
+    use tempfile::TempDir;
+
+    use crate::utils::create_dir_all_with_inherit_owner;
+    use crate::utils::first_valid_executable_path;
+
+    use super::create_fds;
+    use super::is_recorded_vmm_user;
+    use super::remove_dir_all_if_exists;
+    use super::set_process_credentials_with;
+    use super::vmm_user_runtime_dir;
+    use super::VMM_USER_UID_UNKNOWN;
+
+    #[test]
+    fn a_recorded_vmm_user_is_matched_back_carefully() {
+        let sid = "0123456789abcdef";
+        let found = nix::unistd::User::from_uid(nix::unistd::getuid())
+            .unwrap()
+            .unwrap();
+        // A record made once useradd ran is matched by UID alone.
+        assert!(is_recorded_vmm_user(found.uid.as_raw(), &found, sid));
+        assert!(!is_recorded_vmm_user(
+            found.uid.as_raw().wrapping_add(1),
+            &found,
+            sid
+        ));
+        // One made before useradd is only trusted with this sandbox's
+        // creation comment.
+        assert!(!is_recorded_vmm_user(VMM_USER_UID_UNKNOWN, &found, sid));
+        let mut ours = found;
+        ours.gecos = std::ffi::CString::new(super::vmm_user_comment(sid)).unwrap();
+        assert!(is_recorded_vmm_user(VMM_USER_UID_UNKNOWN, &ours, sid));
+        // Another Kata sandbox's account carries its own id in the comment,
+        // even when the user names collide.
+        assert!(!is_recorded_vmm_user(
+            VMM_USER_UID_UNKNOWN,
+            &ours,
+            "0123456789abcdee"
+        ));
+    }
+    use super::SocketAddress;
+    use super::{
+        authorize_rootless_resource_access, authorize_rootless_socket, select_rootless_access_group,
+    };
+    use super::{check_unix_socket_path_len, link_socket_into_dir, MAX_UNIX_SOCKET_PATH_LEN};
+
+    #[test]
+    fn test_check_unix_socket_path_len() {
+        let path = |len: usize| PathBuf::from(format!("/{}", "a".repeat(len - 1)));
+
+        check_unix_socket_path_len(&path(MAX_UNIX_SOCKET_PATH_LEN)).unwrap();
+        let error = check_unix_socket_path_len(&path(MAX_UNIX_SOCKET_PATH_LEN + 1))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("108 bytes"), "{}", error);
+    }
+
+    #[test]
+    fn test_link_socket_into_dir() {
+        let tmp = TempDir::new().unwrap();
+        let socket = tmp.path().join("long").join("virtiofsd.sock");
+        fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let _listener = UnixListener::bind(&socket).unwrap();
+        let dir = tmp.path().join("short").join("root");
+
+        let link = link_socket_into_dir(&dir, &socket).unwrap();
+        assert_eq!(link, dir.join("virtiofsd.sock"));
+        assert_eq!(fs::read_link(&link).unwrap(), socket);
+        std::os::unix::net::UnixStream::connect(&link).unwrap();
+
+        fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink("/nonexistent", &link).unwrap();
+        let link = link_socket_into_dir(&dir, &socket).unwrap();
+        assert_eq!(fs::read_link(&link).unwrap(), socket);
+
+        fs::remove_file(&link).unwrap();
+        fs::write(&link, "").unwrap();
+        link_socket_into_dir(&dir, &socket).unwrap_err();
+        assert!(fs::symlink_metadata(&link).unwrap().is_file());
+    }
+
+    #[test]
+    fn test_link_socket_into_dir_rejects_long_link() {
+        let tmp = TempDir::new().unwrap();
+        let socket = tmp.path().join("virtiofsd.sock");
+        let dir = tmp.path().join("d".repeat(MAX_UNIX_SOCKET_PATH_LEN));
+
+        link_socket_into_dir(&dir, &socket).unwrap_err();
+        assert!(!dir.exists());
+    }
+
+    fn rootless_user() -> RootlessUser {
+        RootlessUser {
+            uid: 1000,
+            gid: 1000,
+            groups: Vec::new(),
+            user_name: "kata-test".to_string(),
+        }
+    }
+
+    // Model a user unrelated to the socket owner and group, with one existing
+    // supplementary group, so authorization must append the socket group.
+    fn socket_test_user(socket_path: &Path) -> RootlessUser {
+        let metadata = fs::metadata(socket_path).expect("stat socket");
+
+        RootlessUser {
+            uid: metadata.uid().wrapping_add(1),
+            gid: metadata.gid().wrapping_add(1),
+            groups: vec![metadata.gid().wrapping_add(2)],
+            user_name: "kata-socket-test".to_string(),
+        }
+    }
+
+    fn set_socket_group_access(socket_path: &Path) -> u32 {
+        fs::set_permissions(socket_path, fs::Permissions::from_mode(0o660))
+            .expect("set socket permissions");
+
+        let gid = fs::metadata(socket_path).expect("stat socket").gid();
+        if gid != 0 {
+            return gid;
+        }
+
+        assert_eq!(
+            geteuid().as_raw(),
+            0,
+            "changing a root-owned socket requires root"
+        );
+        let gid = 2000;
+        chown(socket_path, None, Some(Gid::from_raw(gid))).expect("set non-root socket group");
+        gid
+    }
+
+    #[test]
+    fn test_select_rootless_access_group() {
+        let path = Path::new("/dev/test");
+
+        assert_eq!(
+            select_rootless_access_group(path, 0o666, 0, 0o6).unwrap(),
+            None
+        );
+        assert_eq!(
+            select_rootless_access_group(path, 0o660, 2000, 0o6).unwrap(),
+            Some(2000)
+        );
+
+        let error = select_rootless_access_group(path, 0o640, 2000, 0o6)
+            .expect_err("group without write permission must be rejected");
+        assert!(error.to_string().contains("requires group permissions 060"));
+
+        let error = select_rootless_access_group(path, 0o660, 0, 0o6)
+            .expect_err("group root must be rejected");
+        assert!(error.to_string().contains("refuses group-root access"));
+    }
+
+    #[test]
+    fn test_authorize_rootless_resource_access() {
+        let path = Path::new("/run/test.sock");
+        let mut user = rootless_user();
+
+        authorize_rootless_resource_access(path, 0, 2000, 0o660, 0o2, &mut user).unwrap();
+        assert_eq!(user.groups, vec![2000]);
+
+        let error = authorize_rootless_resource_access(path, 0, 2001, 0o640, 0o2, &mut user)
+            .expect_err("group without write permission must be rejected");
+        assert!(error.to_string().contains("requires group permissions 020"));
+
+        let mut user = rootless_user();
+        authorize_rootless_resource_access(path, 0, 2000, 0o666, 0o2, &mut user).unwrap();
+        assert!(user.groups.is_empty());
+    }
+
+    #[test]
+    fn test_authorize_rootless_socket() {
+        let dir = TempDir::new().expect("create socket directory");
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755))
+            .expect("make socket directory traversable");
+        let socket_path = dir.path().join("qgs.socket");
+        let _listener = UnixListener::bind(&socket_path).expect("bind Unix socket");
+        let socket_gid = set_socket_group_access(&socket_path);
+        let mut user = socket_test_user(&socket_path);
+        let original_groups = user.groups.clone();
+
+        authorize_rootless_socket(&socket_path, &mut user, 0o2).expect("authorize rootless socket");
+
+        assert_eq!(user.groups, [original_groups, vec![socket_gid]].concat());
+    }
+
+    #[test]
+    fn test_authorize_rootless_socket_rejects_non_socket() {
+        let dir = TempDir::new().expect("create socket directory");
+        let socket_path = dir.path().join("qgs.socket");
+        fs::write(&socket_path, []).expect("create regular file");
+        let mut user = rootless_user();
+        let original_groups = user.groups.clone();
+
+        let error = authorize_rootless_socket(&socket_path, &mut user, 0o2)
+            .expect_err("regular file must be rejected");
+
+        assert!(error.to_string().contains("is not a Unix socket"));
+        assert_eq!(user.groups, original_groups);
+    }
+
+    #[test]
+    fn test_authorize_rootless_socket_rejects_untraversable_parent() {
+        let dir = TempDir::new().expect("create socket directory");
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))
+            .expect("make socket directory private");
+        let socket_path = dir.path().join("qgs.socket");
+        let _listener = UnixListener::bind(&socket_path).expect("bind Unix socket");
+        set_socket_group_access(&socket_path);
+        let mut user = socket_test_user(&socket_path);
+        let original_groups = user.groups.clone();
+
+        let error = authorize_rootless_socket(&socket_path, &mut user, 0o2)
+            .expect_err("untraversable parent must be rejected");
+
+        assert!(error.to_string().contains("cannot traverse socket parent"));
+        assert_eq!(user.groups, original_groups);
+    }
+
+    // The Set* prefix mirrors the setgroups/setgid/setuid syscalls these
+    // variants stand for, so keep it despite clippy::enum_variant_names.
+    #[derive(Debug, PartialEq)]
+    #[allow(clippy::enum_variant_names)]
+    enum CredentialOperation {
+        SetGroups(Vec<u32>),
+        SetGid(u32),
+        SetUid(u32),
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    #[allow(clippy::enum_variant_names)]
+    enum CredentialStep {
+        SetGroups,
+        SetGid,
+        SetUid,
+    }
+
+    fn credential_user() -> RootlessUser {
+        RootlessUser {
+            uid: 1001,
+            gid: 1002,
+            groups: vec![1003, 1004],
+            user_name: "kata-test".to_string(),
+        }
+    }
+
+    #[rstest]
+    #[case::with_supplementary_groups(vec![1003, 1004])]
+    #[case::without_supplementary_groups(Vec::new())]
+    fn test_set_process_credentials_order(#[case] groups: Vec<u32>) {
+        let operations = RefCell::new(Vec::new());
+        let mut user = credential_user();
+        user.groups = groups.clone();
+
+        set_process_credentials_with(
+            &user,
+            |groups| {
+                operations
+                    .borrow_mut()
+                    .push(CredentialOperation::SetGroups(groups.to_vec()));
+                Ok(())
+            },
+            |gid| {
+                operations
+                    .borrow_mut()
+                    .push(CredentialOperation::SetGid(gid));
+                Ok(())
+            },
+            |uid| {
+                operations
+                    .borrow_mut()
+                    .push(CredentialOperation::SetUid(uid));
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            *operations.borrow(),
+            vec![
+                // Calling setgroups with an empty list clears any inherited
+                // supplementary groups and must not be skipped.
+                CredentialOperation::SetGroups(groups),
+                CredentialOperation::SetGid(1002),
+                CredentialOperation::SetUid(1001),
+            ]
+        );
+    }
+
+    #[rstest]
+    #[case::setgroups(CredentialStep::SetGroups, "setgroups failed", 1)]
+    #[case::setgid(CredentialStep::SetGid, "setgid failed", 2)]
+    #[case::setuid(CredentialStep::SetUid, "setuid failed", 3)]
+    fn test_set_process_credentials_stops_on_error(
+        #[case] failed_step: CredentialStep,
+        #[case] expected_error: &str,
+        #[case] expected_calls: usize,
+    ) {
+        let calls = Cell::new(0);
+        let result = set_process_credentials_with(
+            &credential_user(),
+            |_| {
+                calls.set(calls.get() + 1);
+                if failed_step == CredentialStep::SetGroups {
+                    Err(anyhow!("injected setgroups failure"))
+                } else {
+                    Ok(())
+                }
+            },
+            |_| {
+                calls.set(calls.get() + 1);
+                if failed_step == CredentialStep::SetGid {
+                    Err(anyhow!("injected setgid failure"))
+                } else {
+                    Ok(())
+                }
+            },
+            |_| {
+                calls.set(calls.get() + 1);
+                if failed_step == CredentialStep::SetUid {
+                    Err(anyhow!("injected setuid failure"))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+
+        let error = result.expect_err("credential failure must abort setup");
+        assert!(format!("{error:#}").contains(expected_error));
+        assert_eq!(calls.get(), expected_calls);
+    }
+
+    #[test]
+    fn test_ctreate_fds() {
+        let device = "/dev/null";
+        let num_fds = 3_usize;
+        let fds = create_fds(device, num_fds);
+        assert!(fds.is_ok());
+        assert_eq!(fds.unwrap().len(), num_fds);
+    }
+
+    #[test]
+    fn test_vmm_user_runtime_dir() {
+        assert_eq!(vmm_user_runtime_dir(1000), PathBuf::from("/run/user/1000"));
+    }
+
+    #[test]
+    fn test_remove_dir_all_if_exists_is_idempotent() {
+        let parent = TempDir::new().unwrap();
+        let runtime_dir = parent.path().join("runtime");
+        fs::create_dir_all(&runtime_dir).unwrap();
+
+        remove_dir_all_if_exists(&runtime_dir).unwrap();
+        assert!(!runtime_dir.exists());
+
+        remove_dir_all_if_exists(&runtime_dir).unwrap();
+    }
+
+    #[rstest]
+    #[case::shared_with_the_state("sid", true)]
+    #[case::of_its_own("other", false)]
+    fn the_vm_dir_goes_but_the_state_stays(#[case] dir: &str, #[case] state_stays: bool) {
+        let root = TempDir::new().unwrap();
+        let vm_path = root.path().join(dir);
+        fs::create_dir_all(vm_path.join("vhost-fs")).unwrap();
+        fs::write(vm_path.join("qmp.sock"), b"").unwrap();
+        fs::write(vm_path.join(persist::PERSIST_FILE), b"{}").unwrap();
+
+        super::remove_vm_dir_in(root.path(), "sid", &vm_path).unwrap();
+        let left: Vec<_> = fs::read_dir(&vm_path)
+            .map(|d| d.map(|e| e.unwrap().file_name()).collect())
+            .unwrap_or_default();
+        if state_stays {
+            assert_eq!(left, vec![persist::PERSIST_FILE]);
+        } else {
+            assert!(!vm_path.exists());
+        }
+        super::remove_vm_dir_in(root.path(), "sid", &vm_path).unwrap();
+    }
+
+    #[test]
+    fn test_vsocket_address_new() {
+        let socket = SocketAddress::new(8866);
+        assert_eq!(socket.typ, "vsock");
+        assert_eq!(socket.cid, "2");
+        assert_eq!(socket.port, "8866");
+    }
+
+    #[test]
+    fn test_unix_address_new() {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("qgs.socket");
+        std::fs::File::create(&sock).unwrap();
+
+        // Socket present: must return unix type
+        let socket = SocketAddress::new_with_socket_path(0, sock.to_str().unwrap());
+        assert_eq!(socket.typ, "unix");
+        assert_eq!(socket.path, sock.to_str().unwrap());
+
+        // Socket absent: must fall back to vsock port 4050
+        let socket = SocketAddress::new_with_socket_path(0, "/nonexistent/qgs.socket");
+        assert_eq!(socket.typ, "vsock");
+        assert_eq!(socket.cid, "2");
+        assert_eq!(socket.port, "4050");
+    }
+
+    #[test]
+    fn test_socket_address_display() {
+        let socket = SocketAddress::new(6688);
+        let expected_json = r#"{"type":"vsock","cid":"2","port":"6688"}"#;
+        assert_eq!(format!("{socket}"), expected_json);
+    }
+
+    #[test]
+    fn test_socket_address_serialize_deserialize() {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("qgs.socket");
+        std::fs::File::create(&sock).unwrap();
+        let sock_str = sock.to_str().unwrap();
+
+        // Socket present: unix type
+        let socket = SocketAddress::new_with_socket_path(0, sock_str);
+        let serialized = serde_json::to_string(&socket).unwrap();
+        let expected_json = format!(r#"{{"type":"unix","path":"{sock_str}"}}"#);
+        assert_eq!(expected_json, serialized);
+
+        // Socket absent: vsock fallback
+        let socket = SocketAddress::new_with_socket_path(0, "/nonexistent/qgs.socket");
+        let serialized = serde_json::to_string(&socket).unwrap();
+        let expected_json = r#"{"type":"vsock","cid":"2","port":"4050"}"#;
+        assert_eq!(expected_json, serialized);
+    }
+
+    #[test]
+    fn test_socket_address_kebab_case() {
+        let socket = SocketAddress::new(6868);
+        let serialized = serde_json::to_string(&socket).unwrap();
+        assert!(serialized.contains(r#""type":"#));
+        assert!(serialized.contains(r#""cid":"#));
+        assert!(serialized.contains(r#""port":"#));
+    }
+
+    #[test]
+    fn test_mkdir_all_with_inherited_owner_successful() {
+        if geteuid().as_raw() != 0 {
+            eprintln!("skipped: requires root");
+            return;
+        }
+
+        let tmp1 = TempDir::new().expect("create tmp1");
+        let tmp1_path = tmp1.path().to_path_buf();
+
+        chown(
+            &tmp1_path,
+            Some(Uid::from_raw(1234)),
+            Some(Gid::from_raw(5678)),
+        )
+        .expect("chown tmp1");
+
+        let target1 = tmp1_path.join("foo").join("bar");
+        create_dir_all_with_inherit_owner(&target1, 0o700).expect("mkdir -p target1");
+
+        let temp_root = std::env::temp_dir();
+        assert!(
+            target1.starts_with(&temp_root),
+            "target1 not under temp dir"
+        );
+
+        let mut chain: Vec<PathBuf> = target1.ancestors().map(|p| p.to_path_buf()).collect();
+        chain.reverse();
+
+        let start = chain
+            .iter()
+            .position(|p| p == &temp_root)
+            .map(|i| i + 1)
+            .unwrap_or(1);
+
+        for p in chain.into_iter().skip(start) {
+            let md = fs::metadata(&p).expect("stat p");
+            assert!(md.is_dir(), "not a dir: {}", p.display());
+            assert_eq!(md.uid(), 1234, "uid mismatch for {}", p.display());
+            assert_eq!(md.gid(), 5678, "gid mismatch for {}", p.display());
+        }
+
+        let tmp2 = TempDir::new().expect("create tmp2");
+        let tmp2_path = tmp2.keep();
+        let _ = fs::remove_dir_all(&tmp2_path);
+
+        let target2 = tmp2_path.join("foo").join("bar");
+        create_dir_all_with_inherit_owner(&target2, 0o700).expect("mkdir -p target2");
+
+        let temp_root = std::env::temp_dir();
+        assert!(
+            target2.starts_with(&temp_root),
+            "target2 not under temp dir"
+        );
+
+        let mut chain: Vec<PathBuf> = target2.ancestors().map(|p| p.to_path_buf()).collect();
+        chain.reverse();
+
+        let start = chain
+            .iter()
+            .position(|p| p == &temp_root)
+            .map(|i| i + 1)
+            .unwrap_or(1);
+
+        for p in chain.into_iter().skip(start) {
+            let md = fs::metadata(&p).expect("stat p");
+            assert!(md.is_dir(), "not a dir: {}", p.display());
+            assert_eq!(md.uid(), 0, "uid mismatch for {}", p.display());
+            assert_eq!(md.gid(), 0, "gid mismatch for {}", p.display());
+        }
+
+        let _ = fs::remove_dir_all(&tmp2_path);
+    }
+
+    #[test]
+    fn test_chown_to_parent() {
+        if geteuid().as_raw() != 0 {
+            eprintln!("skipped: requires root");
+            return;
+        }
+
+        let tmp = Builder::new()
+            .prefix("root")
+            .tempdir()
+            .expect("create temp dir");
+        let root_dir = tmp.path();
+
+        chown(
+            root_dir,
+            Some(Uid::from_raw(1234)),
+            Some(Gid::from_raw(5678)),
+        )
+        .expect("chown root_dir");
+
+        let target_dir = root_dir.join("foo");
+        fs::create_dir_all(&target_dir).expect("mkdir -p target_dir");
+
+        super::chown_to_parent(&target_dir).expect("chown_to_parent");
+
+        let md = fs::metadata(&target_dir).expect("stat target_dir");
+        assert_eq!(md.uid(), 1234, "uid mismatch");
+        assert_eq!(md.gid(), 5678, "gid mismatch");
+    }
+
+    #[test]
+    fn test_first_valid_executable_path() {
+        let tmp = TempDir::new().expect("create tmpdir");
+        let tmpdir = tmp.path();
+
+        {
+            let paths: Vec<String> = vec!["a/b/c".to_string(), "c/d".to_string()];
+            let slice: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
+
+            let err = first_valid_executable_path(&slice).unwrap_err();
+            let expected = format!("No valid executable found in paths: {:?}", slice);
+            assert_eq!(
+                err.to_string(),
+                expected,
+                "all invalid: error message mismatch"
+            );
+        }
+
+        {
+            let ab = tmpdir.join("a").join("b");
+            fs::create_dir_all(&ab).expect("mkdir -p a/b");
+
+            let c = ab.join("c");
+            fs::write(&c, b"test\n").expect("write c");
+            let mut perm = fs::metadata(&c).unwrap().permissions();
+            perm.set_mode(0o644);
+            fs::set_permissions(&c, perm).unwrap();
+
+            let paths: Vec<String> = vec![c.to_string_lossy().into_owned(), "c/d".to_string()];
+            let slice: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
+
+            let err = first_valid_executable_path(&slice).unwrap_err();
+            let expected = format!("No valid executable found in paths: {:?}", slice);
+            assert_eq!(err.to_string(), expected, "non-exec file should be invalid");
+        }
+
+        {
+            let de = tmpdir.join("d").join("e");
+            fs::create_dir_all(&de).expect("mkdir -p d/e");
+
+            let f = de.join("f");
+            fs::write(&f, b"test\n").expect("write f");
+            let mut perm = fs::metadata(&f).unwrap().permissions();
+            perm.set_mode(0o755);
+            fs::set_permissions(&f, perm).unwrap();
+
+            let expect_path = f.to_string_lossy().into_owned();
+            let paths: Vec<String> = vec![expect_path.clone(), "c/d".to_string()];
+            let slice: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
+
+            let got = first_valid_executable_path(&slice).expect("should find executable");
+            assert_eq!(got, expect_path, "should return the first executable path");
+        }
+
+        {
+            let gh = tmpdir.join("g").join("h");
+            fs::create_dir_all(&gh).expect("mkdir -p g/h");
+
+            let i = gh.join("i");
+            fs::write(&i, b"test\n").expect("write i");
+            let mut perm = fs::metadata(&i).unwrap().permissions();
+            perm.set_mode(0o755);
+            fs::set_permissions(&i, perm).unwrap();
+
+            let expect_path = i.to_string_lossy().into_owned();
+            let paths: Vec<String> = vec!["c/d".to_string(), expect_path.clone()];
+            let slice: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
+
+            let got = first_valid_executable_path(&slice).expect("should find executable");
+            assert_eq!(got, expect_path, "should return the second executable path");
+        }
+    }
 }

@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2018 Intel Corporation
+# Copyright (c) 2018-2023 Intel Corporation
 #
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -73,270 +73,382 @@ assets:
     cloud_hypervisor:
       description: "Cloud Hypervisor is an open source Virtual Machine Monitor"
       url: "https://github.com/cloud-hypervisor/cloud-hypervisor"
-      uscan-url: >-
-        https://github.com/cloud-hypervisor/cloud-hypervisor/tags.*/v?(\d\S+)\.tar\.gz
-      version: "v35.0"
+      version: "v54.1"
+
+    openvmm:
+      description: >-
+        OpenVMM is a modular, cross-platform Virtual Machine Monitor written
+        in Rust
+      url: "https://github.com/microsoft/openvmm"
+      version: "d8c1f25a35d85d7cd2ea762a2a7b2e7328a6fc9d"
 
     firecracker:
       description: "Firecracker micro-VMM"
       url: "https://github.com/firecracker-microvm/firecracker"
-      uscan-url: >-
-        https://github.com/firecracker-microvm/firecracker/tags
-        .*/v?(\d\S+)\.tar\.gz
-      version: "v1.4.0"
+      version: "v1.17.0"
 
     qemu:
       description: "VMM that uses KVM"
       url: "https://github.com/qemu/qemu"
-      version: "v7.2.0"
-      tag: "v7.2.0"
-      # Do not include any non-full release versions
-      # Break the line *without CR or space being appended*, to appease
-      # yamllint, and note the deliberate ' ' at the end of the expression.
-      uscan-opts: "opts=uversionmangle=s/(\\d)[_\\.\\-\\+]?\
-        ((RC|rc|pre|dev|beta|alpha)\\d*)$/$1~$2/ "
-      uscan-url: >-
-        https://github.com/qemu/qemu/tags
-        .*/v?(\d\S+)\.tar\.gz
-
-    qemu-experimental:
-      description: "QEMU with virtiofs support"
-      url: "https://github.com/qemu/qemu"
-      version: "7a800cf9496fddddf71b21a00991e0ec757a170a"
-
-    qemu-tdx-experimental:
-      # yamllint disable-line rule:line-length
-      description: "QEMU with TDX support - based on https://github.com/intel/tdx-tools/releases/tag/2023ww15"
-      url: "https://github.com/kata-containers/qemu"
-      tag: "b67b00e6b4c7831a3f5bc684bc0df7a9bfd1bd56-plus-TDX-v1.10"
+      version: "v11.1.3"
 
     qemu-snp-experimental:
-      description: "QEMU with experimental SNP support (no UPM)"
-      url: "https://github.com/AMDESE/qemu"
-      tag: "3b6a2b6b7466f6dea53243900b7516c3f29027b7"
+      description: "QEMU with GPU+SNP support"
+      url: "https://github.com/confidential-containers/qemu.git"
+      tag: "gpu-snp-20260430"
+
+    qemu-tdx-experimental:
+      description: "QEMU with GPU+TDX support"
+      url: "https://github.com/confidential-containers/qemu.git"
+      tag: "gpu-tdx-20260430"
+
+    stratovirt:
+      description: "StratoVirt is an lightweight opensource VMM"
+      url: "https://github.com/openeuler-mirror/stratovirt"
+      version: "v2.3.0"
 
   image:
     description: |
       Root filesystem disk image used to boot the guest virtual
       machine.
-    url: "https://github.com/kata-containers/kata-containers/tools/osbuilder"
     architecture:
       aarch64:
-        name: &default-image-name "ubuntu"
-        version: &default-image-version "latest"
+        name: "ubuntu"
+        version: "resolute"  # 26.04 LTS
+        substrate:
+          name: "debian"
+          version: "trixie-slim"
+        confidential:
+          name: "ubuntu"
+          version: "resolute"  # 26.04 LTS
+        nvidia-gpu:
+          name: "ubuntu"
+          version: "resolute"  # 26.04 LTS
+        nvidia-gpu-confidential:
+          name: "ubuntu"
+          version: "resolute"  # 26.04 LTS
+        nvidia:
+          name: "ubuntu"
+          version: "resolute"  # 26.04 LTS
+        nvidia-gpu-extension:
+          name: "ubuntu"
+          version: "resolute"  # 26.04 LTS
       ppc64le:
-        name: *default-image-name
-        version: *default-image-version
+        name: "ubuntu"
+        version: "resolute"  # 26.04 LTS
       s390x:
-        name: *default-image-name
-        version: *default-image-version
+        name: "ubuntu"
+        version: "resolute"  # 26.04 LTS
+        confidential:
+          name: "ubuntu"
+          version: "resolute"  # 26.04 LTS
       x86_64:
-        name: *default-image-name
-        version: *default-image-version
-        tdx:
-          name: *default-image-name
-          version: *default-image-version
-    meta:
-      image-type: *default-image-name
+        name: "ubuntu"
+        version: "resolute"  # 26.04 LTS
+        substrate:
+          name: "debian"
+          version: "trixie-slim"
+        confidential:
+          name: "ubuntu"
+          version: "resolute"  # 26.04 LTS
+        mariner:
+          name: "cbl-mariner"
+          version: "3.0"
+        nvidia-gpu:
+          name: "ubuntu"
+          version: "resolute"  # 26.04 LTS
+        nvidia-gpu-confidential:
+          name: "ubuntu"
+          version: "resolute"  # 26.04 LTS
+        nvidia:
+          name: "ubuntu"
+          version: "resolute"  # 26.04 LTS
+        nvidia-gpu-extension:
+          name: "ubuntu"
+          version: "resolute"  # 26.04 LTS
 
   initrd:
     description: |
       Root filesystem initrd used to boot the guest virtual
       machine.
-    url: "https://github.com/kata-containers/kata-containers/tools/osbuilder"
     architecture:
       aarch64:
-        name: &default-initrd-name "alpine"
-        version: &default-initrd-version "3.18"
+        name: "ubuntu"
+        version: "resolute"  # 26.04 LTS
+        confidential:
+          name: "ubuntu"
+          version: "resolute"  # 26.04 LTS
+        nvidia-gpu:
+          name: "ubuntu"
+          version: "resolute"  # 26.04 LTS
+        nvidia-gpu-confidential:
+          name: "ubuntu"
+          version: "resolute"  # 26.04 LTS
       # Do not use Alpine on ppc64le & s390x, the agent cannot use musl because
       # there is no such Rust target
       ppc64le:
-        name: &glibc-initrd-name "ubuntu"
-        version: &glibc-initrd-version "20.04"
+        name: "ubuntu"
+        version: "resolute"  # 26.04 LTS
       s390x:
-        name: *glibc-initrd-name
-        version: *glibc-initrd-version
+        name: "ubuntu"
+        version: "resolute"  # 26.04 LTS
+        confidential:
+          name: "ubuntu"
+          version: "resolute"  # 26.04 LTS
       x86_64:
-        name: *default-initrd-name
-        version: *default-initrd-version
-        mariner:
-          name: "cbl-mariner"
-          version: "2.0"
-        sev:
-          name: *glibc-initrd-name
-          version: *glibc-initrd-version
+        name: "ubuntu"
+        version: "resolute"  # 26.04 LTS
+        confidential:
+          name: "ubuntu"
+          version: "resolute"  # 26.04 LTS
+        nvidia-gpu:
+          name: "ubuntu"
+          version: "resolute"  # 26.04 LTS
+        nvidia-gpu-confidential:
+          name: "ubuntu"
+          version: "resolute"  # 26.04 LTS
 
   kernel:
     description: "Linux kernel optimised for virtual machines"
     url: "https://cdn.kernel.org/pub/linux/kernel/v6.x/"
-    version: "v6.1.52"
-    sev:
-      description: "Linux kernel that supports SEV and SNP"
-      url: "https://cdn.kernel.org/pub/linux/kernel/v5.x/"
-      version: "v5.19.2"
-    snp:
-      description: "Linux kernel that supports AMD SEV-SNP for VMs"
-      url: "https://cdn.kernel.org/pub/linux/kernel/v5.x/"
-      version: "v5.19.2"
-
-  kernel-arm-experimental:
-    description: "Linux kernel with cpu/mem hotplug support on arm64"
-    url: "https://cdn.kernel.org/pub/linux/kernel/v5.x/"
-    version: "v5.15.7"
+    version: "v6.18.62"
+    nvidia:
+      url: "https://cdn.kernel.org/pub/linux/kernel/v6.x/"
+      version: "v6.18.62"
 
   kernel-dragonball-experimental:
     description: "Linux kernel with Dragonball VMM optimizations like upcall"
-    url: "https://cdn.kernel.org/pub/linux/kernel/v5.x/"
-    version: "v5.10.25"
-
-  kernel-tdx-experimental:
-    # yamllint disable-line rule:line-length
-    description: "Linux kernel with TDX support -- based on https://github.com/intel/tdx-tools/releases/tag/2023ww15"
-    url: "https://github.com/kata-containers/linux/archive/refs/tags"
-    version: "6.2-TDX-v1.8"
+    url: "https://cdn.kernel.org/pub/linux/kernel/v6.x/"
+    version: "v6.18.62"
 
 externals:
   description: "Third-party projects used by the system"
+
+  nvrc:
+    # yamllint disable-line rule:line-length
+    desc: "The NVRC project provides a Rust binary that implements a simple init system for microVMs"
+    # To test an NVRC pull request, set url to
+    # "oci://ghcr.io/nvidia/nvrc/nvrc-pr" and version to its head sha
+    # (published by adding the "publish-nvrc-from-pr" label there). The
+    # check-nvrc-is-released static check blocks merging that.
+    version: "v0.1.7"
+    url: "https://github.com/NVIDIA/nvrc/releases/download/"
+
+  nvidia:
+    desc: "NVIDIA compute stack"
+    driver:
+      desc: "NVIDIA kernel driver"
+      version: "615.71.09"
+      # yamllint disable-line rule:line-length
+      url: "https://github.com/NVIDIA/open-gpu-kernel-modules/archive/refs/tags/"
+      # Optional dedicated driver userspace repository - drivers released
+      # separately from the toolkit ship pinning/libnvidia-*/fabricmanager/
+      # nvlsm/imex in their own repo, not the CUDA one. Empty: the packages
+      # resolve from the repositories above as before.
+      repo:
+        x86_64:
+          url: ""
+          pkg: ""
+        aarch64:
+          url: ""
+          pkg: ""
+    cuda:
+      desc: "NVIDIA CUDA repository"
+      repo:
+        x86_64:
+          # yamllint disable-line rule:line-length
+          url: "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2604/x86_64/"
+          pkg: "cuda-keyring_1.1-1_all.deb"
+        aarch64:
+          # yamllint disable-line rule:line-length
+          url: "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2604/sbsa/"
+          pkg: "cuda-keyring_1.1-1_all.deb"
+    tools:
+      desc: "NVIDIA container toolkit and tools repository"
+      repo:
+        x86_64:
+          # yamllint disable-line rule:line-length
+          url: "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2604/x86_64/"
+          pkg: "cuda-keyring_1.1-1_all.deb"
+        aarch64:
+          # yamllint disable-line rule:line-length
+          url: "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2604/sbsa/"
+          pkg: "cuda-keyring_1.1-1_all.deb"
+    ctk:
+      version: "1.20.1-1"
+      url: "https://github.com/NVIDIA/nvidia-container-toolkit"
+    dcgm:
+      desc: "NVIDIA Data Center GPU Manager"
+      version: "1:4.7.0-1"
+      url: "https://github.com/NVIDIA/DCGM"
+      exporter:
+        desc: "NVIDIA DCGM exporter, released independently of DCGM itself"
+        version: "4.8.4.3955-1"
+        url: "https://github.com/NVIDIA/dcgm-exporter"
+    nvat:
+      desc: "NVIDIA Attestation SDK"
+      version: "2026.03.02"
+      url: "https://github.com/NVIDIA/attestation-sdk"
+
+  upx:
+    desc: "Executable packer used to shrink the NVIDIA GPU rootfs"
+    version: "5.3.0"
+    url: "https://github.com/upx/upx"
+
+  busybox:
+    desc: "The Swiss Army Knife of Embedded Linux"
+    version: "1.36.1"
+    url: "https://busybox.net/downloads"
+
+  helm:
+    description: "Kubernetes package manager"
+    url: "https://get.helm.sh/"
+    version: "v4.0.4"
 
   cni-plugins:
     description: "CNI network plugins"
     url: "https://github.com/containernetworking/plugins"
     version: "v1.2.0"
 
-  conmon:
-    description: "An OCI container runtime monitor"
-    url: "https://github.com/containers/conmon"
-    version: "v2.0.10"
+  coco-guest-components:
+    description: "Provides attested key unwrapping for image decryption"
+    url: "https://github.com/confidential-containers/guest-components/"
+    version: "eae0bf63a3a9db7721f86e0a2b0b9941a7fcba3a"
+    # Guest Ubuntu release qualifier published by coco-extension-image.yml
+    # (tags are "<version>-<variant>", e.g. "<sha>-ubuntu26.04"). The
+    # extension ships no libc, so this must match the guest rootfs ABI.
+    variant: "ubuntu26.04"
+    # Scratch OCI container image (guest-components "Publish OCI container
+    # image" step). Consumed by monolithic confidential rootfs builds.
+    # yamllint disable-line rule:line-length
+    container_image: "ghcr.io/confidential-containers/guest-components/coco-extension"
+    # EROFS + dm-verity disk image (guest-components "Publish disk image with
+    # ORAS" step). Consumed by the runtime-rs composable extension path.
+    # yamllint disable-line rule:line-length
+    extension_image: "ghcr.io/confidential-containers/guest-components/coco-extension-disk"
 
-  crio:
-    description: |
-      OCI-based Kubernetes Container Runtime Interface implementation
-    url: "https://github.com/cri-o/cri-o"
-    branch: "release-1.23"
+  coco-trustee:
+    description: "Provides attestation and secret delivery components"
+    url: "https://github.com/confidential-containers/trustee"
+    version: "512fed65642015b849f38fb13bfdec7806639987"
+    toolchain: "1.90.0"
+    # Helm chart deploys three separate images; tags match version.
+    images:
+      kbs: "ghcr.io/confidential-containers/staged-images/kbs-grpc-as"
+      as: "ghcr.io/confidential-containers/staged-images/coco-as-grpc"
+      rvps: "ghcr.io/confidential-containers/staged-images/rvps"
 
   containerd:
     description: |
       Containerd for Kubernetes Container Runtime Interface.
     url: "github.com/containerd/containerd"
-    tarball_url: "https://github.com/containerd/containerd/releases/download"
-    # containerd from v1.5.0 used the path unix socket
-    # instead of abstract socket, thus kata wouldn's support the containerd's
-    # version older than them.
-    version: "v1.6.8"
-    lts: "v1.6"
-    active: "v1.7"
+    minimum: "v2.3"
+    latest: "v2.4"
 
-  critools:
-    description: "CLI tool for Container Runtime Interface (CRI)"
-    url: "https://github.com/kubernetes-sigs/cri-tools"
-    version: "1.23.0"
-    # As we don't want to disrupt what we have on the `tests` repo, let's
-    # create a "latest" entry and use that for the GitHub actions tests.
-    latest: "v1.27"
-
-  cryptsetup:
-    description: "A utility used to setup disk encryption, integrity protection"
-    url: "https://gitlab.com/cryptsetup/cryptsetup"
-    version: "v2.5.0"
+  runc:
+    description: "CLI tool for spawning and running containers"
+    url: "https://github.com/opencontainers/runc"
+    latest: "v1.2"
 
   gperf:
     description: "GNU gperf is a perfect hash function generator"
-    url: "http://ftp.gnu.org/pub/gnu/gperf/"
-    version: "3.1"
+    url: "https://ftp.gnu.org.uk/gnu/gperf/"
+    version: "3.3"
 
-  lvm2:
-    description: "LVM2 and device-mapper tools and libraries"
-    url: "https://github.com/lvmteam/lvm2"
-    version: "v2_03_16"
-
-  kubernetes:
-    description: "Kubernetes project container manager"
-    url: "https://github.com/kubernetes/kubernetes"
-    # regexp formed to match 'd.tar.gz', deliberately to not match any alpha or
-    # beta type releases
-    uscan-url: >-
-      https://github.com/kubernetes/kubernetes/tags
-      .*/v?([\d\.]+)\.tar\.gz
-    version: "1.23.1-00"
+  hadolint:
+    description: "the dockerfile linter used by static-checks"
+    url: "https://github.com/hadolint/hadolint"
+    version: "2.15.1"
 
   libseccomp:
     description: "High level interface to Linux seccomp filter"
     url: "https://github.com/seccomp/libseccomp"
-    version: "2.5.4"
+    version: "2.6.1"
 
-  runc:
-    description: "OCI CLI reference runtime implementation"
-    url: "https://github.com/opencontainers/runc"
-    # Oddly, here we do want rc versions, as there appears to be little else
-    # really for runc.
-    uscan-url: >-
-      https://github.com/opencontainers/runc/tags
-      .*/v?(\d\S+)\.tar\.gz
-    version: "v1.1.4"
+  pause:
+    description: "Kubernetes pause container image"
+    repo: "docker://registry.k8s.io/pause"
+    version: "3.10"
 
   nydus:
     description: "Nydus image acceleration service"
-    url: "https://github.com/dragonflyoss/image-service"
-    version: "v2.2.3"
+    url: "https://github.com/dragonflyoss/nydus"
+    version: "v2.4.5"
 
   nydus-snapshotter:
     description: "Snapshotter for Nydus image acceleration service"
     url: "https://github.com/containerd/nydus-snapshotter"
-    version: "v0.12.0"
+    version: "v0.16.1"
 
-  open-policy-agent:
+  oras:
+    description: "OCI Registry As Storage CLI"
+    url: "https://github.com/oras-project/oras"
+    version: "1.3.6"
+
+  opa:
     description: "Open Policy Agent"
     url: "https://github.com/open-policy-agent/opa"
-    version: "v0.55.0"
-    meta:
-      # - If an OPA package is available for the Guest image distro, that
-      #   package is used instead of the binary below.
-      #
-      # - TODO: if an OPA package is not available for the Guest image distro,
-      #   Kata should cache the OPA source code, toolchain information, etc.
-      #   OPA should be built from the cached source code instead of downloading
-      #   this binary.
-      #
-      # yamllint disable-line rule:line-length
-      binary: "https://github.com/open-policy-agent/opa/releases/download/v0.55.0/opa_linux_amd64_static"
+    version: "v1.9.0"
 
   ovmf:
     description: "Firmware, implementation of UEFI for virtual machines."
     url: "https://github.com/tianocore/edk2"
     x86_64:
       description: "Vanilla firmware build"
-      version: "edk2-stable202202"
+      version: "edk2-stable202608"
       package: "OvmfPkg/OvmfPkgX64.dsc"
       package_output_dir: "OvmfX64"
     sev:
+      # Used by AMD SEV-SNP for measured direct boot
       description: "AmdSev build needed for SEV measured direct boot."
-      version: "edk2-stable202302"
+      version: "edk2-stable202608"
       package: "OvmfPkg/AmdSev/AmdSevX64.dsc"
       package_output_dir: "AmdSev"
     tdx:
-      # yamllint disable-line rule:line-length
-      description: "QEMU with TDX support - based on https://github.com/intel/tdx-tools/releases/tag/2023ww15"
-      version: "edk2-stable202302"
+      description: "UEFI for Intel TDX virtual machines."
+      version: "edk2-stable202608"
       package: "OvmfPkg/IntelTdx/IntelTdxX64.dsc"
       package_output_dir: "IntelTdx"
+    arm64:
+      description: "UEFI for arm64 virtual machines."
+      version: "edk2-stable202608"
+      package: "ArmVirtPkg/ArmVirtQemu.dsc"
+      package_output_dir: "ArmVirtQemu-AArch64"
+
+  protoc:
+    description: "Protobuf compiler"
+    url: "https://github.com/protocolbuffers/protobuf/releases"
+    version: "v21.12"
+
+  protoc-gen-go:
+    description: "Protobuf Go compiler"
+    url: "https://github.com/protocolbuffers/protobuf-go/releases"
+    version: "v1.28.1"
 
   td-shim:
-    description: "Confidential Containers Shim Firmware"
+    description: "A simplified TDX virtual firmware for TD containers"
     url: "https://github.com/confidential-containers/td-shim"
-    version: "cf9592ef70bd6ba4c7ab1330d278a743f5ba3133"
-    toolchain: "nightly-2022-05-15"
+    version: "0362d0bc6d784170af28551e0b9bc6fd5ad414d2"
+    toolchain: "1.88.0"
+
+  ttrpc:
+    description: "ttRPC libary and code generation utilities"
+    url: "https://github.com/containerd/ttrpc/releases"
+    version: "v1.2.7"
 
   virtiofsd:
     description: "vhost-user virtio-fs device backend written in Rust"
     url: "https://gitlab.com/virtio-fs/virtiofsd"
-    version: "v1.8.0"
-    toolchain: "1.72.0"
+    version: "v1.14.0"
+    toolchain: "1.85.1"
     meta:
-      # From https://gitlab.com/virtio-fs/virtiofsd/-/releases/v1.8.0,
-      # this is the link labelled virtiofsd-v1.8.0.zip
+      # From https://gitlab.com/virtio-fs/virtiofsd/-/releases/v1.14.0,
+      # this is the link labelled virtiofsd-v1.14.0.zip
       #
       # yamllint disable-line rule:line-length
-      binary: "https://gitlab.com/virtio-fs/virtiofsd/uploads/9ec473efd0203219d016e66aac4190aa/virtiofsd-v1.8.0.zip"
+      binary: "https://gitlab.com/-/project/21523468/uploads/f505704014ae7a816e515f2a05a93d8b/virtiofsd-v1.14.0.zip"
+      # yamllint disable-line rule:line-length
+      binary_sha256: "2e4fe9571f492b00baa34bc4e708e950039c5da05b830b31a8d179cb6ac8978e"
 
 languages:
   description: |
@@ -346,52 +458,41 @@ languages:
   golang:
     description: "Google's 'go' language"
     notes: "'version' is the default minimum version used by this project."
-    version: "1.19.3"
+    # When updating this, also update in go.mod files.
+    version: "1.26.11"
     meta:
       description: |
         'newest-version' is the latest version known to work when
         building Kata
-      newest-version: "1.19.3"
+      newest-version: "1.26.11"
 
   rust:
     description: "Rust language"
     notes: "'version' is the default minimum version used by this project."
-    version: "1.72.0"
+    # Keep in sync with rust-toolchain.toml
+    version: "1.97"
     meta:
       description: |
         'newest-version' is the latest version known to work when
         building Kata
-      newest-version: "1.72.0"
+      newest-version: "1.97"
 
   golangci-lint:
     description: "golangci-lint"
     notes: "'version' is the default minimum version used by this project."
-    version: "1.50.1"
+    url: "github.com/golangci/golangci-lint"
+    version: "2.9.0"
     meta:
       description: |
         'newest-version' is the latest version known to work when
         building Kata
-      newest-version: "1.50.1"
+      newest-version: "2.9.0"
 
-specs:
-  description: "Details of important specifications"
+docker_images:
+  description: "Docker images used for testing"
 
-  oci:
-    description: "Open Containers Initiative runtime specification"
-    url: "https://github.com/opencontainers/runtime-spec/releases"
-    uscan-url: >-
-      https://github.com/opencontainers/runtime-spec/tags
-      .*/v?(\d\S+)\.tar\.gz
-    version: "v1.0.2"
-
-plugins:
-  description: |
-    Details of plugins required for the components or testing.
-
-  sriov-network-device:
-    description: |
-      The SR-IOV network device plugin is Kubernetes device plugin for
-      discovering and advertising SR-IOV virtual functions (VFs)
-      available on a Kubernetes host.
-    url: "https://github.com/k8snetworkplumbingwg/sriov-network-device-plugin"
-    version: "b7f6d3e0679796e907ecca88cfab0e32e326850d"
+  nginx:
+    description: "Proxy server for HTTP, HTTPS, SMTP, POP3 and IMAP protocols"
+    registry: "quay.io/kata-containers/nginx"
+    # yamllint disable-line rule:line-length
+    digest: "sha256:a905609e0f9adc2607f06da2f76893c6da07caa396c41f2806fee162064cfb4b"  # 1.15-alpine

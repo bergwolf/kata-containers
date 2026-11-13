@@ -4,23 +4,32 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+use std::convert::TryFrom;
 use std::path::PathBuf;
+use std::time::Duration;
 
+use super::{build_dragonball_network_config, DragonballInner};
+use crate::VhostUserConfig;
+use crate::{device::pci_path::PciPath, KATA_BLK_DEV_TYPE};
+use crate::{
+    device::DeviceType, HybridVsockConfig, NetworkConfig, ShareFsConfig, ShareFsMountConfig,
+    ShareFsMountOperation, ShareFsMountType, VfioDevice, VmmState, DEFAULT_HOTPLUG_TIMEOUT,
+    JAILER_ROOT,
+};
 use anyhow::{anyhow, Context, Result};
 use dbs_utils::net::MacAddr;
-use dragonball::{
-    api::v1::{
-        BlockDeviceConfigInfo, FsDeviceConfigInfo, FsMountConfigInfo, VirtioNetDeviceConfigInfo,
-        VsockDeviceConfigInfo,
-    },
-    device_manager::blk_dev_mgr::BlockDeviceType,
+use dragonball::api::v1::VhostUserConfig as DragonballVhostUserConfig;
+use dragonball::api::v1::{
+    BlockDeviceConfigInfo, FsDeviceConfigInfo, FsMountConfigInfo, NetworkInterfaceConfig,
+    VsockDeviceConfigInfo,
 };
-
-use super::DragonballInner;
-use crate::{
-    device::DeviceType, HybridVsockConfig, NetworkConfig, ShareFsDeviceConfig, ShareFsMountConfig,
-    ShareFsMountType, ShareFsOperation, VfioBusMode, VfioDevice, VmmState, JAILER_ROOT,
+use dragonball::config_manager::{RateLimiterConfigInfo, TokenBucketConfigInfo};
+use dragonball::device_manager::{
+    blk_dev_mgr::BlockDeviceType,
+    vfio_dev_mgr::{HostDeviceConfig, VfioPciDeviceConfig},
 };
+use kata_types::config::hypervisor::DEFAULT_RATE_LIMITER_REFILL_TIME;
+use virtio_bindings::bindings::virtio_blk::VIRTIO_BLK_ID_BYTES;
 
 const MB_TO_B: u32 = 1024 * 1024;
 const DEFAULT_VIRTIO_FS_NUM_QUEUES: i32 = 1;
@@ -29,54 +38,133 @@ const DEFAULT_VIRTIO_FS_QUEUE_SIZE: i32 = 1024;
 const VIRTIO_FS: &str = "virtio-fs";
 const INLINE_VIRTIO_FS: &str = "inline-virtio-fs";
 
-pub(crate) fn drive_index_to_id(index: u64) -> String {
-    format!("drive_{}", index)
-}
-
 impl DragonballInner {
-    pub(crate) async fn add_device(&mut self, device: DeviceType) -> Result<()> {
+    pub(crate) async fn add_device(&mut self, device: DeviceType) -> Result<DeviceType> {
         if self.state == VmmState::NotReady {
             info!(sl!(), "VMM not ready, queueing device {}", device);
 
             // add the pending device by reverse order, thus the
             // start_vm would pop the devices in an right order
             // to add the devices.
-            self.pending_devices.insert(0, device);
-            return Ok(());
+            self.pending_devices.insert(0, device.clone());
+            return Ok(device);
         }
 
         info!(sl!(), "dragonball add device {:?}", &device);
         match device {
-            DeviceType::Network(network) => self
-                .add_net_device(&network.config)
-                .context("add net device"),
-            DeviceType::Vfio(hostdev) => self.add_vfio_device(&hostdev).context("add vfio device"),
-            DeviceType::Block(block) => self
-                .add_block_device(
-                    block.config.path_on_host.as_str(),
-                    block.device_id.as_str(),
-                    block.config.is_readonly,
-                    block.config.no_drop,
-                )
-                .context("add block device"),
-            DeviceType::VhostUserBlk(block) => self
-                .add_block_device(
+            DeviceType::Network(network) => {
+                self.add_net_device(&network.config)
+                    .context("add net device")?;
+                Ok(DeviceType::Network(network))
+            }
+            DeviceType::Vfio(mut hostdev) => {
+                self.add_vfio_device(&mut hostdev)
+                    .context("add vfio device")?;
+
+                Ok(DeviceType::Vfio(hostdev))
+            }
+            DeviceType::BlockModern(block_device) => {
+                let (
+                    device_id,
+                    path_on_host,
+                    is_readonly,
+                    no_drop,
+                    is_direct,
+                    driver_option,
+                    sparse,
+                    serial_override,
+                ) = {
+                    let dev = block_device.lock().await;
+                    let cfg = &dev.config;
+                    (
+                        dev.device_id.clone(),
+                        cfg.path_on_host.clone(),
+                        cfg.is_readonly,
+                        cfg.no_drop,
+                        cfg.is_direct,
+                        cfg.driver_option.clone(),
+                        cfg.discard_unmap,
+                        cfg.serial_override.clone(),
+                    )
+                };
+
+                let use_pci_bus = if driver_option == KATA_BLK_DEV_TYPE {
+                    Some(true)
+                } else {
+                    None
+                };
+
+                info!(
+                    sl!(),
+                    "BlockModern hotplug: device_id={}, path={}, driver={}, readonly={}",
+                    device_id,
+                    path_on_host,
+                    driver_option,
+                    is_readonly,
+                );
+
+                let guest_device_id = self
+                    .add_block_device(
+                        &path_on_host,
+                        &device_id,
+                        is_readonly,
+                        no_drop,
+                        is_direct,
+                        use_pci_bus,
+                        sparse,
+                        if serial_override.is_empty() {
+                            None
+                        } else {
+                            Some(serial_override.as_str())
+                        },
+                    )
+                    .context("add block modern device")?;
+
+                info!(
+                    sl!(),
+                    "BlockModern hotplug result: device_id={}, guest_device_id={:?}",
+                    device_id,
+                    guest_device_id
+                );
+
+                if let Some(slot) = guest_device_id {
+                    if slot > 0 {
+                        let mut dev = block_device.lock().await;
+                        dev.config.pci_path = Some(PciPath::try_from(slot as u32)?);
+                    }
+                }
+
+                Ok(DeviceType::BlockModern(block_device))
+            }
+            DeviceType::VhostUserBlk(block) => {
+                self.add_block_device(
                     block.config.socket_path.as_str(),
                     block.device_id.as_str(),
                     block.is_readonly,
                     block.no_drop,
+                    None,
+                    None,
+                    false,
+                    None,
                 )
-                .context("add vhost user based block device"),
-            DeviceType::HybridVsock(hvsock) => self.add_hvsock(&hvsock.config).context("add vsock"),
-            DeviceType::ShareFs(sharefs) => self
-                .add_share_fs_device(&sharefs.config)
-                .context("add share fs device"),
-            DeviceType::ShareFsMount(sharefs_mount) => self
-                .add_share_fs_mount(&sharefs_mount.config)
-                .context("add share fs mount"),
-            DeviceType::Vsock(_) => {
-                todo!()
+                .context("add vhost user based block device")?;
+                Ok(DeviceType::VhostUserBlk(block))
             }
+            DeviceType::HybridVsock(hvsock) => {
+                self.add_hvsock(&hvsock.config).context("add vsock")?;
+                Ok(DeviceType::HybridVsock(hvsock))
+            }
+            DeviceType::ShareFs(sharefs) => {
+                self.add_share_fs_device(&sharefs.config)
+                    .context("add share fs device")?;
+                Ok(DeviceType::ShareFs(sharefs))
+            }
+            DeviceType::VhostUserNetwork(dev) => {
+                self.add_vhost_user_net_device(&dev.config)
+                    .context("add vhost-user-net device")?;
+                Ok(DeviceType::VhostUserNetwork(dev))
+            }
+            _ => Err(anyhow!("unsupported device {:?}", device)),
         }
     }
 
@@ -88,15 +176,15 @@ impl DragonballInner {
                 // Dragonball doesn't support remove network device, just print message.
                 info!(
                     sl!(),
-                    "dragonball remove network device: {:?}.", network.config.virt_iface_name
+                    "dragonball remove network device: {:?}.", network.config
                 );
 
                 Ok(())
             }
-            DeviceType::Block(block) => {
-                let drive_id = drive_index_to_id(block.config.index);
-                self.remove_block_drive(drive_id.as_str())
-                    .context("remove block drive")
+            DeviceType::BlockModern(block_device) => {
+                let device_id = block_device.lock().await.device_id.clone();
+                self.remove_block_drive(&device_id)
+                    .context("remove block modern drive")
             }
             DeviceType::Vfio(hostdev) => {
                 let primary_device = hostdev.devices.first().unwrap().clone();
@@ -108,94 +196,157 @@ impl DragonballInner {
         }
     }
 
-    fn add_vfio_device(&mut self, device: &VfioDevice) -> Result<()> {
-        let vfio_device = device.clone();
+    pub(crate) async fn update_device(&mut self, device: DeviceType) -> Result<()> {
+        info!(sl!(), "dragonball update device {:?}", &device);
+        match device {
+            DeviceType::ShareFs(sharefs_mount) => {
+                // It's safe to unwrap mount config as mount_config is always there.
+                self.add_share_fs_mount(&sharefs_mount.config.mount_config.unwrap())
+                    .context("update share-fs device with mount operation.")
+            }
+            _ => Err(anyhow!("unsupported device {:?} to update.", device)),
+        }
+    }
 
+    fn add_vfio_device(&mut self, device: &mut VfioDevice) -> Result<()> {
         // FIXME:
         // A device with multi-funtions, or a IOMMU group with one more
         // devices, the Primary device is selected to be passed to VM.
         // And the the first one is Primary device.
         // safe here, devices is not empty.
-        let primary_device = vfio_device.devices.first().unwrap().clone();
-
-        let vendor_device_id = if let Some(vd) = primary_device.device_vendor {
-            vd.get_device_vendor_id()?
+        let primary_device = device.devices.first_mut().unwrap();
+        let vendor_device_id = if let Some(vdc) = primary_device.device_vendor_class.as_ref() {
+            vdc.get_device_vendor_id()?
         } else {
             0
         };
 
-        let guest_dev_id = if let Some(pci_path) = primary_device.guest_pci_path {
-            // safe here, dragonball's pci device directly connects to root bus.
-            // usually, it has been assigned in vfio device manager.
-            pci_path.get_device_slot().unwrap().0
-        } else {
-            0
-        };
-
-        let bus_mode = VfioBusMode::to_string(vfio_device.bus_mode);
-
-        info!(sl!(), "Mock for dragonball insert host device.");
         info!(
             sl!(),
-            " Mock for dragonball insert host device. 
-            host device id: {:?}, 
-            bus_slot_func: {:?}, 
-            bus mod: {:?}, 
-            guest device id: {:?}, 
+            "insert host device.
+            host device id: {:?},
+            bus_slot_func: {:?},
             vendor/device id: {:?}",
             primary_device.hostdev_id,
             primary_device.bus_slot_func,
-            bus_mode,
-            guest_dev_id,
             vendor_device_id,
         );
 
-        // FIXME:
-        // interface implementation to be done when dragonball supports
-        // self.vmm_instance.insert_host_device(host_cfg)?;
+        let vfio_dev_config = VfioPciDeviceConfig {
+            bus_slot_func: primary_device.bus_slot_func.clone(),
+            vendor_device_id,
+            ..Default::default()
+        };
+        let host_dev_config = HostDeviceConfig {
+            hostdev_id: primary_device.hostdev_id.clone(),
+            sysfs_path: primary_device.sysfs_path.clone(),
+            dev_config: vfio_dev_config,
+        };
+
+        let guest_device_id = self
+            .vmm_instance
+            .insert_host_device(host_dev_config)
+            .context("insert host device failed")?;
+
+        // It's safe to unwrap guest_device_id as we can get a guest device id here.
+        primary_device.guest_pci_path = Some(PciPath::try_from(guest_device_id.unwrap() as u32)?);
 
         Ok(())
     }
 
     fn remove_vfio_device(&mut self, hostdev_id: String) -> Result<()> {
-        info!(
-            sl!(),
-            "Mock for dragonball remove host_device with hostdev id {:?}", hostdev_id
-        );
-        // FIXME:
-        // interface implementation to be done when dragonball supports
-        // self.vmm_instance.remove_host_device(hostdev_id)?;
+        info!(sl!(), "remove host_device with hostdev id {:?}", hostdev_id);
+
+        self.vmm_instance
+            .prepare_remove_host_device(&hostdev_id)
+            .context("prepare to remove host device failed")?;
+        self.vmm_instance
+            .remove_host_device(&hostdev_id)
+            .context("remove host device failed")?;
 
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn add_block_device(
         &mut self,
         path: &str,
         id: &str,
         read_only: bool,
         no_drop: bool,
-    ) -> Result<()> {
+        is_direct: Option<bool>,
+        use_pci_bus: Option<bool>,
+        sparse: bool,
+        serial: Option<&str>,
+    ) -> Result<Option<i32>> {
+        if serial.is_some_and(|serial| serial.len() > VIRTIO_BLK_ID_BYTES as usize) {
+            return Err(anyhow!(
+                "virtio-blk serial must not exceed {VIRTIO_BLK_ID_BYTES} bytes"
+            ));
+        }
         let jailed_drive = self.get_resource(path, id).context("get resource")?;
         self.cached_block_devices.insert(id.to_string());
 
+        let bandwidth = TokenBucketConfigInfo {
+            size: self.config.blockdev_info.disk_rate_limiter_bw_max_rate,
+            one_time_burst: self
+                .config
+                .blockdev_info
+                .disk_rate_limiter_bw_one_time_burst
+                .unwrap_or(0),
+            refill_time: DEFAULT_RATE_LIMITER_REFILL_TIME,
+        };
+
+        let ops = TokenBucketConfigInfo {
+            size: self.config.blockdev_info.disk_rate_limiter_ops_max_rate,
+            one_time_burst: self
+                .config
+                .blockdev_info
+                .disk_rate_limiter_ops_one_time_burst
+                .unwrap_or(0),
+            refill_time: DEFAULT_RATE_LIMITER_REFILL_TIME,
+        };
+        let block_rate_limit = RateLimiterConfigInfo { bandwidth, ops };
+
         let blk_cfg = BlockDeviceConfigInfo {
             drive_id: id.to_string(),
+            serial: serial.map(str::to_owned),
             device_type: BlockDeviceType::get_type(path),
-            path_on_host: PathBuf::from(jailed_drive),
-            is_direct: self.config.blockdev_info.block_device_cache_direct,
+            path_on_host: PathBuf::from(jailed_drive.clone()),
+            is_direct: is_direct.unwrap_or(self.config.blockdev_info.block_device_cache_direct),
             no_drop,
             is_read_only: read_only,
+            use_pci_bus,
+            sparse,
+            rate_limiter: Some(block_rate_limit),
             ..Default::default()
         };
-        self.vmm_instance
-            .insert_block_device(blk_cfg)
-            .context("insert block device")
+        info!(
+            sl!(),
+            "add_block_device: id={}, path={}, device_type={:?}, use_pci_bus={:?}, vm_running={}",
+            id,
+            jailed_drive,
+            BlockDeviceType::get_type(path),
+            use_pci_bus,
+            self.state == VmmState::VmRunning
+        );
+        let result = self
+            .vmm_instance
+            .insert_block_device(blk_cfg, Duration::from_millis(DEFAULT_HOTPLUG_TIMEOUT))
+            .context("insert block device");
+        match &result {
+            Ok(guest_id) => info!(
+                sl!(),
+                "add_block_device success: id={}, guest_id={:?}", id, guest_id
+            ),
+            Err(e) => error!(sl!(), "add_block_device failed: id={}, error={:?}", id, e),
+        }
+        result
     }
 
     fn remove_block_drive(&mut self, id: &str) -> Result<()> {
         self.vmm_instance
-            .remove_block_device(id)
+            .remove_block_device(id, Duration::from_millis(DEFAULT_HOTPLUG_TIMEOUT))
             .context("remove block device")?;
 
         if self.cached_block_devices.contains(id) && self.jailed {
@@ -207,26 +358,33 @@ impl DragonballInner {
     }
 
     fn add_net_device(&mut self, config: &NetworkConfig) -> Result<()> {
-        let iface_cfg = VirtioNetDeviceConfigInfo {
-            iface_id: config.virt_iface_name.clone(),
-            host_dev_name: config.host_dev_name.clone(),
-            guest_mac: match &config.guest_mac {
-                Some(mac) => MacAddr::from_bytes(&mac.0).ok(),
-                None => None,
-            },
-            num_queues: config.queue_num,
-            queue_size: config.queue_size as u16,
-            ..Default::default()
+        let net_cfg = build_dragonball_network_config(&self.config, config);
+        self.vmm_instance
+            .insert_network_device(net_cfg)
+            .context("insert network device")
+    }
+
+    /// Add vhost-user-net device to Dragonball
+    fn add_vhost_user_net_device(&mut self, config: &VhostUserConfig) -> Result<()> {
+        let guest_mac = MacAddr::parse_str(&config.mac_address).ok();
+        // `config.num_queues` is a queue *pair* count (1 RX + 1 TX per pair).
+        // Convert pairs into the actual queue count.
+        let num_queues = config.num_queues.max(1) * 2;
+        let net_cfg = NetworkInterfaceConfig {
+            num_queues: Some(num_queues),
+            queue_size: Some(config.queue_size as u16),
+            backend: dragonball::api::v1::Backend::VhostUser(DragonballVhostUserConfig {
+                iface_id: config.dev_id.clone(),
+                sock_path: config.socket_path.clone(),
+            }),
+            guest_mac,
+            use_shared_irq: None,
+            use_generic_irq: None,
         };
 
-        info!(
-            sl!(),
-            "add {} endpoint to {}", iface_cfg.host_dev_name, iface_cfg.iface_id
-        );
-
         self.vmm_instance
-            .insert_network_device(iface_cfg)
-            .context("insert network device")
+            .insert_network_device(net_cfg)
+            .context("insert vhost-user-net device")
     }
 
     fn add_hvsock(&mut self, config: &HybridVsockConfig) -> Result<()> {
@@ -266,7 +424,7 @@ impl DragonballInner {
             flags.add_flag("drop-sys-resource", &mut fs_cfg.drop_sys_resource);
             flags.add_flag("o", &mut opt_list);
         })
-        .with_context(|| format!("parse args: {:?}", args))?;
+        .with_context(|| format!("parse args: {args:?}"))?;
 
         // more options parsed for inline virtio-fs' custom config
         args.append(options);
@@ -309,7 +467,7 @@ impl DragonballInner {
         Ok(())
     }
 
-    fn add_share_fs_device(&self, config: &ShareFsDeviceConfig) -> Result<()> {
+    fn add_share_fs_device(&self, config: &ShareFsConfig) -> Result<()> {
         let mut fs_cfg = FsDeviceConfigInfo {
             sock_path: config.sock_path.clone(),
             tag: config.mount_tag.clone(),
@@ -361,9 +519,9 @@ impl DragonballInner {
 
     fn add_share_fs_mount(&mut self, config: &ShareFsMountConfig) -> Result<()> {
         let ops = match config.op {
-            ShareFsOperation::Mount => "mount",
-            ShareFsOperation::Umount => "umount",
-            ShareFsOperation::Update => "update",
+            ShareFsMountOperation::Mount => "mount",
+            ShareFsMountOperation::Umount => "umount",
+            ShareFsMountOperation::Update => "update",
         };
 
         let fstype = match config.fstype {
@@ -397,12 +555,52 @@ impl DragonballInner {
 #[cfg(test)]
 mod tests {
     use dragonball::api::v1::FsDeviceConfigInfo;
+    use tokio::sync::mpsc;
 
     use crate::dragonball::DragonballInner;
 
+    #[actix_rt::test]
+    async fn test_queue_guest_extension_images_before_boot() {
+        use crate::{BlockConfigModern, BlockDeviceModern, DeviceType};
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let (tx, _) = mpsc::channel(1);
+        let mut dragonball = DragonballInner::new(tx);
+        for name in ["coco", "devkit"] {
+            let device = BlockDeviceModern {
+                device_id: name.into(),
+                attach_count: 0,
+                config: BlockConfigModern {
+                    path_on_host: format!("/{name}.img"),
+                    is_readonly: true,
+                    driver_option: crate::KATA_BLK_DEV_TYPE.into(),
+                    serial_override: format!("extension-{name}"),
+                    ..Default::default()
+                },
+            };
+            dragonball
+                .add_device(DeviceType::BlockModern(Arc::new(Mutex::new(device))))
+                .await
+                .unwrap();
+        }
+        for name in ["coco", "devkit"] {
+            let DeviceType::BlockModern(device) = dragonball.pending_devices.pop().unwrap() else {
+                panic!("expected a cold-plugged block device");
+            };
+            let device = device.lock().await;
+            assert_eq!(device.config.path_on_host, format!("/{name}.img"));
+            assert_eq!(device.config.serial_override, format!("extension-{name}"));
+            assert!(device.config.is_readonly);
+            assert_eq!(device.config.driver_option, crate::KATA_BLK_DEV_TYPE);
+        }
+        assert!(dragonball.pending_devices.is_empty());
+    }
+
     #[test]
     fn test_parse_inline_virtiofs_args() {
-        let mut dragonball = DragonballInner::new();
+        let (tx, _) = mpsc::channel(1);
+        let mut dragonball = DragonballInner::new(tx);
         let mut fs_cfg = FsDeviceConfigInfo::default();
 
         // no_open and writeback_cache is the default, so test open and no_writeback_cache. "-d"

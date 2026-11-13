@@ -5,43 +5,66 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
-[ -z "${DEBUG}" ] || set -x
+[[ -z "${DEBUG}" ]] || set -x
 set -o errexit
 set -o nounset
 set -o pipefail
 set -o errtrace
 
-KATA_DEPLOY_DIR="`dirname ${0}`/../../kata-deploy"
-KATA_DEPLOY_ARTIFACT="${1:-"kata-static.tar.xz"}"
-REGISTRY="${2:-"quay.io/kata-containers/kata-deploy"}"
-TAG="${3:-}"
+SCRIPT_DIR="$(cd "$(dirname "${0}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
 
-echo "Copying ${KATA_DEPLOY_ARTIFACT} to ${KATA_DEPLOY_DIR}"
-cp ${KATA_DEPLOY_ARTIFACT} ${KATA_DEPLOY_DIR}
+REGISTRY="${1:-"quay.io/kata-containers/kata-deploy"}"
+TAG="${2:-}"
+ARTIFACTS_BUILD_DIR="${3:-${REPO_ROOT}/tools/packaging/kata-deploy/local-build/build}"
 
-pushd ${KATA_DEPLOY_DIR}
+KATA_DEPLOY_DIR="${REPO_ROOT}/tools/packaging/kata-deploy"
+ARTIFACTS_STAGE_DIR="${KATA_DEPLOY_DIR}/kata-artifacts"
+
+# Stage the component tarballs into a directory that is visible to the
+# Docker build context (local-build/ is excluded via .dockerignore).
+mkdir -p "${ARTIFACTS_STAGE_DIR}"
+cp "${ARTIFACTS_BUILD_DIR}"/kata-static-*.tar.zst "${ARTIFACTS_STAGE_DIR}/"
+cp "${ARTIFACTS_BUILD_DIR}"/kata-deploy-static-*.tar.zst "${ARTIFACTS_STAGE_DIR}/"
+
+cleanup() {
+	rm -rf "${ARTIFACTS_STAGE_DIR}"
+}
+trap cleanup EXIT
+
+# Match the version metadata in the merged release tarballs. Release builds
+# can run before the tag is published; development builds identify the commit.
+if [[ "${RELEASE:-no}" == "yes" ]]; then
+	cp "${REPO_ROOT}/VERSION" "${ARTIFACTS_STAGE_DIR}/VERSION"
+else
+	git -C "${REPO_ROOT}" describe --tags > "${ARTIFACTS_STAGE_DIR}/VERSION"
+fi
+
+pushd "${REPO_ROOT}"
 
 arch=$(uname -m)
-[ "$arch" = "x86_64" ] && arch="amd64"
-IMAGE_TAG="${REGISTRY}:kata-containers-$(git rev-parse HEAD)-${arch}"
+[[ "${arch}" = "x86_64" ]] && arch="amd64"
+[[ "${arch}" = "aarch64" ]] && arch="arm64"
+# Disable provenance and SBOM so each tag is a single image manifest. quay.io rejects
+# pushing multi-arch manifest lists that include attestation manifests ("manifest invalid").
+PLATFORM="linux/${arch}"
+COMMIT_TAG="kata-containers-$(git -C "${REPO_ROOT}" rev-parse HEAD)-${arch}"
+IMAGE_TAG="${REGISTRY}:${COMMIT_TAG}"
 
-sudo chown -R $USER $HOME/.docker
+DOCKERFILE="${REPO_ROOT}/tools/packaging/kata-deploy/Dockerfile"
 
-echo "Building the image"
-docker build --tag ${IMAGE_TAG} .
+echo "Building the kata-deploy image"
+docker buildx build --platform "${PLATFORM}" --provenance false --sbom false \
+	-f "${DOCKERFILE}" \
+	--tag "${IMAGE_TAG}" --push .
 
-echo "Pushing the image to the registry"
-docker push ${IMAGE_TAG}
-
-if [ -n "${TAG}" ]; then
+if [[ -n "${TAG}" ]]; then
 	ADDITIONAL_TAG="${REGISTRY}:${TAG}"
 
 	echo "Building the ${ADDITIONAL_TAG} image"
-
-	docker build --tag ${ADDITIONAL_TAG} .
-
-	echo "Pushing the image ${ADDITIONAL_TAG} to the registry"
-	docker push ${ADDITIONAL_TAG}
+	docker buildx build --platform "${PLATFORM}" --provenance false --sbom false \
+		-f "${DOCKERFILE}" \
+		--tag "${ADDITIONAL_TAG}" --push .
 fi
 
 popd

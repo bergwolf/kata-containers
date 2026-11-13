@@ -2,24 +2,20 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::net_util::MAC_ADDR_LEN;
 use crate::NamedHypervisorConfig;
+use crate::ProtectionDevConfig;
 use crate::VmConfig;
 use crate::{
-    guest_protection_is_tdx, ConsoleConfig, ConsoleOutputMode, CpuFeatures, CpuTopology,
-    CpusConfig, DiskConfig, MacAddr, MemoryConfig, PayloadConfig, PlatformConfig, PmemConfig,
-    RngConfig, VsockConfig,
+    ConsoleConfig, ConsoleOutputMode, CpuFeatures, CpuTopology, CpusConfig, DiskConfig, ImageType,
+    MemoryConfig, MemoryZoneConfig, PayloadConfig, PmemConfig, RngConfig, VsockConfig,
 };
-use anyhow::{anyhow, Context, Result};
-use kata_sys_util::protection::GuestProtection;
+use anyhow::Result;
 use kata_types::config::default::DEFAULT_CH_ENTROPY_SOURCE;
 use kata_types::config::hypervisor::Hypervisor as HypervisorConfig;
-use kata_types::config::hypervisor::{
-    CpuInfo, MachineInfo, MemoryInfo, VIRTIO_BLK_MMIO, VIRTIO_BLK_PCI,
-};
+use kata_types::config::hypervisor::{CpuInfo, MachineInfo, MemoryInfo};
 use kata_types::config::BootInfo;
 use std::convert::TryFrom;
-use std::fmt::Display;
+use std::fs;
 use std::path::PathBuf;
 
 use crate::errors::*;
@@ -31,61 +27,16 @@ const PMEM_ALIGN_BYTES: u64 = 2 * MIB;
 
 const DEFAULT_CH_MAX_PHYS_BITS: u8 = 46;
 
-const DEFAULT_VSOCK_CID: u64 = 3;
+const DEFAULT_VSOCK_CID: u32 = 3;
 
 pub const DEFAULT_NUM_PCI_SEGMENTS: u16 = 1;
 
 pub const DEFAULT_DISK_QUEUES: usize = 1;
 pub const DEFAULT_DISK_QUEUE_SIZE: u16 = 128;
 
-// TDX requires all rootfs's be mounted using a block device. This test
-// ensures that the user has a correct set of values for the following Kata
-// Containers configuration "hypervisor" section variables:
-//
-// - block_device_driver=
-// - vm_rootfs_driver=
-//
-fn check_tdx_rootfs_settings(
-    cfg: &HypervisorConfig,
-    guest_protection_to_use: &GuestProtection,
-) -> Result<(), VmConfigError> {
-    if guest_protection_is_tdx(guest_protection_to_use.clone()) {
-        let block_drivers = [VIRTIO_BLK_MMIO, VIRTIO_BLK_PCI];
-
-        let using_image = !cfg.boot_info.image.is_empty();
-
-        if !using_image {
-            return Err(VmConfigError::TDXDisallowsInitrd);
-        }
-
-        // Check the hypervisor rootfs configuration variables
-        // for validity.
-        let block_device_driver = cfg.blockdev_info.block_device_driver.clone();
-        let vm_rootfs_driver = cfg.boot_info.vm_rootfs_driver.clone();
-
-        if !block_drivers.contains(&block_device_driver.as_str()) {
-            return Err(VmConfigError::TDXContainerRootfsNotVirtioBlk);
-        }
-
-        // It doesn't matter what the VM rootfs driver is when using an initrd
-        // as this is not passed as a block device (it's handled with a
-        // PayloadConfig).
-        if using_image && !block_drivers.contains(&vm_rootfs_driver.as_str()) {
-            return Err(VmConfigError::TDXVMRootfsNotVirtioBlk);
-        }
-    }
-
-    Ok(())
-}
-
 impl TryFrom<NamedHypervisorConfig> for VmConfig {
     type Error = VmConfigError;
 
-    // XXX: Note that this function assumes that if
-    // NamedHypervisorConfig.guest_protection_to_use is set, that a protected guest
-    // should be created. In other words, the check to ensure that suitable
-    // hardware guest protection is available should already have been
-    // confirmed at this point!
     fn try_from(n: NamedHypervisorConfig) -> Result<Self, Self::Error> {
         let kernel_params = if n.kernel_params.is_empty() {
             None
@@ -97,15 +48,7 @@ impl TryFrom<NamedHypervisorConfig> for VmConfig {
 
         let debug = cfg.debug_info.enable_debug;
 
-        let guest_protection_to_use = n.guest_protection_to_use;
-
-        check_tdx_rootfs_settings(&cfg, &guest_protection_to_use)?;
-
-        let vsock_socket_path = if n.vsock_socket_path.is_empty() {
-            return Err(VmConfigError::EmptyVsockSocketPath);
-        } else {
-            n.vsock_socket_path
-        };
+        let vsock_socket_path = n.vsock_socket_path;
 
         let sandbox_path = if n.sandbox_path.is_empty() {
             return Err(VmConfigError::EmptySandboxPath);
@@ -115,23 +58,25 @@ impl TryFrom<NamedHypervisorConfig> for VmConfig {
 
         let fs = n.shared_fs_devices;
         let net = n.network_devices;
+        let host_devices = n.host_devices;
+        let boot_disks = n.boot_disks;
+        let protection_dev = n.protection_device;
 
-        let cpus = CpusConfig::try_from((cfg.cpu_info, guest_protection_to_use.clone()))
-            .map_err(VmConfigError::CPUError)?;
+        let template_memory = if cfg.vm_template.boot_to_be_template {
+            Some(template_memory_config(&cfg).map_err(VmConfigError::MemoryError)?)
+        } else {
+            None
+        };
+
+        let cpus = CpusConfig::try_from(cfg.cpu_info).map_err(VmConfigError::CPUError)?;
 
         let rng = RngConfig::from(cfg.machine_info);
 
         // Note how CH handles the different image types:
         //
-        // - A standard image is specified in PmemConfig.
         // - An initrd/initramfs is specified in PayloadConfig.
-        // - A confidential guest image is specified by a DiskConfig.
-        //   - If TDX is enabled, the firmware (`td-shim` [1]) must be
-        //     specified in PayloadConfig.
-        // - A confidential guest initrd is specified by a PayloadConfig with
-        //   firmware.
-        //
-        // [1] - https://github.com/confidential-containers/td-shim
+        // - An image is specified in DiskConfig.
+        //   Note: pmem is not used as it's not properly supported by Cloud Hypervisor.
         let boot_info = cfg.boot_info;
 
         let use_initrd = !boot_info.initrd.is_empty();
@@ -145,38 +90,34 @@ impl TryFrom<NamedHypervisorConfig> for VmConfig {
             return Err(VmConfigError::NoBootFile);
         }
 
-        let pmem = if use_initrd || guest_protection_is_tdx(guest_protection_to_use.clone()) {
-            None
-        } else {
-            let pmem = PmemConfig::try_from(&boot_info).map_err(VmConfigError::PmemError)?;
-
-            Some(vec![pmem])
-        };
-
         let payload = Some(
-            PayloadConfig::try_from((
-                boot_info.clone(),
-                kernel_params,
-                guest_protection_to_use.clone(),
-            ))
-            .map_err(VmConfigError::PayloadError)?,
+            PayloadConfig::try_from((boot_info.clone(), kernel_params, protection_dev))
+                .map_err(VmConfigError::PayloadError)?,
         );
 
         let mut disks: Vec<DiskConfig> = vec![];
 
-        if use_image && guest_protection_is_tdx(guest_protection_to_use.clone()) {
+        if use_image {
             let disk = DiskConfig::try_from(boot_info).map_err(VmConfigError::DiskError)?;
 
             disks.push(disk);
         };
 
+        // Append the cold-plugged block devices (such as the initdata image)
+        // after the VM rootfs so that the rootfs keeps the first slot.
+        if let Some(boot_disks) = boot_disks {
+            disks.extend(boot_disks);
+        }
+
         let disks = if !disks.is_empty() { Some(disks) } else { None };
 
-        let serial = get_serial_cfg(debug, guest_protection_to_use.clone());
-        let console = get_console_cfg(debug, guest_protection_to_use.clone());
+        let serial = get_serial_cfg(debug);
+        let console = get_console_cfg();
 
-        let memory = MemoryConfig::try_from((cfg.memory_info, guest_protection_to_use.clone()))
-            .map_err(VmConfigError::MemoryError)?;
+        let memory = match template_memory {
+            Some(memory) => memory,
+            None => MemoryConfig::try_from(cfg.memory_info).map_err(VmConfigError::MemoryError)?,
+        };
 
         std::fs::create_dir_all(sandbox_path.clone())
             .map_err(|e| VmConfigError::SandboxError(sandbox_path, e.to_string()))?;
@@ -184,7 +125,14 @@ impl TryFrom<NamedHypervisorConfig> for VmConfig {
         let vsock = VsockConfig::try_from((vsock_socket_path, DEFAULT_VSOCK_CID))
             .map_err(VmConfigError::VsockError)?;
 
-        let platform = get_platform_cfg(guest_protection_to_use);
+        let balloon = if cfg.device_info.reclaim_guest_freed_memory {
+            Some(crate::BalloonConfig {
+                free_page_reporting: true,
+                ..Default::default()
+            })
+        } else {
+            None
+        };
 
         let cfg = VmConfig {
             cpus,
@@ -194,11 +142,11 @@ impl TryFrom<NamedHypervisorConfig> for VmConfig {
             payload,
             fs,
             net,
-            pmem,
+            devices: host_devices,
             disks,
             vsock: Some(vsock),
             rng,
-            platform,
+            balloon,
 
             ..Default::default()
         };
@@ -207,10 +155,10 @@ impl TryFrom<NamedHypervisorConfig> for VmConfig {
     }
 }
 
-impl TryFrom<(String, u64)> for VsockConfig {
+impl TryFrom<(String, u32)> for VsockConfig {
     type Error = VsockConfigError;
 
-    fn try_from(args: (String, u64)) -> Result<Self, Self::Error> {
+    fn try_from(args: (String, u32)) -> Result<Self, Self::Error> {
         let vsock_socket_path = args.0;
         let cid = args.1;
 
@@ -231,13 +179,10 @@ impl TryFrom<(String, u64)> for VsockConfig {
     }
 }
 
-impl TryFrom<(MemoryInfo, GuestProtection)> for MemoryConfig {
+impl TryFrom<MemoryInfo> for MemoryConfig {
     type Error = MemoryConfigError;
 
-    fn try_from(args: (MemoryInfo, GuestProtection)) -> Result<Self, Self::Error> {
-        let mem = args.0;
-        let guest_protection_to_use = args.1;
-
+    fn try_from(mem: MemoryInfo) -> Result<Self, Self::Error> {
         if mem.default_memory == 0 {
             return Err(MemoryConfigError::NoDefaultMemory);
         }
@@ -255,23 +200,18 @@ impl TryFrom<(MemoryInfo, GuestProtection)> for MemoryConfig {
             return Err(MemoryConfigError::DefaultMemSizeTooBig);
         }
 
-        let hotplug_size = if guest_protection_is_tdx(guest_protection_to_use) {
-            None
-        } else {
-            // The amount of memory that can be hot-plugged is the total less the
-            // amount allocated at VM start.
-            let hotplug_size_bytes = max_mem_bytes
-                .checked_sub(mem_bytes)
+        // The amount of memory that can be hot-plugged is the total less the
+        // amount allocated at VM start.
+        let hotplug_size_bytes = max_mem_bytes
+            .checked_sub(mem_bytes)
+            .ok_or(())
+            .map_err(|_| MemoryConfigError::BadMemSizeForHotplug(max_mem_bytes))?;
+
+        let hotplug_size = Some(
+            checked_next_multiple_of(hotplug_size_bytes, PMEM_ALIGN_BYTES)
                 .ok_or(())
-                .map_err(|_| MemoryConfigError::BadMemSizeForHotplug(max_mem_bytes))?;
-
-            let aligned_hotplug_size_bytes =
-                checked_next_multiple_of(hotplug_size_bytes, PMEM_ALIGN_BYTES)
-                    .ok_or(())
-                    .map_err(|_| MemoryConfigError::BadPmemAlign(hotplug_size_bytes))?;
-
-            Some(aligned_hotplug_size_bytes)
-        };
+                .map_err(|_| MemoryConfigError::BadPmemAlign(hotplug_size_bytes))?,
+        );
 
         let cfg = MemoryConfig {
             size: mem_bytes,
@@ -281,11 +221,57 @@ impl TryFrom<(MemoryInfo, GuestProtection)> for MemoryConfig {
 
             hotplug_size,
 
+            prefault: mem.enable_mem_prealloc,
+
             ..Default::default()
         };
 
         Ok(cfg)
     }
+}
+
+/// Builds the file-backed memory configuration for creating a source template VM.
+fn template_memory_config(cfg: &HypervisorConfig) -> Result<MemoryConfig, MemoryConfigError> {
+    let mem = cfg.memory_info.clone();
+
+    if mem.default_memory == 0 {
+        return Err(MemoryConfigError::NoDefaultMemory);
+    }
+
+    if cfg.vm_template.memory_path.is_empty() {
+        return Err(MemoryConfigError::NoTemplateMemoryPath);
+    }
+
+    fs::metadata(&cfg.vm_template.memory_path).map_err(|e| {
+        MemoryConfigError::TemplateMemoryPathNotAccessible(format!(
+            "{}: {}",
+            cfg.vm_template.memory_path, e
+        ))
+    })?;
+
+    if cfg.shared_fs.shared_fs.is_some() {
+        return Err(MemoryConfigError::TemplateRequiresNoSharedFs);
+    }
+
+    let mem_bytes = MIB
+        .checked_mul(u64::from(mem.default_memory))
+        .ok_or(MemoryConfigError::BadDefaultMemSize(mem.default_memory))?;
+    let zone = MemoryZoneConfig {
+        id: "mem0".to_string(),
+        size: mem_bytes,
+        file: Some(PathBuf::from(&cfg.vm_template.memory_path)),
+        shared: true,
+        prefault: mem.enable_mem_prealloc,
+        ..Default::default()
+    };
+
+    Ok(MemoryConfig {
+        size: 0,
+        shared: true,
+        prefault: mem.enable_mem_prealloc,
+        zones: Some(vec![zone]),
+        ..Default::default()
+    })
 }
 
 // Return the next multiple of 'multiple' starting from the specified value
@@ -295,53 +281,42 @@ impl TryFrom<(MemoryInfo, GuestProtection)> for MemoryConfig {
 // method is available in the rust language.
 //
 // See: https://github.com/rust-lang/rust/issues/88581
-fn checked_next_multiple_of(value: u64, multiple: u64) -> Option<u64> {
+pub fn checked_next_multiple_of(value: u64, multiple: u64) -> Option<u64> {
     match value.checked_rem(multiple) {
         None => Some(value),
         Some(r) => value.checked_add(multiple - r),
     }
 }
 
-impl TryFrom<(CpuInfo, GuestProtection)> for CpusConfig {
+impl TryFrom<CpuInfo> for CpusConfig {
     type Error = CpusConfigError;
 
-    fn try_from(args: (CpuInfo, GuestProtection)) -> Result<Self, Self::Error> {
-        let cpu = args.0;
-
-        let guest_protection_to_use = args.1;
-
+    fn try_from(cpu: CpuInfo) -> Result<Self, Self::Error> {
         // This can only happen if runtime-rs fails to set default values.
-        if cpu.default_vcpus <= 0 {
+        if cpu.default_vcpus <= 0.0 {
             return Err(CpusConfigError::BootVCPUsTooSmall);
         }
 
-        let default_vcpus =
-            u8::try_from(cpu.default_vcpus).map_err(CpusConfigError::BootVCPUsTooBig)?;
+        let default_vcpus = cpu.default_vcpus.ceil() as u32;
 
         // This can only happen if runtime-rs fails to set default values.
         if cpu.default_maxvcpus == 0 {
             return Err(CpusConfigError::MaxVCPUsTooSmall);
         }
 
-        let default_max_vcpus =
-            u8::try_from(cpu.default_maxvcpus).map_err(CpusConfigError::MaxVCPUsTooBig)?;
-
         let boot_vcpus = default_vcpus;
 
-        let max_vcpus = if guest_protection_is_tdx(guest_protection_to_use.clone()) {
-            // Hotplug is not available with TDX so limit to number of boot
-            // cpus.
-            default_vcpus
-        } else {
-            default_max_vcpus
-        };
+        let max_vcpus = cpu.default_maxvcpus;
 
         if boot_vcpus > max_vcpus {
             return Err(CpusConfigError::BootVPUsGtThanMaxVCPUs);
         }
 
+        let cores_per_die =
+            u16::try_from(max_vcpus).map_err(CpusConfigError::MaxVCPUsTooBigForTopology)?;
+
         let topology = CpuTopology {
-            cores_per_die: max_vcpus,
+            cores_per_die,
             threads_per_core: 1,
             dies_per_package: 1,
             packages: 1,
@@ -354,6 +329,7 @@ impl TryFrom<(CpuInfo, GuestProtection)> for CpusConfig {
         let cfg = CpusConfig {
             boot_vcpus,
             max_vcpus,
+            nested: cpu.disable_nested_virtualization.map(|value| !value),
             max_phys_bits,
             topology: Some(topology),
             features,
@@ -386,15 +362,17 @@ impl From<String> for CpuFeatures {
 //   The kernel params cannot be created only from BootInfo since that contains
 //   the user-specified kernel parameters only.
 //
-// - The 3rd tuple element determines if TDX is enabled.
+// - The 3rd tuple element is the optional protection device configuration.
 //
-impl TryFrom<(BootInfo, Option<String>, GuestProtection)> for PayloadConfig {
+impl TryFrom<(BootInfo, Option<String>, Option<ProtectionDevConfig>)> for PayloadConfig {
     type Error = PayloadConfigError;
 
-    fn try_from(args: (BootInfo, Option<String>, GuestProtection)) -> Result<Self, Self::Error> {
+    fn try_from(
+        args: (BootInfo, Option<String>, Option<ProtectionDevConfig>),
+    ) -> Result<Self, Self::Error> {
         let boot_info = args.0;
         let cmdline = args.1;
-        let guest_protection_to_use = args.2;
+        let protection_device = args.2;
 
         // The kernel is always specified here,
         // not in the top level VmConfig.kernel.
@@ -410,16 +388,16 @@ impl TryFrom<(BootInfo, Option<String>, GuestProtection)> for PayloadConfig {
             Some(PathBuf::from(boot_info.initrd))
         };
 
-        let firmware = if guest_protection_is_tdx(guest_protection_to_use) {
-            if boot_info.firmware.is_empty() {
-                return Err(PayloadConfigError::TDXFirmwareMissing);
-            } else {
-                Some(PathBuf::from(boot_info.firmware))
-            }
-        } else if boot_info.firmware.is_empty() {
+        let firmware = if boot_info.firmware.is_empty() {
             None
         } else {
             Some(PathBuf::from(boot_info.firmware))
+        };
+
+        let host_data = if let Some(ref data) = protection_device {
+            data.host_data.clone()
+        } else {
+            None
         };
 
         let payload = PayloadConfig {
@@ -427,6 +405,7 @@ impl TryFrom<(BootInfo, Option<String>, GuestProtection)> for PayloadConfig {
             initramfs,
             cmdline,
             firmware,
+            host_data,
         };
 
         Ok(payload)
@@ -446,6 +425,7 @@ impl TryFrom<BootInfo> for DiskConfig {
         let disk = DiskConfig {
             path: Some(path),
             readonly: true,
+            image_type: ImageType::Raw,
             num_queues: DEFAULT_DISK_QUEUES,
             queue_size: DEFAULT_DISK_QUEUE_SIZE,
 
@@ -493,10 +473,8 @@ impl TryFrom<&BootInfo> for PmemConfig {
     }
 }
 
-fn get_serial_cfg(debug: bool, guest_protection_to_use: GuestProtection) -> ConsoleConfig {
-    let mode = if guest_protection_is_tdx(guest_protection_to_use) {
-        ConsoleOutputMode::Off
-    } else if debug {
+fn get_serial_cfg(debug: bool) -> ConsoleConfig {
+    let mode = if debug {
         ConsoleOutputMode::Tty
     } else {
         ConsoleOutputMode::Off
@@ -505,91 +483,31 @@ fn get_serial_cfg(debug: bool, guest_protection_to_use: GuestProtection) -> Cons
     ConsoleConfig {
         file: None,
         mode,
-        iommu: false,
+        iommu: false.into(),
     }
 }
 
-fn get_console_cfg(debug: bool, guest_protection_to_use: GuestProtection) -> ConsoleConfig {
-    let mode = if guest_protection_is_tdx(guest_protection_to_use) {
-        if debug {
-            ConsoleOutputMode::Tty
-        } else {
-            ConsoleOutputMode::Off
-        }
-    } else {
-        ConsoleOutputMode::Off
-    };
-
+fn get_console_cfg() -> ConsoleConfig {
     ConsoleConfig {
         file: None,
-        mode,
-        iommu: false,
+        mode: ConsoleOutputMode::Off,
+        iommu: false.into(),
     }
-}
-
-fn get_platform_cfg(guest_protection_to_use: GuestProtection) -> Option<PlatformConfig> {
-    if guest_protection_is_tdx(guest_protection_to_use) {
-        let platform = PlatformConfig {
-            tdx: true,
-            num_pci_segments: DEFAULT_NUM_PCI_SEGMENTS,
-
-            ..Default::default()
-        };
-
-        Some(platform)
-    } else {
-        None
-    }
-}
-
-#[allow(dead_code)]
-fn parse_mac<S>(s: &S) -> Result<MacAddr>
-where
-    S: AsRef<str> + ?Sized + Display,
-{
-    let v: Vec<&str> = s.as_ref().split(':').collect();
-    let mut bytes = [0u8; MAC_ADDR_LEN];
-
-    if v.len() != MAC_ADDR_LEN {
-        return Err(anyhow!(
-            "invalid MAC {} (length {}, expected {})",
-            s,
-            v.len(),
-            MAC_ADDR_LEN
-        ));
-    }
-
-    for i in 0..MAC_ADDR_LEN {
-        if v[i].len() != 2 {
-            return Err(anyhow!(
-                "invalid MAC {} (segment {} length {}, expected {})",
-                s,
-                i,
-                v.len(),
-                2
-            ));
-        }
-
-        bytes[i] =
-            u8::from_str_radix(v[i], 16).context(format!("failed to parse MAC address: {}", s))?;
-    }
-
-    Ok(MacAddr { bytes })
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::HotplugMethod;
+
     use super::*;
-    use kata_types::config::hypervisor::{
-        BlockDeviceInfo, Hypervisor as HypervisorConfig, SecurityInfo,
-    };
+    use kata_types::config::default::MAX_CH_VCPUS;
+    use kata_types::config::hypervisor::Hypervisor as HypervisorConfig;
 
     // Generate a valid generic memory info object and a valid CH specific
     // memory config object.
     fn make_memory_objects(
         default_memory_mib: u32,
         usable_max_mem_bytes: u64,
-        confidential_guest: bool,
     ) -> (MemoryInfo, MemoryConfig) {
         let mem_info = MemoryInfo {
             default_memory: default_memory_mib,
@@ -597,14 +515,10 @@ mod tests {
             ..Default::default()
         };
 
-        let hotplug_size = if confidential_guest {
-            None
-        } else {
-            checked_next_multiple_of(
-                usable_max_mem_bytes - (default_memory_mib as u64 * MIB),
-                PMEM_ALIGN_BYTES,
-            )
-        };
+        let hotplug_size = checked_next_multiple_of(
+            usable_max_mem_bytes - (default_memory_mib as u64 * MIB),
+            PMEM_ALIGN_BYTES,
+        );
 
         let mem_cfg = MemoryConfig {
             size: default_memory_mib as u64 * MIB,
@@ -629,31 +543,22 @@ mod tests {
         }
     }
 
-    fn make_cpu_objects(cpu_default: u8, cpu_max: u8, tdx: bool) -> (CpuInfo, CpusConfig) {
-        let default_maxvcpus = if tdx {
-            cpu_default as u32
-        } else {
-            cpu_max as u32
-        };
-
+    fn make_cpu_objects(cpu_default: u32, cpu_max: u32) -> (CpuInfo, CpusConfig) {
         let cpu_info = CpuInfo {
-            default_vcpus: cpu_default as i32,
-            default_maxvcpus,
+            default_vcpus: cpu_default as f32,
+            default_maxvcpus: cpu_max,
 
             ..Default::default()
         };
 
-        let max_vcpus = if tdx {
-            cpu_default
-        } else {
-            default_maxvcpus as u8
-        };
+        let max_vcpus = cpu_max;
 
         let cpus_config = CpusConfig {
             boot_vcpus: cpu_default,
             max_vcpus,
+            nested: None,
             topology: Some(CpuTopology {
-                cores_per_die: max_vcpus,
+                cores_per_die: u16::try_from(max_vcpus).unwrap(),
 
                 ..make_bare_topology()
             }),
@@ -692,6 +597,7 @@ mod tests {
         let disk_config = DiskConfig {
             path: Some(PathBuf::from(path)),
             readonly: true,
+            image_type: ImageType::Raw,
             num_queues: DEFAULT_DISK_QUEUES,
             queue_size: DEFAULT_DISK_QUEUE_SIZE,
 
@@ -701,7 +607,7 @@ mod tests {
         (boot_info, disk_config)
     }
 
-    // Create BootInfo and PayloadConfig objects for non-TDX scenarios.
+    // Create BootInfo and PayloadConfig objects.
     fn make_bootinfo_payloadconfig_objects(
         kernel: &str,
         initramfs: &str,
@@ -732,6 +638,7 @@ mod tests {
             initramfs: Some(PathBuf::from(initramfs)),
             firmware: payload_firmware,
             cmdline,
+            host_data: None,
         };
 
         (boot_info, payload_config)
@@ -758,63 +665,24 @@ mod tests {
         #[derive(Debug)]
         struct TestData {
             debug: bool,
-            guest_protection: GuestProtection,
             result: ConsoleConfig,
         }
 
         let tests = &[
             TestData {
                 debug: false,
-                guest_protection: GuestProtection::NoProtection,
                 result: ConsoleConfig {
                     file: None,
                     mode: ConsoleOutputMode::Off,
-                    iommu: false,
+                    iommu: false.into(),
                 },
             },
             TestData {
                 debug: true,
-                guest_protection: GuestProtection::NoProtection,
                 result: ConsoleConfig {
                     file: None,
                     mode: ConsoleOutputMode::Tty,
-                    iommu: false,
-                },
-            },
-            TestData {
-                debug: false,
-                guest_protection: GuestProtection::Tdx,
-                result: ConsoleConfig {
-                    file: None,
-                    mode: ConsoleOutputMode::Off,
-                    iommu: false,
-                },
-            },
-            TestData {
-                debug: true,
-                guest_protection: GuestProtection::Tdx,
-                result: ConsoleConfig {
-                    file: None,
-                    mode: ConsoleOutputMode::Off,
-                    iommu: false,
-                },
-            },
-            TestData {
-                debug: false,
-                guest_protection: GuestProtection::Pef,
-                result: ConsoleConfig {
-                    file: None,
-                    mode: ConsoleOutputMode::Off,
-                    iommu: false,
-                },
-            },
-            TestData {
-                debug: true,
-                guest_protection: GuestProtection::Pef,
-                result: ConsoleConfig {
-                    file: None,
-                    mode: ConsoleOutputMode::Tty,
-                    iommu: false,
+                    iommu: false.into(),
                 },
             },
         ];
@@ -822,7 +690,7 @@ mod tests {
         for (i, d) in tests.iter().enumerate() {
             let msg = format!("test[{}]: {:?}", i, d);
 
-            let result = get_serial_cfg(d.debug, d.guest_protection.clone());
+            let result = get_serial_cfg(d.debug);
 
             let msg = format!("{}: actual result: {:?}", msg, result);
 
@@ -838,126 +706,14 @@ mod tests {
 
     #[test]
     fn test_get_console_cfg() {
-        #[derive(Debug)]
-        struct TestData {
-            debug: bool,
-            guest_protection: GuestProtection,
-            result: ConsoleConfig,
-        }
-
-        let tests = &[
-            TestData {
-                debug: false,
-                guest_protection: GuestProtection::NoProtection,
-                result: ConsoleConfig {
-                    file: None,
-                    mode: ConsoleOutputMode::Off,
-                    iommu: false,
-                },
-            },
-            TestData {
-                debug: true,
-                guest_protection: GuestProtection::NoProtection,
-                result: ConsoleConfig {
-                    file: None,
-                    mode: ConsoleOutputMode::Off,
-                    iommu: false,
-                },
-            },
-            TestData {
-                debug: false,
-                guest_protection: GuestProtection::Tdx,
-                result: ConsoleConfig {
-                    file: None,
-                    mode: ConsoleOutputMode::Off,
-                    iommu: false,
-                },
-            },
-            TestData {
-                debug: true,
-                guest_protection: GuestProtection::Tdx,
-                result: ConsoleConfig {
-                    file: None,
-                    mode: ConsoleOutputMode::Tty,
-                    iommu: false,
-                },
-            },
-            TestData {
-                debug: false,
-                guest_protection: GuestProtection::Pef,
-                result: ConsoleConfig {
-                    file: None,
-                    mode: ConsoleOutputMode::Off,
-                    iommu: false,
-                },
-            },
-            TestData {
-                debug: true,
-                guest_protection: GuestProtection::Pef,
-                result: ConsoleConfig {
-                    file: None,
-                    mode: ConsoleOutputMode::Off,
-                    iommu: false,
-                },
-            },
-        ];
-
-        for (i, d) in tests.iter().enumerate() {
-            let msg = format!("test[{}]: {:?}", i, d);
-
-            let result = get_console_cfg(d.debug, d.guest_protection.clone());
-
-            let msg = format!("{}: actual result: {:?}", msg, result);
-
-            if std::env::var("DEBUG").is_ok() {
-                eprintln!("DEBUG: {}", msg);
+        assert_eq!(
+            get_console_cfg(),
+            ConsoleConfig {
+                file: None,
+                mode: ConsoleOutputMode::Off,
+                iommu: false.into(),
             }
-
-            assert_eq!(result, d.result, "{}", msg);
-        }
-    }
-
-    #[test]
-    fn test_get_platform_cfg() {
-        #[derive(Debug)]
-        struct TestData {
-            guest_protection: GuestProtection,
-            result: Option<PlatformConfig>,
-        }
-
-        let tests = &[
-            TestData {
-                guest_protection: GuestProtection::NoProtection,
-                result: None,
-            },
-            TestData {
-                guest_protection: GuestProtection::Tdx,
-                result: Some(PlatformConfig {
-                    tdx: true,
-                    num_pci_segments: DEFAULT_NUM_PCI_SEGMENTS,
-
-                    ..Default::default()
-                }),
-            },
-            TestData {
-                guest_protection: GuestProtection::Pef,
-                result: None,
-            },
-        ];
-
-        for (i, d) in tests.iter().enumerate() {
-            let msg = format!("test[{}]: {:?}", i, d);
-
-            let result = get_platform_cfg(d.guest_protection.clone());
-
-            let msg = format!("{}: actual result: {:?}", msg, result);
-
-            if std::env::var("DEBUG").is_ok() {
-                eprintln!("DEBUG: {}", msg);
-            }
-
-            assert_eq!(result, d.result, "{}", msg);
-        }
+        );
     }
 
     #[test]
@@ -994,15 +750,10 @@ mod tests {
                 eprintln!("DEBUG: {}", msg);
             }
 
-            if d.result.is_err() {
+            if let Err(expected_err) = &d.result {
                 assert!(result.is_err(), "{}", msg);
 
-                assert_eq!(
-                    &result.unwrap_err(),
-                    d.result.as_ref().unwrap_err(),
-                    "{}",
-                    msg
-                );
+                assert_eq!(&result.unwrap_err(), expected_err, "{}", msg);
 
                 continue;
             }
@@ -1171,7 +922,6 @@ mod tests {
         #[derive(Debug)]
         struct TestData {
             cpu_info: CpuInfo,
-            guest_protection: GuestProtection,
             result: Result<CpusConfig, CpusConfigError>,
         }
 
@@ -1180,48 +930,44 @@ mod tests {
         let tests = &[
             TestData {
                 cpu_info: CpuInfo::default(),
-                guest_protection: GuestProtection::NoProtection,
                 result: Err(CpusConfigError::BootVCPUsTooSmall),
             },
             TestData {
                 cpu_info: CpuInfo {
-                    default_vcpus: -1,
+                    default_vcpus: -1.0,
 
                     ..Default::default()
                 },
-                guest_protection: GuestProtection::NoProtection,
                 result: Err(CpusConfigError::BootVCPUsTooSmall),
             },
             TestData {
                 cpu_info: CpuInfo {
-                    default_vcpus: 1,
+                    default_vcpus: 1.0,
                     default_maxvcpus: 0,
 
                     ..Default::default()
                 },
-                guest_protection: GuestProtection::NoProtection,
                 result: Err(CpusConfigError::MaxVCPUsTooSmall),
             },
             TestData {
                 cpu_info: CpuInfo {
-                    default_vcpus: 9,
+                    default_vcpus: 9.0,
                     default_maxvcpus: 7,
 
                     ..Default::default()
                 },
-                guest_protection: GuestProtection::NoProtection,
                 result: Err(CpusConfigError::BootVPUsGtThanMaxVCPUs),
             },
             TestData {
                 cpu_info: CpuInfo {
-                    default_vcpus: 1,
+                    default_vcpus: 1.0,
                     default_maxvcpus: 1,
                     ..Default::default()
                 },
-                guest_protection: GuestProtection::NoProtection,
                 result: Ok(CpusConfig {
                     boot_vcpus: 1,
                     max_vcpus: 1,
+                    nested: None,
                     topology: Some(CpuTopology {
                         cores_per_die: 1,
 
@@ -1234,14 +980,15 @@ mod tests {
             },
             TestData {
                 cpu_info: CpuInfo {
-                    default_vcpus: 1,
+                    default_vcpus: 1.0,
                     default_maxvcpus: 3,
+                    disable_nested_virtualization: Some(false),
                     ..Default::default()
                 },
-                guest_protection: GuestProtection::NoProtection,
                 result: Ok(CpusConfig {
                     boot_vcpus: 1,
                     max_vcpus: 3,
+                    nested: Some(true),
                     topology: Some(CpuTopology {
                         cores_per_die: 3,
 
@@ -1254,16 +1001,37 @@ mod tests {
             },
             TestData {
                 cpu_info: CpuInfo {
-                    default_vcpus: 1,
-                    default_maxvcpus: 13,
+                    default_vcpus: 1.0,
+                    default_maxvcpus: 3,
+                    disable_nested_virtualization: Some(true),
                     ..Default::default()
                 },
-                guest_protection: GuestProtection::Tdx,
                 result: Ok(CpusConfig {
                     boot_vcpus: 1,
-                    max_vcpus: 1,
+                    max_vcpus: 3,
+                    nested: Some(false),
                     topology: Some(CpuTopology {
-                        cores_per_die: 1,
+                        cores_per_die: 3,
+
+                        ..topology
+                    }),
+                    max_phys_bits: DEFAULT_CH_MAX_PHYS_BITS,
+
+                    ..Default::default()
+                }),
+            },
+            TestData {
+                cpu_info: CpuInfo {
+                    default_vcpus: 512.0,
+                    default_maxvcpus: 512,
+                    ..Default::default()
+                },
+                result: Ok(CpusConfig {
+                    boot_vcpus: 512,
+                    max_vcpus: 512,
+                    nested: None,
+                    topology: Some(CpuTopology {
+                        cores_per_die: 512,
 
                         ..topology
                     }),
@@ -1277,7 +1045,7 @@ mod tests {
         for (i, d) in tests.iter().enumerate() {
             let msg = format!("test[{}]: {:?}", i, d);
 
-            let result = CpusConfig::try_from((d.cpu_info.clone(), d.guest_protection.clone()));
+            let result = CpusConfig::try_from(d.cpu_info.clone());
 
             let msg = format!("{}: actual result: {:?}", msg, result);
 
@@ -1285,15 +1053,10 @@ mod tests {
                 eprintln!("DEBUG: {}", msg);
             }
 
-            if d.result.is_err() {
+            if let Err(expected_err) = &d.result {
                 assert!(result.is_err(), "{}", msg);
 
-                assert_eq!(
-                    &result.unwrap_err(),
-                    d.result.as_ref().unwrap_err(),
-                    "{}",
-                    msg
-                );
+                assert_eq!(&result.unwrap_err(), expected_err, "{}", msg);
                 continue;
             }
 
@@ -1308,7 +1071,7 @@ mod tests {
         struct TestData {
             boot_info: BootInfo,
             cmdline: Option<String>,
-            guest_protection: GuestProtection,
+            protection_device: Option<ProtectionDevConfig>,
             result: Result<PayloadConfig, PayloadConfigError>,
         }
 
@@ -1344,7 +1107,7 @@ mod tests {
             TestData {
                 boot_info: BootInfo::default(),
                 cmdline: None,
-                guest_protection: GuestProtection::NoProtection,
+                protection_device: None,
                 result: Err(PayloadConfigError::NoKernel),
             },
             TestData {
@@ -1356,7 +1119,7 @@ mod tests {
                     ..Default::default()
                 },
                 cmdline: None,
-                guest_protection: GuestProtection::NoProtection,
+                protection_device: None,
                 result: Ok(PayloadConfig {
                     kernel: Some(PathBuf::from(kernel)),
                     cmdline: None,
@@ -1375,12 +1138,13 @@ mod tests {
                     ..Default::default()
                 },
                 cmdline: None,
-                guest_protection: GuestProtection::NoProtection,
+                protection_device: None,
                 result: Ok(PayloadConfig {
                     kernel: Some(PathBuf::from(kernel)),
                     cmdline: None,
                     initramfs: Some(PathBuf::from(initramfs)),
                     firmware: Some(PathBuf::from(firmware)),
+                    host_data: None,
                 }),
             },
             TestData {
@@ -1392,7 +1156,7 @@ mod tests {
                     ..Default::default()
                 },
                 cmdline: Some(cmdline.to_string()),
-                guest_protection: GuestProtection::NoProtection,
+                protection_device: None,
                 result: Ok(PayloadConfig {
                     kernel: Some(PathBuf::from(kernel)),
                     initramfs: Some(PathBuf::from(initramfs)),
@@ -1402,26 +1166,15 @@ mod tests {
                 }),
             },
             TestData {
-                boot_info: BootInfo {
-                    kernel: kernel.into(),
-                    initrd: initramfs.into(),
-
-                    ..Default::default()
-                },
-                cmdline: None,
-                guest_protection: GuestProtection::Tdx,
-                result: Err(PayloadConfigError::TDXFirmwareMissing),
-            },
-            TestData {
                 boot_info: boot_info_with_initrd,
                 cmdline: Some(cmdline.to_string()),
-                guest_protection: GuestProtection::Tdx,
+                protection_device: None,
                 result: Ok(payload_config_with_initrd),
             },
             TestData {
                 boot_info: boot_info_without_initrd,
                 cmdline: Some(cmdline.to_string()),
-                guest_protection: GuestProtection::Tdx,
+                protection_device: None,
                 result: Ok(payload_config_without_initrd),
             },
         ];
@@ -1432,7 +1185,7 @@ mod tests {
             let result = PayloadConfig::try_from((
                 d.boot_info.clone(),
                 d.cmdline.clone(),
-                d.guest_protection.clone(),
+                d.protection_device.clone(),
             ));
 
             let msg = format!("{}: actual result: {:?}", msg, result);
@@ -1441,15 +1194,10 @@ mod tests {
                 eprintln!("DEBUG: {}", msg);
             }
 
-            if d.result.is_err() {
+            if let Err(expected_err) = &d.result {
                 assert!(result.is_err(), "{}", msg);
 
-                assert_eq!(
-                    &result.unwrap_err(),
-                    d.result.as_ref().unwrap_err(),
-                    "{}",
-                    msg
-                );
+                assert_eq!(&result.unwrap_err(), expected_err, "{}", msg);
                 continue;
             }
 
@@ -1463,7 +1211,6 @@ mod tests {
         #[derive(Debug)]
         struct TestData {
             mem_info: MemoryInfo,
-            guest_protection: GuestProtection,
             result: Result<MemoryConfig, MemoryConfigError>,
         }
 
@@ -1478,45 +1225,12 @@ mod tests {
         // bytes.
         let usable_max_mem_bytes = MIB.checked_mul(max_mem_mib).unwrap();
 
-        let (mem_info_std, mem_cfg_std) = make_memory_objects(79, usable_max_mem_bytes, false);
-        let (mem_info_confidential_guest, mem_cfg_confidential_guest) =
-            make_memory_objects(79, usable_max_mem_bytes, true);
+        let (mem_info_std, mem_cfg_std) = make_memory_objects(79, usable_max_mem_bytes);
 
         let tests = &[
             TestData {
                 mem_info: MemoryInfo::default(),
-                guest_protection: GuestProtection::NoProtection,
                 result: Err(MemoryConfigError::NoDefaultMemory),
-            },
-            TestData {
-                mem_info: MemoryInfo {
-                    default_memory: 17,
-
-                    ..Default::default()
-                },
-                guest_protection: GuestProtection::Tdx,
-                result: Ok(MemoryConfig {
-                    size: (17 * MIB),
-                    shared: true,
-                    hotplug_size: None,
-
-                    ..Default::default()
-                }),
-            },
-            TestData {
-                mem_info: MemoryInfo {
-                    default_memory: max_mem_mib as u32,
-
-                    ..Default::default()
-                },
-                guest_protection: GuestProtection::Tdx,
-                result: Ok(MemoryConfig {
-                    size: usable_max_mem_bytes,
-                    shared: true,
-                    hotplug_size: None,
-
-                    ..Default::default()
-                }),
             },
             TestData {
                 mem_info: MemoryInfo {
@@ -1524,7 +1238,6 @@ mod tests {
 
                     ..Default::default()
                 },
-                guest_protection: GuestProtection::Tdx,
                 result: Err(MemoryConfigError::DefaultMemSizeTooBig),
             },
             TestData {
@@ -1533,7 +1246,6 @@ mod tests {
 
                     ..Default::default()
                 },
-                guest_protection: GuestProtection::NoProtection,
                 result: Ok(MemoryConfig {
                     size: 1024_u64 * MIB,
                     shared: true,
@@ -1547,20 +1259,14 @@ mod tests {
             },
             TestData {
                 mem_info: mem_info_std,
-                guest_protection: GuestProtection::NoProtection,
                 result: Ok(mem_cfg_std),
-            },
-            TestData {
-                mem_info: mem_info_confidential_guest,
-                guest_protection: GuestProtection::Tdx,
-                result: Ok(mem_cfg_confidential_guest),
             },
         ];
 
         for (i, d) in tests.iter().enumerate() {
             let msg = format!("test[{}]: {:?}", i, d);
 
-            let result = MemoryConfig::try_from((d.mem_info.clone(), d.guest_protection.clone()));
+            let result = MemoryConfig::try_from(d.mem_info.clone());
 
             let msg = format!("{}: actual result: {:?}", msg, result);
 
@@ -1568,15 +1274,10 @@ mod tests {
                 eprintln!("DEBUG: {}", msg);
             }
 
-            if d.result.is_err() {
+            if let Err(expected_err) = &d.result {
                 assert!(result.is_err(), "{}", msg);
 
-                assert_eq!(
-                    &result.unwrap_err(),
-                    d.result.as_ref().unwrap_err(),
-                    "{}",
-                    msg
-                );
+                assert_eq!(&result.unwrap_err(), expected_err, "{}", msg);
                 continue;
             }
 
@@ -1586,11 +1287,48 @@ mod tests {
     }
 
     #[test]
+    fn test_template_memory_config() {
+        let memory_path =
+            std::env::temp_dir().join(format!("kata-clh-template-memory-{}", std::process::id()));
+        fs::write(&memory_path, []).unwrap();
+
+        let mut cfg = HypervisorConfig {
+            memory_info: MemoryInfo {
+                default_memory: 512,
+                default_maxmemory: 0,
+                enable_hugepages: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        cfg.vm_template.boot_to_be_template = true;
+        cfg.vm_template.memory_path = memory_path.to_string_lossy().to_string();
+
+        let memory = template_memory_config(&cfg).unwrap();
+        let zones = memory.zones.as_ref().unwrap();
+
+        assert_eq!(memory.size, 0);
+        assert_eq!(memory.hotplug_method, HotplugMethod::Acpi);
+        assert!(memory.hotplug_size.is_none());
+        assert!(memory.shared);
+        assert!(!memory.hugepages);
+        assert_eq!(zones.len(), 1);
+        assert_eq!(zones[0].id, "mem0");
+        assert_eq!(zones[0].size, 512 * MIB);
+        assert_eq!(zones[0].file, Some(memory_path.clone()));
+        assert!(zones[0].shared);
+        assert!(!zones[0].hugepages);
+        assert!(zones[0].hotplug_size.is_none());
+
+        fs::remove_file(memory_path).unwrap();
+    }
+
+    #[test]
     fn test_vsock_config() {
         #[derive(Debug)]
         struct TestData<'a> {
             vsock_socket_path: &'a str,
-            cid: u64,
+            cid: u32,
             result: Result<VsockConfig, VsockConfigError>,
         }
 
@@ -1623,15 +1361,10 @@ mod tests {
                 eprintln!("DEBUG: {}", msg);
             }
 
-            if d.result.is_err() {
+            if let Err(expected_err) = &d.result {
                 assert!(result.is_err(), "{}", msg);
 
-                assert_eq!(
-                    &result.unwrap_err(),
-                    d.result.as_ref().unwrap_err(),
-                    "{}",
-                    msg
-                );
+                assert_eq!(&result.unwrap_err(), expected_err, "{}", msg);
                 continue;
             }
 
@@ -1648,7 +1381,6 @@ mod tests {
             result: Result<VmConfig, VmConfigError>,
         }
 
-        let u8_max = std::u8::MAX;
         let sysinfo = nix::sys::sysinfo::sysinfo().unwrap();
 
         let actual_max_mem_bytes = sysinfo.ram_total();
@@ -1663,7 +1395,6 @@ mod tests {
         let image = "image";
         let initramfs = "initramfs";
         let kernel = "kernel";
-        let firmware = "firmware";
 
         let kernel_params = "foo bar baz=true wibble=1234 a=b:c:d:e moo=0xf00f hello=world quoted_string='a list of stuff' comma-list=a,b,c,d,e";
 
@@ -1674,16 +1405,10 @@ mod tests {
         let valid_vsock =
             VsockConfig::try_from((vsock_socket_path.to_string(), DEFAULT_VSOCK_CID)).unwrap();
 
-        let (cpu_info, cpus_config) = make_cpu_objects(7, u8_max, false);
-        let (cpu_info_tdx, cpus_config_tdx) = make_cpu_objects(7, u8_max, true);
+        let (cpu_info, cpus_config) = make_cpu_objects(7, MAX_CH_VCPUS);
 
-        let (memory_info_std, mem_config_std) =
-            make_memory_objects(79, usable_max_mem_bytes, false);
+        let (memory_info_std, mem_config_std) = make_memory_objects(79, usable_max_mem_bytes);
 
-        let (memory_info_confidential_guest, mem_config_confidential_guest) =
-            make_memory_objects(79, usable_max_mem_bytes, true);
-
-        let (_, pmem_config_with_image) = make_bootinfo_pmemconfig_objects(image);
         let (machine_info, rng_config) = make_machineinfo_rngconfig_objects(entropy_source);
 
         let payload_firmware = None;
@@ -1691,33 +1416,7 @@ mod tests {
         let (boot_info_with_initrd, payload_config_with_initrd) =
             make_bootinfo_payloadconfig_objects(kernel, initramfs, payload_firmware, None);
 
-        let (_, disk_config_confidential_guest_image) = make_bootinfo_diskconfig_objects(image);
-
-        let boot_info_tdx_image = BootInfo {
-            kernel: kernel.to_string(),
-            image: image.to_string(),
-            firmware: firmware.to_string(),
-            vm_rootfs_driver: VIRTIO_BLK_PCI.to_string(),
-
-            ..Default::default()
-        };
-
-        let boot_info_tdx_initrd = BootInfo {
-            kernel: kernel.to_string(),
-            initrd: initramfs.to_string(),
-            firmware: firmware.to_string(),
-
-            ..Default::default()
-        };
-
-        // XXX: Note that the image is defined in a DiskConfig!
-        let payload_config_tdx_for_image = PayloadConfig {
-            firmware: Some(PathBuf::from(firmware)),
-            kernel: Some(PathBuf::from(kernel)),
-
-            ..Default::default()
-        };
-
+        let (_, disk_config_with_image) = make_bootinfo_diskconfig_objects(image);
         //------------------------------
 
         let hypervisor_cfg_with_image_and_kernel = HypervisorConfig {
@@ -1744,42 +1443,6 @@ mod tests {
             ..Default::default()
         };
 
-        let security_info_confidential_guest = SecurityInfo {
-            confidential_guest: true,
-
-            ..Default::default()
-        };
-
-        let hypervisor_cfg_tdx_image = HypervisorConfig {
-            cpu_info: cpu_info_tdx.clone(),
-            memory_info: memory_info_confidential_guest.clone(),
-            boot_info: boot_info_tdx_image,
-            machine_info: machine_info.clone(),
-            security_info: security_info_confidential_guest.clone(),
-            blockdev_info: BlockDeviceInfo {
-                block_device_driver: VIRTIO_BLK_PCI.to_string(),
-
-                ..Default::default()
-            },
-
-            ..Default::default()
-        };
-
-        let hypervisor_cfg_tdx_initrd = HypervisorConfig {
-            cpu_info: cpu_info_tdx.clone(),
-            memory_info: memory_info_confidential_guest,
-            boot_info: boot_info_tdx_initrd,
-            machine_info,
-            security_info: security_info_confidential_guest,
-            blockdev_info: BlockDeviceInfo {
-                block_device_driver: VIRTIO_BLK_PCI.to_string(),
-
-                ..Default::default()
-            },
-
-            ..Default::default()
-        };
-
         //------------------------------
 
         let vmconfig_with_image_and_kernel = VmConfig {
@@ -1789,7 +1452,7 @@ mod tests {
             vsock: Some(valid_vsock.clone()),
 
             // rootfs image specific
-            pmem: Some(vec![pmem_config_with_image]),
+            disks: Some(vec![disk_config_with_image]),
 
             payload: Some(PayloadConfig {
                 kernel: Some(PathBuf::from(kernel)),
@@ -1813,24 +1476,6 @@ mod tests {
             ..Default::default()
         };
 
-        let platform_config_tdx = get_platform_cfg(GuestProtection::Tdx);
-
-        let vmconfig_tdx_image = VmConfig {
-            cpus: cpus_config_tdx.clone(),
-            memory: mem_config_confidential_guest.clone(),
-            rng: rng_config.clone(),
-            vsock: Some(valid_vsock.clone()),
-            platform: platform_config_tdx.clone(),
-
-            // TDX specific
-            payload: Some(payload_config_tdx_for_image),
-
-            // Confidential guest + TDX specific
-            disks: Some(vec![disk_config_confidential_guest_image]),
-
-            ..Default::default()
-        };
-
         //------------------------------
 
         let named_hypervisor_cfg_with_image_and_kernel = NamedHypervisorConfig {
@@ -1850,7 +1495,7 @@ mod tests {
 
             cfg: HypervisorConfig {
                 cpu_info: CpuInfo {
-                    default_vcpus: 0,
+                    default_vcpus: 0.0,
 
                     ..cpu_info.clone()
                 },
@@ -1917,32 +1562,12 @@ mod tests {
             ..Default::default()
         };
 
-        let named_hypervisor_cfg_tdx_image = NamedHypervisorConfig {
-            sandbox_path: sandbox_path.into(),
-            vsock_socket_path: vsock_socket_path.into(),
-
-            cfg: hypervisor_cfg_tdx_image,
-            guest_protection_to_use: GuestProtection::Tdx,
-
-            ..Default::default()
-        };
-
-        let named_hypervisor_cfg_tdx_initrd = NamedHypervisorConfig {
-            sandbox_path: sandbox_path.into(),
-            vsock_socket_path: vsock_socket_path.into(),
-
-            cfg: hypervisor_cfg_tdx_initrd,
-            guest_protection_to_use: GuestProtection::Tdx,
-
-            ..Default::default()
-        };
-
         //------------------------------
 
         let tests = &[
             TestData {
                 cfg: NamedHypervisorConfig::default(),
-                result: Err(VmConfigError::EmptyVsockSocketPath),
+                result: Err(VmConfigError::EmptySandboxPath),
             },
             TestData {
                 cfg: NamedHypervisorConfig {
@@ -1958,7 +1583,7 @@ mod tests {
 
                     ..Default::default()
                 },
-                result: Err(VmConfigError::EmptyVsockSocketPath),
+                result: Err(VmConfigError::CPUError(CpusConfigError::BootVCPUsTooSmall)),
             },
             TestData {
                 cfg: NamedHypervisorConfig {
@@ -1966,7 +1591,7 @@ mod tests {
                     vsock_socket_path: "vsock_socket_path".into(),
                     cfg: HypervisorConfig {
                         cpu_info: CpuInfo {
-                            default_vcpus: 1,
+                            default_vcpus: 1.0,
                             default_maxvcpus: 1,
 
                             ..Default::default()
@@ -1990,7 +1615,7 @@ mod tests {
                             ..Default::default()
                         },
                         cpu_info: CpuInfo {
-                            default_vcpus: 1,
+                            default_vcpus: 1.0,
                             default_maxvcpus: 1,
 
                             ..Default::default()
@@ -2019,7 +1644,9 @@ mod tests {
             },
             TestData {
                 cfg: named_hypervisor_cfg_with_image_and_kernel_bad_vsock,
-                result: Err(VmConfigError::EmptyVsockSocketPath),
+                result: Err(VmConfigError::VsockError(
+                    VsockConfigError::NoVsockSocketPath,
+                )),
             },
             TestData {
                 cfg: named_hypervisor_cfg_with_image_and_kernel,
@@ -2029,14 +1656,6 @@ mod tests {
                 cfg: named_hypervisor_cfg_with_initrd,
                 result: Ok(vmconfig_with_initrd),
             },
-            TestData {
-                cfg: named_hypervisor_cfg_tdx_image,
-                result: Ok(vmconfig_tdx_image),
-            },
-            TestData {
-                cfg: named_hypervisor_cfg_tdx_initrd,
-                result: Err(VmConfigError::TDXDisallowsInitrd),
-            },
         ];
 
         for (i, d) in tests.iter().enumerate() {
@@ -2044,21 +1663,24 @@ mod tests {
 
             let result = VmConfig::try_from(d.cfg.clone());
 
+            if !d.cfg.cfg.boot_info.image.is_empty() {
+                if let Ok(config) = &result {
+                    // CLH v54.0 rejects boot disks without an explicit format.
+                    let json = serde_json::to_value(config).unwrap();
+                    assert_eq!(json["disks"][0]["image_type"], "Raw", "{}", msg);
+                }
+            }
+
             let msg = format!("{}: actual result: {:?}", msg, result);
 
             if std::env::var("DEBUG").is_ok() {
                 eprintln!("DEBUG: {}", msg);
             }
 
-            if d.result.is_err() {
+            if let Err(expected_err) = &d.result {
                 assert!(result.is_err(), "{}", msg);
 
-                assert_eq!(
-                    &result.unwrap_err(),
-                    d.result.as_ref().unwrap_err(),
-                    "{}",
-                    msg
-                );
+                assert_eq!(&result.unwrap_err(), expected_err, "{}", msg);
                 continue;
             }
 
@@ -2156,193 +1778,6 @@ mod tests {
             let msg = format!("test[{}]: {:?}", i, d);
 
             let result = checked_next_multiple_of(d.value, d.multiple);
-
-            let msg = format!("{}: actual result: {:?}", msg, result);
-
-            if std::env::var("DEBUG").is_ok() {
-                eprintln!("DEBUG: {}", msg);
-            }
-
-            assert_eq!(result, d.result, "{}", msg);
-        }
-    }
-
-    #[test]
-    fn test_check_tdx_rootfs_settings() {
-        #[derive(Debug)]
-        struct TestData<'a> {
-            use_image: bool,
-            container_rootfs_driver: &'a str,
-            vm_rootfs_driver: &'a str,
-            guest_protection_to_use: GuestProtection,
-            result: Result<(), VmConfigError>,
-        }
-
-        let tests = &[
-            // n/a as no TDX
-            TestData {
-                use_image: true,
-                container_rootfs_driver: "container",
-                vm_rootfs_driver: "vm",
-                guest_protection_to_use: GuestProtection::NoProtection,
-                result: Ok(()),
-            },
-            TestData {
-                use_image: true,
-                container_rootfs_driver: "container",
-                vm_rootfs_driver: "vm",
-                guest_protection_to_use: GuestProtection::Sev,
-                result: Ok(()),
-            },
-            TestData {
-                use_image: true,
-                container_rootfs_driver: "container",
-                vm_rootfs_driver: "vm",
-                guest_protection_to_use: GuestProtection::Snp,
-                result: Ok(()),
-            },
-            TestData {
-                use_image: true,
-                container_rootfs_driver: "container",
-                vm_rootfs_driver: "vm",
-                guest_protection_to_use: GuestProtection::Pef,
-                result: Ok(()),
-            },
-            TestData {
-                use_image: true,
-                container_rootfs_driver: "container",
-                vm_rootfs_driver: "vm",
-                guest_protection_to_use: GuestProtection::Se,
-                result: Ok(()),
-            },
-            // Incorrect
-            TestData {
-                use_image: true,
-                container_rootfs_driver: "container",
-                vm_rootfs_driver: "vm",
-                guest_protection_to_use: GuestProtection::Tdx,
-                result: Err(VmConfigError::TDXContainerRootfsNotVirtioBlk),
-            },
-            // Partially correct
-            TestData {
-                use_image: true,
-                container_rootfs_driver: VIRTIO_BLK_PCI,
-                vm_rootfs_driver: "vm",
-                guest_protection_to_use: GuestProtection::Tdx,
-                result: Err(VmConfigError::TDXVMRootfsNotVirtioBlk),
-            },
-            TestData {
-                use_image: true,
-                container_rootfs_driver: VIRTIO_BLK_MMIO,
-                vm_rootfs_driver: "vm",
-                guest_protection_to_use: GuestProtection::Tdx,
-                result: Err(VmConfigError::TDXVMRootfsNotVirtioBlk),
-            },
-            TestData {
-                use_image: true,
-                container_rootfs_driver: "container",
-                vm_rootfs_driver: VIRTIO_BLK_PCI,
-                guest_protection_to_use: GuestProtection::Tdx,
-                result: Err(VmConfigError::TDXContainerRootfsNotVirtioBlk),
-            },
-            TestData {
-                use_image: true,
-                container_rootfs_driver: "container",
-                vm_rootfs_driver: VIRTIO_BLK_MMIO,
-                guest_protection_to_use: GuestProtection::Tdx,
-                result: Err(VmConfigError::TDXContainerRootfsNotVirtioBlk),
-            },
-            // Same types
-            TestData {
-                use_image: true,
-                container_rootfs_driver: VIRTIO_BLK_MMIO,
-                vm_rootfs_driver: VIRTIO_BLK_MMIO,
-                guest_protection_to_use: GuestProtection::Tdx,
-                result: Ok(()),
-            },
-            TestData {
-                use_image: true,
-                container_rootfs_driver: VIRTIO_BLK_PCI,
-                vm_rootfs_driver: VIRTIO_BLK_PCI,
-                guest_protection_to_use: GuestProtection::Tdx,
-                result: Ok(()),
-            },
-            // Alternate types
-            TestData {
-                use_image: true,
-                container_rootfs_driver: VIRTIO_BLK_MMIO,
-                vm_rootfs_driver: VIRTIO_BLK_PCI,
-                guest_protection_to_use: GuestProtection::Tdx,
-                result: Ok(()),
-            },
-            TestData {
-                use_image: true,
-                container_rootfs_driver: VIRTIO_BLK_PCI,
-                vm_rootfs_driver: VIRTIO_BLK_MMIO,
-                guest_protection_to_use: GuestProtection::Tdx,
-                result: Ok(()),
-            },
-            // Using an initrd (not currently supported)
-            TestData {
-                use_image: false,
-                container_rootfs_driver: VIRTIO_BLK_PCI,
-                vm_rootfs_driver: VIRTIO_BLK_PCI,
-                guest_protection_to_use: GuestProtection::Tdx,
-                result: Err(VmConfigError::TDXDisallowsInitrd),
-            },
-            TestData {
-                use_image: false,
-                container_rootfs_driver: "container",
-                vm_rootfs_driver: "vm",
-                guest_protection_to_use: GuestProtection::Tdx,
-                result: Err(VmConfigError::TDXDisallowsInitrd),
-            },
-            TestData {
-                use_image: false,
-                container_rootfs_driver: VIRTIO_BLK_PCI,
-                vm_rootfs_driver: "vm",
-                guest_protection_to_use: GuestProtection::Tdx,
-                result: Err(VmConfigError::TDXDisallowsInitrd),
-            },
-            TestData {
-                use_image: false,
-                container_rootfs_driver: VIRTIO_BLK_MMIO,
-                vm_rootfs_driver: "vm",
-                guest_protection_to_use: GuestProtection::Tdx,
-                result: Err(VmConfigError::TDXDisallowsInitrd),
-            },
-        ];
-
-        for (i, d) in tests.iter().enumerate() {
-            let msg = format!("test[{}]: {:?}", i, d);
-
-            let image = if d.use_image {
-                "image".to_string()
-            } else {
-                "".to_string()
-            };
-
-            let boot_info = BootInfo {
-                vm_rootfs_driver: d.vm_rootfs_driver.into(),
-                image,
-
-                ..Default::default()
-            };
-
-            let blockdev_info = BlockDeviceInfo {
-                block_device_driver: d.container_rootfs_driver.into(),
-
-                ..Default::default()
-            };
-
-            let cfg = HypervisorConfig {
-                boot_info,
-                blockdev_info,
-
-                ..Default::default()
-            };
-
-            let result = check_tdx_rootfs_settings(&cfg, &d.guest_protection_to_use);
 
             let msg = format!("{}: actual result: {:?}", msg, result);
 

@@ -5,26 +5,27 @@
 //
 
 use std::{
-    collections::HashMap,
+    ffi::OsStr,
     fs,
     path::{Path, PathBuf},
     process::Command,
-    sync::{
-        atomic::{AtomicU8, Ordering},
-        Arc, RwLock,
-    },
 };
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use lazy_static::lazy_static;
 use path_clean::PathClean;
 
-use crate::{
-    device::{hypervisor, Device, DeviceType},
-    PciPath, PciSlot,
-};
 use kata_sys_util::fs::get_base_name;
+
+use crate::{
+    device::{
+        pci_path::PciPath,
+        topology::{do_add_pcie_endpoint, AvailableNode, PCIePort, PCIeTopology},
+        util::{do_decrease_count, do_increase_count},
+        Device, DeviceType, PCIeDevice,
+    },
+    register_pcie_device, unregister_pcie_device, update_pcie_device, Hypervisor as hypervisor,
+};
 
 pub const SYS_BUS_PCI_DRIVER_PROBE: &str = "/sys/bus/pci/drivers_probe";
 pub const SYS_BUS_PCI_DEVICES: &str = "/sys/bus/pci/devices";
@@ -32,49 +33,18 @@ pub const SYS_KERN_IOMMU_GROUPS: &str = "/sys/kernel/iommu_groups";
 pub const VFIO_PCI_DRIVER: &str = "vfio-pci";
 pub const DRIVER_MMIO_BLK_TYPE: &str = "mmioblk";
 pub const DRIVER_VFIO_PCI_TYPE: &str = "vfio-pci";
+pub const DRIVER_VFIO_AP_TYPE: &str = "vfio-ap";
 pub const MAX_DEV_ID_SIZE: usize = 31;
 
+/// PCI class bitmasks for devices that must be ignored when enumerating an IOMMU group.
+/// Host Bridge: 0x0600, Audio device: 0x0403.
+const IOMMU_IGNORE: &[u64] = &[0x0600, 0x403];
+
 const VFIO_PCI_DRIVER_NEW_ID: &str = "/sys/bus/pci/drivers/vfio-pci/new_id";
-const VFIO_PCI_DRIVER_UNBIND: &str = "/sys/bus/pci/drivers/vfio-pci/unbind";
 const SYS_CLASS_IOMMU: &str = "/sys/class/iommu";
 const INTEL_IOMMU_PREFIX: &str = "dmar";
 const AMD_IOMMU_PREFIX: &str = "ivhd";
 const ARM_IOMMU_PREFIX: &str = "smmu";
-
-lazy_static! {
-    static ref GUEST_DEVICE_ID: Arc<AtomicU8> = Arc::new(AtomicU8::new(0_u8));
-    static ref HOST_GUEST_MAP: Arc<RwLock<HashMap<String, String>>> =
-        Arc::new(RwLock::new(HashMap::new()));
-}
-
-// map host/guest bdf and the mapping saved into `HOST_GUEST_MAP`,
-// and return PciPath.
-pub fn generate_guest_pci_path(bdf: String) -> Result<PciPath> {
-    let hg_map = HOST_GUEST_MAP.clone();
-    let current_id = GUEST_DEVICE_ID.clone();
-
-    current_id.fetch_add(1, Ordering::SeqCst);
-    let slot = current_id.load(Ordering::SeqCst);
-
-    // In some Hypervisors, dragonball, cloud-hypervisor or firecracker,
-    // the device is directly connected to the bus without intermediary bus.
-    // FIXME: Qemu's pci path needs to be implemented;
-    let host_bdf = normalize_device_bdf(bdf.as_str());
-    let guest_bdf = format!("0000:00:{:02x}.0", slot);
-
-    // safe, just do unwrap as `HOST_GUEST_MAP` is always valid.
-    hg_map.write().unwrap().insert(host_bdf, guest_bdf);
-
-    Ok(PciPath {
-        slots: vec![PciSlot::convert_from_u32(slot.into()).context("pci slot convert failed.")?],
-    })
-}
-
-// get host/guest mapping for info
-pub fn get_host_guest_map(host_bdf: String) -> Option<String> {
-    // safe, just do unwrap as `HOST_GUEST_MAP` is always valid.
-    HOST_GUEST_MAP.read().unwrap().get(&host_bdf).cloned()
-}
 
 pub fn do_check_iommu_on() -> Result<bool> {
     let element = std::fs::read_dir(SYS_CLASS_IOMMU)?
@@ -97,9 +67,9 @@ pub fn do_check_iommu_on() -> Result<bool> {
 }
 
 fn override_driver(bdf: &str, driver: &str) -> Result<()> {
-    let driver_override = format!("/sys/bus/pci/devices/{}/driver_override", bdf);
+    let driver_override = format!("/sys/bus/pci/devices/{bdf}/driver_override");
     fs::write(&driver_override, driver)
-        .with_context(|| format!("echo {} > {}", driver, &driver_override))?;
+        .with_context(|| format!("echo {} > {}", driver, driver_override))?;
     info!(sl!(), "echo {} > {}", driver, driver_override);
     Ok(())
 }
@@ -109,6 +79,7 @@ pub enum VfioBusMode {
     #[default]
     MMIO,
     PCI,
+    CCW,
 }
 
 impl VfioBusMode {
@@ -128,8 +99,12 @@ impl VfioBusMode {
 
     // driver_type used for kata-agent
     // (1) vfio-pci for add device handler,
-    // (2) mmioblk for add storage handler,
-    pub fn driver_type(mode: &str) -> &str {
+    // (2) vfio-ap for add ccw device handler,
+    // (3) mmioblk for add storage handler,
+    pub fn driver_type(bus_type: &str, mode: &str) -> &'static str {
+        if bus_type == "ccw" {
+            return DRIVER_VFIO_AP_TYPE;
+        }
         match mode {
             "b" => DRIVER_MMIO_BLK_TYPE,
             _ => DRIVER_VFIO_PCI_TYPE,
@@ -137,7 +112,7 @@ impl VfioBusMode {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub enum VfioDeviceType {
     /// error type of VFIO device
     Error,
@@ -146,16 +121,19 @@ pub enum VfioDeviceType {
     #[default]
     Normal,
 
-    /// mediated VFIO device type
-    Mediated,
+    /// mediated VFIO-PCI device type
+    MediatedPci,
+
+    /// mediated VFIO-AP device type
+    MediatedAp,
 }
 
-// DeviceVendor represents a PCI device's device id and vendor id
-// DeviceVendor: (device, vendor)
+// DeviceVendorClass represents a PCI device's deviceID, vendorID and classID
+// DeviceVendorClass: (device, vendor, class)
 #[derive(Clone, Debug)]
-pub struct DeviceVendor(String, String);
+pub struct DeviceVendorClass(String, String, String);
 
-impl DeviceVendor {
+impl DeviceVendorClass {
     pub fn get_device_vendor(&self) -> Result<(u32, u32)> {
         // default value is 0 when vendor_id or device_id is empty
         if self.0.is_empty() || self.1.is_empty() {
@@ -177,6 +155,10 @@ impl DeviceVendor {
         Ok((device, vendor))
     }
 
+    pub fn get_vendor_class_id(&self) -> Result<(&str, &str)> {
+        Ok((&self.1, &self.2))
+    }
+
     pub fn get_device_vendor_id(&self) -> Result<u32> {
         let (device, vendor) = self
             .get_device_vendor()
@@ -195,11 +177,17 @@ pub struct HostDevice {
     /// Sysfs path for mdev bus type device
     pub sysfs_path: String,
 
+    /// PCI device information (Domain)
+    pub domain: String,
+
+    // iommufd for vfio device
+    pub iommufd: String,
+
     /// PCI device information (BDF): "bus:slot:function"
     pub bus_slot_func: String,
 
-    /// device_vendor: device id and vendor id
-    pub device_vendor: Option<DeviceVendor>,
+    /// device_vendor_class: (device, vendor, class)
+    pub device_vendor_class: Option<DeviceVendorClass>,
 
     /// type of vfio device
     pub vfio_type: VfioDeviceType,
@@ -208,6 +196,7 @@ pub struct HostDevice {
     pub guest_pci_path: Option<PciPath>,
 
     /// vfio_vendor for vendor's some special cases.
+    #[allow(unexpected_cfgs)]
     #[cfg(feature = "enable-vendor")]
     pub vfio_vendor: VfioVendor,
 }
@@ -220,6 +209,9 @@ pub struct VfioConfig {
 
     /// device as block or char
     pub dev_type: String,
+
+    /// bus type: pci or ccw
+    pub bus_type: String,
 
     /// hostdev_prefix for devices, such as:
     /// (1) phisycial endpoint: "physical_nic_"
@@ -252,11 +244,20 @@ pub struct VfioDevice {
     pub devices: Vec<HostDevice>,
     // options for vfio pci handler in kata-agent
     pub device_options: Vec<String>,
+
+    // specifies the PCIe port type to which the device is attached
+    pub port: PCIePort,
+
+    // bus of VFIO PCIe device
+    pub bus: String,
+
+    // Indicated host device allocated or not.
+    pub allocated: bool,
 }
 
 impl VfioDevice {
     // new with VfioConfig
-    pub fn new(device_id: String, dev_info: &VfioConfig) -> Self {
+    pub fn new(device_id: String, dev_info: &VfioConfig) -> Result<Self> {
         // devices and device_options are in a 1-1 mapping, used in
         // vfio-pci handler for kata-agent.
         let devices: Vec<HostDevice> = Vec::with_capacity(MAX_DEV_ID_SIZE);
@@ -264,17 +265,32 @@ impl VfioDevice {
 
         // get bus mode and driver type based on the device type
         let dev_type = dev_info.dev_type.as_str();
-        let driver_type = VfioBusMode::driver_type(dev_type).to_owned();
+        let bus_type = dev_info.bus_type.as_str();
+        let driver_type = VfioBusMode::driver_type(bus_type, dev_type).to_owned();
 
-        Self {
+        let bus_mode = if bus_type == "ccw" {
+            VfioBusMode::CCW
+        } else {
+            VfioBusMode::PCI
+        };
+
+        let mut vfio_device = Self {
             device_id,
             attach_count: 0,
-            bus_mode: VfioBusMode::PCI,
+            bus_mode,
             driver_type,
             config: dev_info.clone(),
             devices,
             device_options,
-        }
+            allocated: false,
+            ..Default::default()
+        };
+
+        vfio_device
+            .initialize_vfio_device()
+            .context("initialize vfio device failed.")?;
+
+        Ok(vfio_device)
     }
 
     fn get_host_path(&self) -> String {
@@ -287,14 +303,22 @@ impl VfioDevice {
 
     // nornaml VFIO BDF: 0000:04:00.0
     // mediated VFIO BDF: 83b8f4f2-509f-382f-3c1e-e6bfe0fa1001
-    fn get_vfio_device_type(&self, device_sys_path: String) -> Result<VfioDeviceType> {
+    fn get_vfio_device_type(
+        &self,
+        device_sys_path: String,
+        iommu_dev_path: PathBuf,
+    ) -> Result<VfioDeviceType> {
         let mut tokens: Vec<&str> = device_sys_path.as_str().split(':').collect();
         let vfio_type = match tokens.len() {
             3 => VfioDeviceType::Normal,
             _ => {
                 tokens = device_sys_path.split('-').collect();
                 if tokens.len() == 5 {
-                    VfioDeviceType::Mediated
+                    if iommu_dev_path.to_string_lossy().contains("vfio_ap") {
+                        VfioDeviceType::MediatedAp
+                    } else {
+                        VfioDeviceType::MediatedPci
+                    }
                 } else {
                     VfioDeviceType::Error
                 }
@@ -338,19 +362,23 @@ impl VfioDevice {
         dev_file_name: String,
         iommu_dev_path: PathBuf,
     ) -> Result<(Option<String>, String, VfioDeviceType)> {
-        let vfio_type = self.get_vfio_device_type(dev_file_name.clone())?;
+        let vfio_type = self.get_vfio_device_type(dev_file_name.clone(), iommu_dev_path.clone())?;
         match vfio_type {
             VfioDeviceType::Normal => {
                 let dev_bdf = get_device_bdf(dev_file_name.clone());
                 let dev_sys = [SYS_BUS_PCI_DEVICES, dev_file_name.as_str()].join("/");
                 Ok((dev_bdf, dev_sys, vfio_type))
             }
-            VfioDeviceType::Mediated => {
+            VfioDeviceType::MediatedPci | VfioDeviceType::MediatedAp => {
                 // sysfsdev eg. /sys/devices/pci0000:00/0000:00:02.0/f79944e4-5a3d-11e8-99ce-479cbab002e4
                 let sysfs_dev = Path::new(&iommu_dev_path).join(dev_file_name);
                 let dev_sys = self
                     .get_sysfs_device(sysfs_dev)
                     .context("get sysfs device failed")?;
+
+                if vfio_type == VfioDeviceType::MediatedAp {
+                    return Ok((None, dev_sys, vfio_type));
+                }
 
                 let dev_bdf = if let Some(dev_s) = get_mediated_device_bdf(dev_sys.clone()) {
                     get_device_bdf(dev_s)
@@ -365,16 +393,18 @@ impl VfioDevice {
     }
 
     // read vendor and deviceor from /sys/bus/pci/devices/BDF/X
-    fn get_vfio_device_vendor(&self, bdf: &str) -> Result<DeviceVendor> {
+    fn get_vfio_device_vendor_class(&self, device_name: &str) -> Result<DeviceVendorClass> {
         let device =
-            get_device_property(bdf, "device").context("get device from syspath failed")?;
+            get_device_property(device_name, "device").context("get device from syspath failed")?;
         let vendor =
-            get_device_property(bdf, "vendor").context("get vendor from syspath failed")?;
+            get_device_property(device_name, "vendor").context("get vendor from syspath failed")?;
+        let class =
+            get_device_property(device_name, "class").context("get class from syspath failed")?;
 
-        Ok(DeviceVendor(device, vendor))
+        Ok(DeviceVendorClass(device, vendor, class))
     }
 
-    async fn set_vfio_config(
+    fn set_vfio_config(
         &mut self,
         iommu_devs_path: PathBuf,
         device_name: &str,
@@ -383,39 +413,36 @@ impl VfioDevice {
             .get_vfio_device_details(device_name.to_owned(), iommu_devs_path)
             .context("get vfio device details failed")?;
 
-        // It's safe as BDF really exists.
-        let dev_bdf = vfio_dev_details.0.unwrap();
-        let dev_vendor = self
-            .get_vfio_device_vendor(&dev_bdf)
-            .context("get property device and vendor failed")?;
+        // BDF exists only for PCI devices
+        // For AP devices, the BDF is not available.
+        if let Some(bdf) = vfio_dev_details.0 {
+            let dev_vendor_class = self
+                .get_vfio_device_vendor_class(device_name)
+                .context("get property device and vendor failed")?;
 
-        let mut vfio_dev = HostDevice {
-            bus_slot_func: dev_bdf.clone(),
-            device_vendor: Some(dev_vendor),
-            sysfs_path: vfio_dev_details.1,
-            vfio_type: vfio_dev_details.2,
-            ..Default::default()
-        };
-
-        // when vfio pci, kata-agent handles with device_options, and its
-        // format: "DDDD:BB:DD.F=<pcipath>"
-        // DDDD:BB:DD.F is the device's PCI address on host
-        // <pcipath> is the device's PCI path in the guest
-        if self.bus_mode == VfioBusMode::PCI {
-            let pci_path =
-                generate_guest_pci_path(dev_bdf.clone()).context("generate pci path failed")?;
-            vfio_dev.guest_pci_path = Some(pci_path.clone());
-            self.device_options
-                .push(format!("0000:{}={}", dev_bdf, pci_path.convert_to_string()));
+            let parts: Vec<&str> = device_name.splitn(2, ':').collect();
+            let domain_part = parts.first().context("missing domain segment")?;
+            let vfio_dev = HostDevice {
+                domain: domain_part.to_string(),
+                bus_slot_func: bdf.clone(),
+                device_vendor_class: Some(dev_vendor_class),
+                sysfs_path: vfio_dev_details.1,
+                vfio_type: vfio_dev_details.2,
+                ..Default::default()
+            };
+            Ok(vfio_dev)
+        } else {
+            Ok(HostDevice {
+                sysfs_path: vfio_dev_details.1,
+                vfio_type: vfio_dev_details.2,
+                ..Default::default()
+            })
         }
-
-        Ok(vfio_dev)
     }
 
-    // filter Host or PCI Bridges that are in the same IOMMU group as the
-    // passed-through devices. One CANNOT pass-through a PCI bridge or Host
-    // bridge. Class 0x0604 is PCI bridge, 0x0600 is Host bridge
-    fn filter_bridge_device(&self, bdf: &str, bitmask: u64) -> Option<u64> {
+    // filter Host or PCI Bridges and audio devices that are in the same IOMMU
+    // group as the passed-through devices.
+    fn filter_bridge_device(&self, bdf: &str, bitmasks: &[u64]) -> Option<u64> {
         let device_class = match get_device_property(bdf, "class") {
             Ok(dev_class) => dev_class,
             Err(_) => "".to_string(),
@@ -429,20 +456,18 @@ impl VfioDevice {
             Ok(cid_u32) => {
                 // class code is 16 bits, remove the two trailing zeros
                 let class_code = u64::from(cid_u32) >> 8;
-                if class_code & bitmask == bitmask {
-                    Some(class_code)
-                } else {
-                    None
+                for &bitmask in bitmasks {
+                    if class_code & bitmask == bitmask {
+                        return Some(class_code);
+                    }
                 }
+                None
             }
             _ => None,
         }
     }
-}
 
-#[async_trait]
-impl Device for VfioDevice {
-    async fn attach(&mut self, h: &dyn hypervisor) -> Result<()> {
+    fn initialize_vfio_device(&mut self) -> Result<()> {
         // host path: /dev/vfio/X
         let host_path = self.get_host_path();
         // vfio group: X
@@ -469,40 +494,68 @@ impl Device for VfioDevice {
 
         // pass all devices in iommu group, and use index to identify device.
         for (index, device) in iommu_devices.iter().enumerate() {
-            // filter host or PCI bridge
-            if self.filter_bridge_device(device, 0x0600).is_some() {
+            // filter host/PCI bridge, audio, etc.
+            if self.filter_bridge_device(device, IOMMU_IGNORE).is_some() {
                 continue;
             }
 
             let mut hostdev: HostDevice = self
                 .set_vfio_config(iommu_devs_path.clone(), device)
-                .await
                 .context("set vfio config failed")?;
-            let dev_prefix = self.get_vfio_prefix();
+            let dev_prefix = format!("{}_{}", self.get_vfio_prefix(), vfio_group);
             hostdev.hostdev_id = make_device_nameid(&dev_prefix, index, MAX_DEV_ID_SIZE);
 
             self.devices.push(hostdev);
         }
+
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Device for VfioDevice {
+    async fn attach(
+        &mut self,
+        pcie_topo: &mut Option<&mut PCIeTopology>,
+        h: &dyn hypervisor,
+    ) -> Result<()> {
+        register_pcie_device!(self, pcie_topo)?;
 
         if self
             .increase_attach_count()
             .await
             .context("failed to increase attach count")?
         {
-            return Err(anyhow!("attach count increased failed as some reason."));
+            warn!(
+                sl!(),
+                "The device {:?} is not allowed to be attached more than one times.",
+                self.device_id
+            );
+
+            return Ok(());
         }
 
-        // do add device for vfio deivce
-        if let Err(e) = h.add_device(DeviceType::Vfio(self.clone())).await {
-            self.decrease_attach_count().await?;
+        // do add device for vfio device
+        match h.add_device(DeviceType::Vfio(self.clone())).await {
+            Ok(_dev) => {
+                update_pcie_device!(self, pcie_topo)?;
 
-            return Err(e);
+                Ok(())
+            }
+            Err(e) => {
+                error!(sl!(), "failed to attach vfio device: {:?}", e);
+                self.decrease_attach_count().await?;
+                unregister_pcie_device!(self, pcie_topo)?;
+                return Err(e);
+            }
         }
-
-        Ok(())
     }
 
-    async fn detach(&mut self, h: &dyn hypervisor) -> Result<Option<u64>> {
+    async fn detach(
+        &mut self,
+        pcie_topo: &mut Option<&mut PCIeTopology>,
+        h: &dyn hypervisor,
+    ) -> Result<Option<u64>> {
         if self
             .decrease_attach_count()
             .await
@@ -523,37 +576,22 @@ impl Device for VfioDevice {
             None
         };
 
+        unregister_pcie_device!(self, pcie_topo)?;
+
         Ok(device_index)
     }
 
+    async fn update(&mut self, _h: &dyn hypervisor) -> Result<()> {
+        // There's no need to do update for vfio device
+        Ok(())
+    }
+
     async fn increase_attach_count(&mut self) -> Result<bool> {
-        match self.attach_count {
-            0 => {
-                // do real attach
-                self.attach_count += 1;
-                Ok(false)
-            }
-            std::u64::MAX => Err(anyhow!("device was attached too many times")),
-            _ => {
-                self.attach_count += 1;
-                Ok(true)
-            }
-        }
+        do_increase_count(&mut self.attach_count)
     }
 
     async fn decrease_attach_count(&mut self) -> Result<bool> {
-        match self.attach_count {
-            0 => Err(anyhow!("detaching a device that wasn't attached")),
-            1 => {
-                // do real wrok
-                self.attach_count -= 1;
-                Ok(false)
-            }
-            _ => {
-                self.attach_count -= 1;
-                Ok(true)
-            }
-        }
+        do_decrease_count(&mut self.attach_count)
     }
 
     async fn get_device_info(&self) -> DeviceType {
@@ -561,9 +599,78 @@ impl Device for VfioDevice {
     }
 }
 
+#[async_trait]
+impl PCIeDevice for VfioDevice {
+    async fn register(&mut self, pcie_topo: &mut PCIeTopology) -> Result<()> {
+        if self.bus_mode != VfioBusMode::PCI {
+            return Ok(());
+        }
+
+        // handle port devices
+        if !self.allocated {
+            let (port_type, _) = pcie_topo
+                .get_pcie_port()
+                .ok_or_else(|| anyhow!("No validated port type supported."))?;
+            let avail_port = match port_type {
+                PCIePort::RootPort | PCIePort::SwitchPort => pcie_topo.find_available_node(),
+                _ => {
+                    info!(
+                        sl!(),
+                        "There's no need to set ports used to hot-plug vfio devices"
+                    );
+                    None
+                }
+            };
+            // vfio device attached onto port(root port | switch port)
+            let port_device = avail_port
+                .ok_or_else(|| anyhow!("No available node found for {:?} device", port_type))?;
+            self.bus = match port_device {
+                AvailableNode::TopologyPortDevice(root_port) => root_port.port_id(),
+                AvailableNode::SwitchDownPort(swdown_port) => swdown_port.port_id(),
+            };
+
+            self.port = port_type;
+            self.allocated = true;
+            info!(sl!(), "bus: {:?}, port type: {:?}", &self.bus, &self.port);
+        }
+
+        self.device_options.clear();
+        for hostdev in self.devices.iter_mut() {
+            let pci_path = do_add_pcie_endpoint(
+                self.device_id.clone(),
+                hostdev.guest_pci_path.clone(),
+                pcie_topo,
+            )
+            .context(format!(
+                "add pcie endpoint for host device {:?} in PCIe Topology failed",
+                self.device_id
+            ))?;
+            hostdev.guest_pci_path = Some(pci_path.clone());
+
+            self.device_options.push(format!(
+                "{}:{}={}",
+                hostdev.domain, hostdev.bus_slot_func, pci_path
+            ));
+        }
+
+        Ok(())
+    }
+
+    async fn unregister(&mut self, pcie_topo: &mut PCIeTopology) -> Result<()> {
+        if let Some(_slot) = pcie_topo.remove_device(&self.device_id.clone()) {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "vfio device with {:?} not found.",
+                self.device_id.clone()
+            ))
+        }
+    }
+}
+
 // binds the device to vfio driver after unbinding from host.
 // Will be called by a network interface or a generic pcie device.
-pub fn bind_device_to_vfio(bdf: &str, host_driver: &str, _vendor_device_id: &str) -> Result<()> {
+pub fn bind_device_to_vfio(bdf: &str, host_driver: &str) -> Result<()> {
     // modprobe vfio-pci
     if !Path::new(VFIO_PCI_DRIVER_NEW_ID).exists() {
         Command::new("modprobe")
@@ -572,16 +679,9 @@ pub fn bind_device_to_vfio(bdf: &str, host_driver: &str, _vendor_device_id: &str
             .expect("Failed to run modprobe vfio-pci");
     }
 
-    // Arm does not need cmdline to open iommu, just set it through bios.
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    {
-        // check intel_iommu=on
-        let cmdline = fs::read_to_string("/proc/cmdline").unwrap();
-        if cmdline.contains("iommu=off") || !cmdline.contains("iommu=") {
-            return Err(anyhow!("iommu isn't set on kernel cmdline"));
-        }
-    }
-
+    // An IOMMU the kernel enabled registers itself in /sys/class/iommu,
+    // whether a kernel parameter turned it on or the kernel's default did
+    // (CONFIG_INTEL_IOMMU_DEFAULT_ON); intel_iommu=off leaves none there.
     if !do_check_iommu_on().context("check iommu on failed")? {
         return Err(anyhow!("IOMMU not enabled yet."));
     }
@@ -595,16 +695,24 @@ pub fn bind_device_to_vfio(bdf: &str, host_driver: &str, _vendor_device_id: &str
     info!(sl!(), "host driver : {}", host_driver);
     override_driver(bdf, VFIO_PCI_DRIVER).context("override driver")?;
 
-    let unbind_path = format!("/sys/bus/pci/devices/{}/driver/unbind", bdf);
-    // echo bdf > /sys/bus/pci/drivers/virtio-pci/unbind"
-    fs::write(&unbind_path, bdf)
-        .with_context(|| format!("Failed to echo {} > {}", bdf, &unbind_path))?;
+    // Unbind from whichever driver holds the device. A device no driver
+    // holds was left half way by an earlier attempt that failed before its
+    // reprobe, which a retried attach resumes; it cannot be unbound, and
+    // only needs the probe.
+    if Path::new(&format!("/sys/bus/pci/devices/{bdf}/driver")).exists() {
+        let unbind_path = format!("/sys/bus/pci/devices/{bdf}/driver/unbind");
+        // echo bdf > /sys/bus/pci/drivers/virtio-pci/unbind"
+        fs::write(&unbind_path, bdf)
+            .with_context(|| format!("Failed to echo {} > {}", bdf, unbind_path))?;
 
-    info!(sl!(), "{} is unbound from {}", bdf, host_driver);
+        info!(sl!(), "{} is unbound from {}", bdf, host_driver);
+    } else {
+        info!(sl!(), "no driver holds {}, probe only", bdf);
+    }
 
     // echo bdf > /sys/bus/pci/drivers_probe
     fs::write(SYS_BUS_PCI_DRIVER_PROBE, bdf)
-        .with_context(|| format!("Failed to echo {} > {}", bdf, SYS_BUS_PCI_DRIVER_PROBE))?;
+        .with_context(|| format!("Failed to echo {bdf} > {SYS_BUS_PCI_DRIVER_PROBE}"))?;
 
     info!(sl!(), "echo {} > /sys/bus/pci/drivers_probe", bdf);
 
@@ -612,8 +720,11 @@ pub fn bind_device_to_vfio(bdf: &str, host_driver: &str, _vendor_device_id: &str
 }
 
 pub fn is_equal_driver(bdf: &str, host_driver: &str) -> bool {
-    let sys_pci_devices_path = Path::new(SYS_BUS_PCI_DEVICES);
-    let driver_file = sys_pci_devices_path.join(bdf).join("driver");
+    is_equal_driver_in(Path::new(SYS_BUS_PCI_DEVICES), bdf, host_driver)
+}
+
+fn is_equal_driver_in(devices: &Path, bdf: &str, host_driver: &str) -> bool {
+    let driver_file = devices.join(bdf).join("driver");
 
     if driver_file.exists() {
         let driver_path = fs::read_link(driver_file).unwrap_or_default();
@@ -626,31 +737,44 @@ pub fn is_equal_driver(bdf: &str, host_driver: &str) -> bool {
     false
 }
 
-// bind_device_to_host binds the device to the host driver after unbinding from vfio-pci.
-pub fn bind_device_to_host(bdf: &str, host_driver: &str, _vendor_device_id: &str) -> Result<()> {
-    // Unbind from vfio-pci driver to the original host driver
+// bind_device_to_host binds the device to the host driver, from whatever
+// state a passthrough or an interrupted earlier attempt left it in.
+pub fn bind_device_to_host(bdf: &str, host_driver: &str) -> Result<()> {
+    bind_device_to_host_in(Path::new("/sys/bus/pci"), bdf, host_driver)
+}
+
+fn bind_device_to_host_in(pci_root: &Path, bdf: &str, host_driver: &str) -> Result<()> {
     info!(sl!(), "bind {} to {}", bdf, host_driver);
+    let devices = pci_root.join("devices");
 
     // if it's already bound to host_driver
-    if is_equal_driver(bdf, host_driver) {
+    if is_equal_driver_in(&devices, bdf, host_driver) {
         info!(
             sl!(),
-            "bdf {} was already unbound to host driver {}", bdf, host_driver
+            "bdf {} is already bound to host driver {}", bdf, host_driver
         );
         return Ok(());
     }
 
-    override_driver(bdf, host_driver).context("override driver")?;
+    let driver_override = devices.join(bdf).join("driver_override");
+    fs::write(&driver_override, host_driver)
+        .with_context(|| format!("echo {host_driver} > {}", driver_override.display()))?;
 
-    // echo bdf > /sys/bus/pci/drivers/vfio-pci/unbind"
-    std::fs::write(VFIO_PCI_DRIVER_UNBIND, bdf)
-        .with_context(|| format!("echo {}> {}", bdf, VFIO_PCI_DRIVER_UNBIND))?;
-    info!(sl!(), "echo {} > {}", bdf, VFIO_PCI_DRIVER_UNBIND);
+    // Unbind from whichever driver holds the device, vfio-pci after a
+    // passthrough. A device no driver holds was left half way by an earlier
+    // attempt that died or failed before its reprobe; it cannot be unbound,
+    // and only needs the probe.
+    let driver_link = devices.join(bdf).join("driver");
+    if driver_link.exists() {
+        let unbind = driver_link.join("unbind");
+        fs::write(&unbind, bdf).with_context(|| format!("echo {bdf} > {}", unbind.display()))?;
+        info!(sl!(), "{} unbound", bdf);
+    }
 
     // echo bdf > /sys/bus/pci/drivers_probe
-    std::fs::write(SYS_BUS_PCI_DRIVER_PROBE, bdf)
-        .with_context(|| format!("echo {} > {}", bdf, SYS_BUS_PCI_DRIVER_PROBE))?;
-    info!(sl!(), "echo {} > {}", bdf, SYS_BUS_PCI_DRIVER_PROBE);
+    let probe = pci_root.join("drivers_probe");
+    fs::write(&probe, bdf).with_context(|| format!("echo {bdf} > {}", probe.display()))?;
+    info!(sl!(), "echo {} > {}", bdf, probe.display());
 
     Ok(())
 }
@@ -659,13 +783,14 @@ pub fn bind_device_to_host(bdf: &str, host_driver: &str, _vendor_device_id: &str
 // expected format <bus>:<slot>.<func> eg. 02:10.0
 fn get_device_bdf(dev_sys_str: String) -> Option<String> {
     let dev_sys = dev_sys_str;
-    if !dev_sys.starts_with("0000:") {
-        return Some(dev_sys);
-    }
-
     let parts: Vec<&str> = dev_sys.as_str().splitn(2, ':').collect();
     if parts.len() < 2 {
         return None;
+    }
+
+    let domain_part = parts.first()?;
+    if domain_part.len() != 4 {
+        return Some(dev_sys);
     }
 
     parts.get(1).copied().map(|bdf| bdf.to_owned())
@@ -673,8 +798,9 @@ fn get_device_bdf(dev_sys_str: String) -> Option<String> {
 
 // expected format <domain>:<bus>:<slot>.<func> eg. 0000:02:10.0
 fn normalize_device_bdf(bdf: &str) -> String {
-    if !bdf.starts_with("0000") {
-        format!("0000:{}", bdf)
+    let parts: Vec<&str> = bdf.split(':').collect();
+    if parts.len() == 2 {
+        format!("0000:{bdf}")
     } else {
         bdf.to_string()
     }
@@ -682,7 +808,7 @@ fn normalize_device_bdf(bdf: &str) -> String {
 
 // make_device_nameid: generate a ID for the hypervisor commandline
 fn make_device_nameid(name_type: &str, id: usize, max_len: usize) -> String {
-    let name_id = format!("{}_{}", name_type, id);
+    let name_id = format!("{name_type}_{id}");
 
     if name_id.len() > max_len {
         name_id[0..max_len].to_string()
@@ -708,9 +834,7 @@ fn get_mediated_device_bdf(dev_sys_str: String) -> Option<String> {
 
 // dev_sys_path: /sys/bus/pci/devices/DDDD:BB:DD.F
 // cfg_path: : /sys/bus/pci/devices/DDDD:BB:DD.F/xxx
-fn get_device_property(bdf: &str, property: &str) -> Result<String> {
-    let device_name = normalize_device_bdf(bdf);
-
+fn get_device_property(device_name: &str, property: &str) -> Result<String> {
     let dev_sys_path = Path::new(SYS_BUS_PCI_DEVICES).join(device_name);
     let cfg_path = fs::read_to_string(dev_sys_path.join(property)).with_context(|| {
         format!(
@@ -740,14 +864,21 @@ pub fn get_vfio_iommu_group(bdf: String) -> Result<String> {
     let iommugrp_symlink = fs::read_link(&iommugrp_path)
         .map_err(|e| anyhow!("read iommu group symlink failed {:?}", e))?;
 
-    // get base name from iommu group symlink: X
-    let iommu_group = get_base_name(iommugrp_symlink)?
-        .into_string()
-        .map_err(|e| anyhow!("failed to get iommu group {:?}", e))?;
+    // Just get base name from iommu group symlink is enough as it will be checked
+    // within the full path /sys/kernel/iommu_groups/$iommu_group in the subsequent step.
+    let iommu_group = iommugrp_symlink
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| {
+            anyhow!(
+                "failed to get iommu group with symlink {:?}",
+                iommugrp_symlink
+            )
+        })?;
 
     // we'd better verify the path to ensure it dose exist.
     if !Path::new(SYS_KERN_IOMMU_GROUPS)
-        .join(&iommu_group)
+        .join(iommu_group)
         .join("devices")
         .join(dbdf.as_str())
         .exists()
@@ -760,7 +891,7 @@ pub fn get_vfio_iommu_group(bdf: String) -> Result<String> {
         ));
     }
 
-    Ok(format!("/dev/vfio/{}", iommu_group))
+    Ok(format!("/dev/vfio/{iommu_group}"))
 }
 
 pub fn get_vfio_device(device: String) -> Result<String> {
@@ -775,4 +906,72 @@ pub fn get_vfio_device(device: String) -> Result<String> {
     }
 
     Ok(vfio_device)
+}
+
+#[cfg(test)]
+mod bind_to_host_tests {
+    use super::bind_device_to_host_in;
+    use std::fs;
+    use std::path::Path;
+
+    const BDF: &str = "0000:41:00.2";
+
+    /// A pci root with the device bound to `driver`, or to nothing.
+    fn pci_root(dir: &Path, driver: Option<&str>) {
+        fs::create_dir_all(dir.join("devices").join(BDF)).unwrap();
+        fs::write(dir.join("drivers_probe"), "").unwrap();
+        if let Some(driver) = driver {
+            let driver_dir = dir.join("drivers").join(driver);
+            fs::create_dir_all(&driver_dir).unwrap();
+            fs::write(driver_dir.join("unbind"), "").unwrap();
+            std::os::unix::fs::symlink(
+                format!("../../drivers/{driver}"),
+                dir.join("devices").join(BDF).join("driver"),
+            )
+            .unwrap();
+        }
+    }
+
+    fn read(path: &Path) -> String {
+        fs::read_to_string(path).unwrap_or_default()
+    }
+
+    #[test]
+    fn a_device_on_its_host_driver_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        pci_root(dir.path(), Some("mlx5_core"));
+
+        bind_device_to_host_in(dir.path(), BDF, "mlx5_core").unwrap();
+
+        assert_eq!(read(&dir.path().join("drivers_probe")), "");
+        assert_eq!(read(&dir.path().join("drivers/mlx5_core/unbind")), "");
+    }
+
+    #[test]
+    fn a_device_on_vfio_is_unbound_and_reprobed() {
+        let dir = tempfile::tempdir().unwrap();
+        pci_root(dir.path(), Some("vfio-pci"));
+
+        bind_device_to_host_in(dir.path(), BDF, "mlx5_core").unwrap();
+
+        assert_eq!(read(&dir.path().join("drivers/vfio-pci/unbind")), BDF);
+        assert_eq!(read(&dir.path().join("drivers_probe")), BDF);
+        assert_eq!(
+            read(&dir.path().join("devices").join(BDF).join("driver_override")),
+            "mlx5_core"
+        );
+    }
+
+    #[test]
+    fn a_half_rebound_device_only_needs_the_probe() {
+        // An earlier attempt unbound the device and died, or failed, before
+        // its reprobe: no driver holds it. The retry must not fail on the
+        // impossible unbind, and must reach the probe.
+        let dir = tempfile::tempdir().unwrap();
+        pci_root(dir.path(), None);
+
+        bind_device_to_host_in(dir.path(), BDF, "mlx5_core").unwrap();
+
+        assert_eq!(read(&dir.path().join("drivers_probe")), BDF);
+    }
 }

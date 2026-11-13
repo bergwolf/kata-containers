@@ -16,9 +16,9 @@ import (
 	"strings"
 
 	"github.com/containerd/ttrpc"
-	gpb "github.com/gogo/protobuf/types"
 	aTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/agent/protocols"
 	pb "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/agent/protocols/grpc"
+	gpb "google.golang.org/protobuf/types/known/emptypb"
 )
 
 const VSockPrefix = "mock://"
@@ -259,4 +259,20 @@ func (p *HybridVSockTTRPCMockImp) SetIPTables(ctx context.Context, req *pb.SetIP
 
 func (p *HybridVSockTTRPCMockImp) SetPolicy(ctx context.Context, req *pb.SetPolicyRequest) (*gpb.Empty, error) {
 	return &gpb.Empty{}, nil
+}
+
+func (p *HybridVSockTTRPCMockImp) GetDiagnosticData(ctx context.Context, req *pb.GetDiagnosticDataRequest) (*pb.GetDiagnosticDataResponse, error) {
+	return &pb.GetDiagnosticDataResponse{}, nil
+}
+
+func (p *HybridVSockTTRPCMockImp) AddSwapPath(ctx context.Context, req *pb.AddSwapPathRequest) (*gpb.Empty, error) {
+	return emptyResp, nil
+}
+
+func (p *HybridVSockTTRPCMockImp) MemAgentCompactSet(ctx context.Context, req *pb.MemAgentCompactConfig) (*gpb.Empty, error) {
+	return emptyResp, nil
+}
+
+func (p *HybridVSockTTRPCMockImp) MemAgentMemcgSet(ctx context.Context, req *pb.MemAgentMemcgConfig) (*gpb.Empty, error) {
+	return emptyResp, nil
 }

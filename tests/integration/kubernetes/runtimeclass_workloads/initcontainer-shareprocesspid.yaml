@@ -8,9 +8,10 @@ kind: Pod
 metadata:
   name: busybox
 spec:
-  terminationGracePeriodSeconds: 0
   shareProcessNamespace: true
   runtimeClassName: kata
+  securityContext:
+    supplementalGroups: [10]
   initContainers:
   - name: first
     image: quay.io/prometheus/busybox:latest

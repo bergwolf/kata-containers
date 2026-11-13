@@ -2,32 +2,72 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 //
-use crate::rpc;
-use anyhow::{bail, ensure, Context, Result};
+
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use serde::Deserialize;
-use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::str::FromStr;
 use std::time;
+use strum_macros::{Display, EnumString};
 use tracing::instrument;
+use url::Url;
 
 use kata_types::config::default::DEFAULT_AGENT_VSOCK_PORT;
 
 const DEBUG_CONSOLE_FLAG: &str = "agent.debug_console";
-const DEV_MODE_FLAG: &str = "agent.devmode";
 const TRACE_MODE_OPTION: &str = "agent.trace";
 const LOG_LEVEL_OPTION: &str = "agent.log";
 const SERVER_ADDR_OPTION: &str = "agent.server_addr";
+const PASSFD_LISTENER_PORT: &str = "agent.passfd_listener_port";
 const HOTPLUG_TIMOUT_OPTION: &str = "agent.hotplug_timeout";
+const CDH_API_TIMOUT_OPTION: &str = "agent.cdh_api_timeout";
+const CDH_IMAGE_PULL_TIMEOUT_OPTION: &str = "agent.image_pull_timeout";
+const CDI_TIMEOUT_OPTION: &str = "agent.cdi_timeout";
+const LAUNCH_PROCESS_TIMEOUT_OPTION: &str = "agent.launch_process_timeout";
+const VISIBLE_CDI_DEVICES_OPTION: &str = "agent.visible_cdi_devices";
 const DEBUG_CONSOLE_VPORT_OPTION: &str = "agent.debug_console_vport";
 const LOG_VPORT_OPTION: &str = "agent.log_vport";
 const CONTAINER_PIPE_SIZE_OPTION: &str = "agent.container_pipe_size";
-const UNIFIED_CGROUP_HIERARCHY_OPTION: &str = "agent.unified_cgroup_hierarchy";
+const CGROUP_NO_V1: &str = "cgroup_no_v1";
+const UNIFIED_CGROUP_HIERARCHY_OPTION: &str = "systemd.unified_cgroup_hierarchy";
 const CONFIG_FILE: &str = "agent.config_file";
+const GUEST_COMPONENTS_REST_API_OPTION: &str = "agent.guest_components_rest_api";
+const GUEST_COMPONENTS_PROCS_OPTION: &str = "agent.guest_components_procs";
+const SECURE_STORAGE_INTEGRITY_OPTION: &str = "agent.secure_storage_integrity";
+
+// Configure the proxy settings for HTTPS requests in the guest,
+// to solve the problem of not being able to access the specified image in some cases.
+const HTTPS_PROXY: &str = "agent.https_proxy";
+const NO_PROXY: &str = "agent.no_proxy";
+
+const MEM_AGENT_ENABLE: &str = "agent.mem_agent_enable";
+const MEM_AGENT_MEMCG_DISABLE: &str = "agent.mem_agent_memcg_disable";
+const MEM_AGENT_MEMCG_SWAP: &str = "agent.mem_agent_memcg_swap";
+const MEM_AGENT_MEMCG_SWAPPINESS_MAX: &str = "agent.mem_agent_memcg_swappiness_max";
+const MEM_AGENT_MEMCG_PERIOD_SECS: &str = "agent.mem_agent_memcg_period_secs";
+const MEM_AGENT_MEMCG_PERIOD_PSI_PERCENT_LIMIT: &str =
+    "agent.mem_agent_memcg_period_psi_percent_limit";
+const MEM_AGENT_MEMCG_EVICTION_PSI_PERCENT_LIMIT: &str =
+    "agent.mem_agent_memcg_eviction_psi_percent_limit";
+const MEM_AGENT_MEMCG_EVICTION_RUN_AGING_COUNT_MIN: &str =
+    "agent.mem_agent_memcg_eviction_run_aging_count_min";
+const MEM_AGENT_COMPACT_DISABLE: &str = "agent.mem_agent_compact_disable";
+const MEM_AGENT_COMPACT_PERIOD_SECS: &str = "agent.mem_agent_compact_period_secs";
+const MEM_AGENT_COMPACT_PERIOD_PSI_PERCENT_LIMIT: &str =
+    "agent.mem_agent_compact_period_psi_percent_limit";
+const MEM_AGENT_COMPACT_PSI_PERCENT_LIMIT: &str = "agent.mem_agent_compact_psi_percent_limit";
+const MEM_AGENT_COMPACT_SEC_MAX: &str = "agent.mem_agent_compact_sec_max";
+const MEM_AGENT_COMPACT_ORDER: &str = "agent.mem_agent_compact_order";
+const MEM_AGENT_COMPACT_THRESHOLD: &str = "agent.mem_agent_compact_threshold";
+const MEM_AGENT_COMPACT_FORCE_TIMES: &str = "agent.mem_agent_compact_force_times";
 
 const DEFAULT_LOG_LEVEL: slog::Level = slog::Level::Info;
 const DEFAULT_HOTPLUG_TIMEOUT: time::Duration = time::Duration::from_secs(3);
+const DEFAULT_CDH_API_TIMEOUT: time::Duration = time::Duration::from_secs(50);
+const DEFAULT_IMAGE_PULL_TIMEOUT: time::Duration = time::Duration::from_secs(1200);
+const DEFAULT_CDI_TIMEOUT: time::Duration = time::Duration::from_secs(100);
+const DEFAULT_LAUNCH_PROCESS_TIMEOUT: time::Duration = time::Duration::from_secs(6);
 const DEFAULT_CONTAINER_PIPE_SIZE: i32 = 0;
 const VSOCK_ADDR: &str = "vsock://-1";
 
@@ -35,6 +75,10 @@ const VSOCK_ADDR: &str = "vsock://-1";
 const SERVER_ADDR_ENV_VAR: &str = "KATA_AGENT_SERVER_ADDR";
 const LOG_LEVEL_ENV_VAR: &str = "KATA_AGENT_LOG_LEVEL";
 const TRACING_ENV_VAR: &str = "KATA_AGENT_TRACING";
+#[cfg(feature = "agent-policy")]
+// Policy file environment variable to pass a policy document
+// to initialize agent policy engine.
+const POLICY_FILE_VAR: &str = "KATA_AGENT_POLICY_FILE";
 
 const ERR_INVALID_LOG_LEVEL: &str = "invalid log level";
 const ERR_INVALID_LOG_LEVEL_PARAM: &str = "invalid log level parameter";
@@ -42,56 +86,117 @@ const ERR_INVALID_GET_VALUE_PARAM: &str = "expected name=value";
 const ERR_INVALID_GET_VALUE_NO_NAME: &str = "name=value parameter missing name";
 const ERR_INVALID_GET_VALUE_NO_VALUE: &str = "name=value parameter missing value";
 const ERR_INVALID_LOG_LEVEL_KEY: &str = "invalid log level key name";
-
-const ERR_INVALID_HOTPLUG_TIMEOUT: &str = "invalid hotplug timeout parameter";
-const ERR_INVALID_HOTPLUG_TIMEOUT_PARAM: &str = "unable to parse hotplug timeout";
-const ERR_INVALID_HOTPLUG_TIMEOUT_KEY: &str = "invalid hotplug timeout key name";
+const ERR_INVALID_TIMEOUT: &str = "invalid timeout parameter";
+const ERR_INVALID_TIMEOUT_PARAM: &str = "unable to parse timeout";
+const ERR_INVALID_TIMEOUT_KEY: &str = "invalid timeout key name";
 
 const ERR_INVALID_CONTAINER_PIPE_SIZE: &str = "invalid container pipe size parameter";
 const ERR_INVALID_CONTAINER_PIPE_SIZE_PARAM: &str = "unable to parse container pipe size";
 const ERR_INVALID_CONTAINER_PIPE_SIZE_KEY: &str = "invalid container pipe size key name";
 const ERR_INVALID_CONTAINER_PIPE_NEGATIVE: &str = "container pipe size should not be negative";
 
-#[derive(Debug, Default, Deserialize)]
-pub struct EndpointsConfig {
-    pub allowed: Vec<String>,
+const ERR_INVALID_GUEST_COMPONENTS_REST_API_VALUE: &str = "invalid guest components rest api feature given. Valid values are `all`, `attestation`, `resource`";
+const ERR_INVALID_GUEST_COMPONENTS_PROCS_VALUE: &str = "invalid guest components process param given. Valid values are `attestation-agent`, `confidential-data-hub`, `api-server-rest`, or `none`";
+
+#[derive(Clone, Copy, Debug, Default, Display, Deserialize, EnumString, PartialEq)]
+// Features seem to typically be in kebab-case format, but we only have single words at the moment
+#[strum(serialize_all = "kebab-case")]
+#[serde(rename_all = "kebab-case")]
+pub enum GuestComponentsFeatures {
+    All,
+    Attestation,
+    #[default]
+    Resource,
 }
 
-#[derive(Debug, Default)]
-pub struct AgentEndpoints {
-    pub allowed: HashSet<String>,
-    pub all_allowed: bool,
+#[derive(Clone, Copy, Debug, Default, Display, Deserialize, EnumString, PartialEq, Eq)]
+/// Attestation-related processes that we want to spawn as children of the agent
+#[strum(serialize_all = "kebab-case")]
+#[serde(rename_all = "kebab-case")]
+pub enum GuestComponentsProcs {
+    None,
+    /// ApiServerRest implies ConfidentialDataHub and AttestationAgent
+    #[default]
+    ApiServerRest,
+    AttestationAgent,
+    /// ConfidentialDataHub implies AttestationAgent
+    ConfidentialDataHub,
 }
 
 #[derive(Debug)]
 pub struct AgentConfig {
     pub debug_console: bool,
-    pub dev_mode: bool,
     pub log_level: slog::Level,
     pub hotplug_timeout: time::Duration,
+    pub cdh_api_timeout: time::Duration,
+    pub image_pull_timeout: time::Duration,
+    pub cdi_timeout: time::Duration,
+    pub launch_process_timeout: time::Duration,
+    pub visible_cdi_devices: bool,
     pub debug_console_vport: i32,
     pub log_vport: i32,
     pub container_pipe_size: i32,
     pub server_addr: String,
+    pub passfd_listener_port: i32,
+    pub cgroup_no_v1: String,
     pub unified_cgroup_hierarchy: bool,
     pub tracing: bool,
-    pub endpoints: AgentEndpoints,
-    pub supports_seccomp: bool,
+    pub https_proxy: String,
+    pub no_proxy: String,
+    pub guest_components_rest_api: GuestComponentsFeatures,
+    pub guest_components_procs: GuestComponentsProcs,
+    pub secure_storage_integrity: bool,
+    #[cfg(feature = "agent-policy")]
+    pub policy_file: String,
+    pub mem_agent: Option<MemAgentConfig>,
+}
+
+#[derive(Debug, Default, PartialEq)]
+pub struct MemAgentConfig {
+    pub memcg_config: mem_agent::memcg::Config,
+    pub compact_config: mem_agent::compact::Config,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct AgentConfigBuilder {
     pub debug_console: Option<bool>,
-    pub dev_mode: Option<bool>,
     pub log_level: Option<String>,
     pub hotplug_timeout: Option<time::Duration>,
+    pub cdh_api_timeout: Option<time::Duration>,
+    pub image_pull_timeout: Option<time::Duration>,
+    pub cdi_timeout: Option<time::Duration>,
+    pub launch_process_timeout: Option<time::Duration>,
+    pub visible_cdi_devices: Option<bool>,
     pub debug_console_vport: Option<i32>,
     pub log_vport: Option<i32>,
     pub container_pipe_size: Option<i32>,
     pub server_addr: Option<String>,
+    pub passfd_listener_port: Option<i32>,
     pub unified_cgroup_hierarchy: Option<bool>,
     pub tracing: Option<bool>,
-    pub endpoints: Option<EndpointsConfig>,
+    pub https_proxy: Option<String>,
+    pub no_proxy: Option<String>,
+    pub guest_components_rest_api: Option<GuestComponentsFeatures>,
+    pub guest_components_procs: Option<GuestComponentsProcs>,
+    pub secure_storage_integrity: Option<bool>,
+    #[cfg(feature = "agent-policy")]
+    pub policy_file: Option<String>,
+    pub mem_agent_enable: Option<bool>,
+    pub mem_agent_memcg_disable: Option<bool>,
+    pub mem_agent_memcg_swap: Option<bool>,
+    pub mem_agent_memcg_swappiness_max: Option<u8>,
+    pub mem_agent_memcg_period_secs: Option<u64>,
+    pub mem_agent_memcg_period_psi_percent_limit: Option<u8>,
+    pub mem_agent_memcg_eviction_psi_percent_limit: Option<u8>,
+    pub mem_agent_memcg_eviction_run_aging_count_min: Option<u64>,
+    pub mem_agent_compact_disable: Option<bool>,
+    pub mem_agent_compact_period_secs: Option<u64>,
+    pub mem_agent_compact_period_psi_percent_limit: Option<u8>,
+    pub mem_agent_compact_psi_percent_limit: Option<u8>,
+    pub mem_agent_compact_sec_max: Option<i64>,
+    pub mem_agent_compact_order: Option<u8>,
+    pub mem_agent_compact_threshold: Option<u64>,
+    pub mem_agent_compact_force_times: Option<u64>,
 }
 
 macro_rules! config_override {
@@ -101,9 +206,17 @@ macro_rules! config_override {
         }
     };
 
-    ($builder:ident, $config:ident, $field:ident, $func: ident) => {
+    ($builder:ident, $config:ident, $field:ident, $func:ident) => {
         if let Some(v) = $builder.$field {
             $config.$field = $func(&v)?;
+        }
+    };
+}
+
+macro_rules! mem_agent_config_override {
+    ($builder_v:expr, $mac_v:expr) => {
+        if let Some(v) = $builder_v {
+            $mac_v = v;
         }
     };
 }
@@ -130,7 +243,7 @@ macro_rules! parse_cmdline_param {
     ($param:ident, $key:ident, $field:expr, $func:ident, $guard:expr) => {
         if $param.starts_with(format!("{}=", $key).as_str()) {
             let val = $func($param)?;
-            if $guard(val) {
+            if $guard(&val) {
                 $field = val;
             }
             continue;
@@ -142,17 +255,29 @@ impl Default for AgentConfig {
     fn default() -> Self {
         AgentConfig {
             debug_console: false,
-            dev_mode: false,
             log_level: DEFAULT_LOG_LEVEL,
             hotplug_timeout: DEFAULT_HOTPLUG_TIMEOUT,
+            cdh_api_timeout: DEFAULT_CDH_API_TIMEOUT,
+            image_pull_timeout: DEFAULT_IMAGE_PULL_TIMEOUT,
+            cdi_timeout: DEFAULT_CDI_TIMEOUT,
+            launch_process_timeout: DEFAULT_LAUNCH_PROCESS_TIMEOUT,
+            visible_cdi_devices: false,
             debug_console_vport: 0,
             log_vport: 0,
             container_pipe_size: DEFAULT_CONTAINER_PIPE_SIZE,
-            server_addr: format!("{}:{}", VSOCK_ADDR, DEFAULT_AGENT_VSOCK_PORT),
+            server_addr: format!("{VSOCK_ADDR}:{DEFAULT_AGENT_VSOCK_PORT}"),
+            passfd_listener_port: 0,
+            cgroup_no_v1: String::from(""),
             unified_cgroup_hierarchy: false,
             tracing: false,
-            endpoints: Default::default(),
-            supports_seccomp: rpc::have_seccomp(),
+            https_proxy: String::from(""),
+            no_proxy: String::from(""),
+            guest_components_rest_api: GuestComponentsFeatures::default(),
+            guest_components_procs: GuestComponentsProcs::default(),
+            secure_storage_integrity: true,
+            #[cfg(feature = "agent-policy")]
+            policy_file: String::from(""),
+            mem_agent: None,
         }
     }
 }
@@ -167,7 +292,6 @@ impl FromStr for AgentConfig {
 
         // Overwrite default values with the configuration files ones.
         config_override!(agent_config_builder, agent_config, debug_console);
-        config_override!(agent_config_builder, agent_config, dev_mode);
         config_override!(
             agent_config_builder,
             agent_config,
@@ -175,18 +299,97 @@ impl FromStr for AgentConfig {
             logrus_to_slog_level
         );
         config_override!(agent_config_builder, agent_config, hotplug_timeout);
+        config_override!(agent_config_builder, agent_config, cdh_api_timeout);
+        config_override!(agent_config_builder, agent_config, image_pull_timeout);
+        config_override!(agent_config_builder, agent_config, cdi_timeout);
+        config_override!(agent_config_builder, agent_config, launch_process_timeout);
+        config_override!(agent_config_builder, agent_config, visible_cdi_devices);
         config_override!(agent_config_builder, agent_config, debug_console_vport);
         config_override!(agent_config_builder, agent_config, log_vport);
         config_override!(agent_config_builder, agent_config, container_pipe_size);
         config_override!(agent_config_builder, agent_config, server_addr);
+        config_override!(agent_config_builder, agent_config, passfd_listener_port);
         config_override!(agent_config_builder, agent_config, unified_cgroup_hierarchy);
         config_override!(agent_config_builder, agent_config, tracing);
+        config_override!(agent_config_builder, agent_config, https_proxy);
+        config_override!(agent_config_builder, agent_config, no_proxy);
+        config_override!(
+            agent_config_builder,
+            agent_config,
+            guest_components_rest_api
+        );
+        config_override!(agent_config_builder, agent_config, guest_components_procs);
+        config_override!(agent_config_builder, agent_config, secure_storage_integrity);
 
-        // Populate the allowed endpoints hash set, if we got any from the config file.
-        if let Some(endpoints) = agent_config_builder.endpoints {
-            for ep in endpoints.allowed {
-                agent_config.endpoints.allowed.insert(ep);
-            }
+        #[cfg(feature = "agent-policy")]
+        config_override!(agent_config_builder, agent_config, policy_file);
+
+        if agent_config_builder.mem_agent_enable.unwrap_or(false) {
+            let mut mac = MemAgentConfig::default();
+
+            mem_agent_config_override!(
+                agent_config_builder.mem_agent_memcg_disable,
+                mac.memcg_config.default.disabled
+            );
+            mem_agent_config_override!(
+                agent_config_builder.mem_agent_memcg_swap,
+                mac.memcg_config.default.swap
+            );
+            mem_agent_config_override!(
+                agent_config_builder.mem_agent_memcg_swappiness_max,
+                mac.memcg_config.default.swappiness_max
+            );
+            mem_agent_config_override!(
+                agent_config_builder.mem_agent_memcg_period_secs,
+                mac.memcg_config.default.period_secs
+            );
+            mem_agent_config_override!(
+                agent_config_builder.mem_agent_memcg_period_psi_percent_limit,
+                mac.memcg_config.default.period_psi_percent_limit
+            );
+            mem_agent_config_override!(
+                agent_config_builder.mem_agent_memcg_eviction_psi_percent_limit,
+                mac.memcg_config.default.eviction_psi_percent_limit
+            );
+            mem_agent_config_override!(
+                agent_config_builder.mem_agent_memcg_eviction_run_aging_count_min,
+                mac.memcg_config.default.eviction_run_aging_count_min
+            );
+
+            mem_agent_config_override!(
+                agent_config_builder.mem_agent_compact_disable,
+                mac.compact_config.disabled
+            );
+            mem_agent_config_override!(
+                agent_config_builder.mem_agent_compact_period_secs,
+                mac.compact_config.period_secs
+            );
+            mem_agent_config_override!(
+                agent_config_builder.mem_agent_compact_period_psi_percent_limit,
+                mac.compact_config.period_psi_percent_limit
+            );
+            mem_agent_config_override!(
+                agent_config_builder.mem_agent_compact_psi_percent_limit,
+                mac.compact_config.compact_psi_percent_limit
+            );
+            mem_agent_config_override!(
+                agent_config_builder.mem_agent_compact_sec_max,
+                mac.compact_config.compact_sec_max
+            );
+            mem_agent_config_override!(
+                agent_config_builder.mem_agent_compact_order,
+                mac.compact_config.compact_order
+            );
+            mem_agent_config_override!(
+                agent_config_builder.mem_agent_compact_threshold,
+                mac.compact_config.compact_threshold
+            );
+            mem_agent_config_override!(
+                agent_config_builder.mem_agent_compact_force_times,
+                mac.compact_config.compact_force_times
+            );
+
+            agent_config.mem_agent = Some(mac);
         }
 
         Ok(agent_config)
@@ -201,7 +404,10 @@ impl AgentConfig {
         let config_position = args.iter().position(|a| a == "--config" || a == "-c");
         if let Some(config_position) = config_position {
             if let Some(config_file) = args.get(config_position + 1) {
-                return AgentConfig::from_config_file(config_file).context("AgentConfig from args");
+                let mut config =
+                    AgentConfig::from_config_file(config_file).context("AgentConfig from args")?;
+                config.override_config_from_envs();
+                return Ok(config);
             } else {
                 panic!("The config argument wasn't formed properly: {:?}", args);
             }
@@ -210,12 +416,14 @@ impl AgentConfig {
         let mut config: AgentConfig = Default::default();
         let cmdline = fs::read_to_string(file)?;
         let params: Vec<&str> = cmdline.split_ascii_whitespace().collect();
+        let mut mem_agent_enable = false;
+        let mut mac = MemAgentConfig::default();
         for param in params.iter() {
             // If we get a configuration file path from the command line, we
             // generate our config from it.
             // The agent will fail to start if the configuration file is not present,
             // or if it can't be parsed properly.
-            if param.starts_with(format!("{}=", CONFIG_FILE).as_str()) {
+            if param.starts_with(format!("{CONFIG_FILE}=").as_str()) {
                 let config_file = get_string_value(param)?;
                 return AgentConfig::from_config_file(&config_file)
                     .context("AgentConfig from kernel cmdline");
@@ -223,7 +431,6 @@ impl AgentConfig {
 
             // parse cmdline flags
             parse_cmdline_param!(param, DEBUG_CONSOLE_FLAG, config.debug_console);
-            parse_cmdline_param!(param, DEV_MODE_FLAG, config.dev_mode);
 
             // Support "bare" tracing option for backwards compatibility with
             // Kata 1.x.
@@ -248,8 +455,50 @@ impl AgentConfig {
                 param,
                 HOTPLUG_TIMOUT_OPTION,
                 config.hotplug_timeout,
-                get_hotplug_timeout,
-                |hotplug_timeout: time::Duration| hotplug_timeout.as_secs() > 0
+                get_timeout,
+                |hotplug_timeout: &time::Duration| hotplug_timeout.as_secs() > 0
+            );
+
+            // ensure the timeout is a positive value
+            parse_cmdline_param!(
+                param,
+                CDH_API_TIMOUT_OPTION,
+                config.cdh_api_timeout,
+                get_timeout,
+                |cdh_api_timeout: &time::Duration| cdh_api_timeout.as_secs() > 0
+            );
+
+            // ensure the timeout is a positive value
+            parse_cmdline_param!(
+                param,
+                CDH_IMAGE_PULL_TIMEOUT_OPTION,
+                config.image_pull_timeout,
+                get_timeout,
+                |image_pull_timeout: &time::Duration| image_pull_timeout.as_secs() > 0
+            );
+
+            // ensure the timeout is a positive value
+            parse_cmdline_param!(
+                param,
+                CDI_TIMEOUT_OPTION,
+                config.cdi_timeout,
+                get_timeout,
+                |cdi_timeout: &time::Duration| cdi_timeout.as_secs() > 0
+            );
+
+            parse_cmdline_param!(
+                param,
+                LAUNCH_PROCESS_TIMEOUT_OPTION,
+                config.launch_process_timeout,
+                get_timeout,
+                |launch_process_timeout: &time::Duration| launch_process_timeout.as_secs() > 0
+            );
+
+            parse_cmdline_param!(
+                param,
+                VISIBLE_CDI_DEVICES_OPTION,
+                config.visible_cdi_devices,
+                get_bool_value
             );
 
             // vsock port should be positive values
@@ -257,17 +506,23 @@ impl AgentConfig {
                 param,
                 DEBUG_CONSOLE_VPORT_OPTION,
                 config.debug_console_vport,
-                get_vsock_port,
-                |port| port > 0
+                get_number_value,
+                |port: &i32| *port > 0
             );
             parse_cmdline_param!(
                 param,
                 LOG_VPORT_OPTION,
                 config.log_vport,
-                get_vsock_port,
-                |port| port > 0
+                get_number_value,
+                |port: &i32| *port > 0
             );
-
+            parse_cmdline_param!(
+                param,
+                PASSFD_LISTENER_PORT,
+                config.passfd_listener_port,
+                get_number_value,
+                |port: &i32| *port > 0
+            );
             parse_cmdline_param!(
                 param,
                 CONTAINER_PIPE_SIZE_OPTION,
@@ -276,30 +531,139 @@ impl AgentConfig {
             );
             parse_cmdline_param!(
                 param,
+                CGROUP_NO_V1,
+                config.cgroup_no_v1,
+                get_string_value,
+                |no_v1| no_v1 == "all"
+            );
+            parse_cmdline_param!(
+                param,
                 UNIFIED_CGROUP_HIERARCHY_OPTION,
                 config.unified_cgroup_hierarchy,
                 get_bool_value
             );
-        }
+            parse_cmdline_param!(param, HTTPS_PROXY, config.https_proxy, get_url_value);
+            parse_cmdline_param!(param, NO_PROXY, config.no_proxy, get_string_value);
+            parse_cmdline_param!(
+                param,
+                GUEST_COMPONENTS_REST_API_OPTION,
+                config.guest_components_rest_api,
+                get_guest_components_features_value
+            );
+            parse_cmdline_param!(
+                param,
+                GUEST_COMPONENTS_PROCS_OPTION,
+                config.guest_components_procs,
+                get_guest_components_procs_value
+            );
+            parse_cmdline_param!(
+                param,
+                SECURE_STORAGE_INTEGRITY_OPTION,
+                config.secure_storage_integrity,
+                get_bool_value
+            );
 
-        if let Ok(addr) = env::var(SERVER_ADDR_ENV_VAR) {
-            config.server_addr = addr;
-        }
+            parse_cmdline_param!(param, MEM_AGENT_ENABLE, mem_agent_enable, get_bool_value);
 
-        if let Ok(addr) = env::var(LOG_LEVEL_ENV_VAR) {
-            if let Ok(level) = logrus_to_slog_level(&addr) {
-                config.log_level = level;
+            if mem_agent_enable {
+                parse_cmdline_param!(
+                    param,
+                    MEM_AGENT_MEMCG_DISABLE,
+                    mac.memcg_config.default.disabled,
+                    get_number_value
+                );
+                parse_cmdline_param!(
+                    param,
+                    MEM_AGENT_MEMCG_SWAP,
+                    mac.memcg_config.default.swap,
+                    get_number_value
+                );
+                parse_cmdline_param!(
+                    param,
+                    MEM_AGENT_MEMCG_SWAPPINESS_MAX,
+                    mac.memcg_config.default.swappiness_max,
+                    get_number_value
+                );
+                parse_cmdline_param!(
+                    param,
+                    MEM_AGENT_MEMCG_PERIOD_SECS,
+                    mac.memcg_config.default.period_secs,
+                    get_number_value
+                );
+                parse_cmdline_param!(
+                    param,
+                    MEM_AGENT_MEMCG_PERIOD_PSI_PERCENT_LIMIT,
+                    mac.memcg_config.default.period_psi_percent_limit,
+                    get_number_value
+                );
+                parse_cmdline_param!(
+                    param,
+                    MEM_AGENT_MEMCG_EVICTION_PSI_PERCENT_LIMIT,
+                    mac.memcg_config.default.eviction_psi_percent_limit,
+                    get_number_value
+                );
+                parse_cmdline_param!(
+                    param,
+                    MEM_AGENT_MEMCG_EVICTION_RUN_AGING_COUNT_MIN,
+                    mac.memcg_config.default.eviction_run_aging_count_min,
+                    get_number_value
+                );
+                parse_cmdline_param!(
+                    param,
+                    MEM_AGENT_COMPACT_DISABLE,
+                    mac.compact_config.disabled,
+                    get_number_value
+                );
+                parse_cmdline_param!(
+                    param,
+                    MEM_AGENT_COMPACT_PERIOD_SECS,
+                    mac.compact_config.period_secs,
+                    get_number_value
+                );
+                parse_cmdline_param!(
+                    param,
+                    MEM_AGENT_COMPACT_PERIOD_PSI_PERCENT_LIMIT,
+                    mac.compact_config.period_psi_percent_limit,
+                    get_number_value
+                );
+                parse_cmdline_param!(
+                    param,
+                    MEM_AGENT_COMPACT_PSI_PERCENT_LIMIT,
+                    mac.compact_config.compact_psi_percent_limit,
+                    get_number_value
+                );
+                parse_cmdline_param!(
+                    param,
+                    MEM_AGENT_COMPACT_SEC_MAX,
+                    mac.compact_config.compact_sec_max,
+                    get_number_value
+                );
+                parse_cmdline_param!(
+                    param,
+                    MEM_AGENT_COMPACT_ORDER,
+                    mac.compact_config.compact_order,
+                    get_number_value
+                );
+                parse_cmdline_param!(
+                    param,
+                    MEM_AGENT_COMPACT_THRESHOLD,
+                    mac.compact_config.compact_threshold,
+                    get_number_value
+                );
+                parse_cmdline_param!(
+                    param,
+                    MEM_AGENT_COMPACT_FORCE_TIMES,
+                    mac.compact_config.compact_force_times,
+                    get_number_value
+                );
             }
         }
 
-        if let Ok(value) = env::var(TRACING_ENV_VAR) {
-            let name_value = format!("{}={}", TRACING_ENV_VAR, value);
-
-            config.tracing = get_bool_value(&name_value)?;
+        if mem_agent_enable {
+            config.mem_agent = Some(mac);
         }
 
-        // We did not get a configuration file: allow all endpoints.
-        config.endpoints.all_allowed = true;
+        config.override_config_from_envs();
 
         Ok(config)
     }
@@ -307,21 +671,49 @@ impl AgentConfig {
     #[instrument]
     pub fn from_config_file(file: &str) -> Result<AgentConfig> {
         let config = fs::read_to_string(file)
-            .with_context(|| format!("Failed to read config file {}", file))?;
+            .with_context(|| format!("Failed to read config file {file}"))?;
         AgentConfig::from_str(&config)
     }
 
-    pub fn is_allowed_endpoint(&self, ep: &str) -> bool {
-        self.endpoints.all_allowed || self.endpoints.allowed.contains(ep)
+    #[instrument]
+    fn override_config_from_envs(&mut self) {
+        if let Ok(addr) = env::var(SERVER_ADDR_ENV_VAR) {
+            self.server_addr = addr;
+        }
+
+        if let Ok(level) = env::var(LOG_LEVEL_ENV_VAR) {
+            if let Ok(level) = logrus_to_slog_level(&level) {
+                self.log_level = level;
+            }
+        }
+
+        if let Ok(value) = env::var(TRACING_ENV_VAR) {
+            let name_value = format!("{TRACING_ENV_VAR}={value}");
+
+            self.tracing = get_bool_value(&name_value).unwrap_or(false);
+        }
+
+        #[cfg(feature = "agent-policy")]
+        if let Ok(policy_file) = env::var(POLICY_FILE_VAR) {
+            self.policy_file = policy_file;
+        }
     }
 }
 
 #[instrument]
-fn get_vsock_port(p: &str) -> Result<i32> {
+fn get_number_value<T>(p: &str) -> Result<T>
+where
+    T: std::str::FromStr,
+    <T as std::str::FromStr>::Err: std::fmt::Debug,
+{
     let fields: Vec<&str> = p.split('=').collect();
-    ensure!(fields.len() == 2, "invalid port parameter");
+    if fields.len() != 2 {
+        return Err(anyhow!("format of {} is invalid", p));
+    }
 
-    Ok(fields[1].parse::<i32>()?)
+    fields[1]
+        .parse::<T>()
+        .map_err(|e| anyhow!("parse from {} failed: {:?}", fields[1], e))
 }
 
 // Map logrus (https://godoc.org/github.com/sirupsen/logrus)
@@ -360,17 +752,24 @@ fn get_log_level(param: &str) -> Result<slog::Level> {
 }
 
 #[instrument]
-fn get_hotplug_timeout(param: &str) -> Result<time::Duration> {
+fn get_timeout(param: &str) -> Result<time::Duration> {
     let fields: Vec<&str> = param.split('=').collect();
-    ensure!(fields.len() == 2, ERR_INVALID_HOTPLUG_TIMEOUT);
+    ensure!(fields.len() == 2, ERR_INVALID_TIMEOUT);
     ensure!(
-        fields[0] == HOTPLUG_TIMOUT_OPTION,
-        ERR_INVALID_HOTPLUG_TIMEOUT_KEY
+        matches!(
+            fields[0],
+            HOTPLUG_TIMOUT_OPTION
+                | CDH_API_TIMOUT_OPTION
+                | CDH_IMAGE_PULL_TIMEOUT_OPTION
+                | CDI_TIMEOUT_OPTION
+                | LAUNCH_PROCESS_TIMEOUT_OPTION
+        ),
+        ERR_INVALID_TIMEOUT_KEY
     );
 
     let value = fields[1]
         .parse::<u64>()
-        .with_context(|| ERR_INVALID_HOTPLUG_TIMEOUT_PARAM)?;
+        .with_context(|| ERR_INVALID_TIMEOUT_PARAM)?;
 
     Ok(time::Duration::from_secs(value))
 }
@@ -434,12 +833,44 @@ fn get_container_pipe_size(param: &str) -> Result<i32> {
     Ok(value)
 }
 
+#[instrument]
+fn get_url_value(param: &str) -> Result<String> {
+    let value = get_string_value(param)?;
+    Ok(Url::parse(&value)?.to_string())
+}
+
+#[instrument]
+fn get_guest_components_features_value(param: &str) -> Result<GuestComponentsFeatures> {
+    let fields: Vec<&str> = param.split('=').collect();
+    ensure!(fields.len() >= 2, ERR_INVALID_GET_VALUE_PARAM);
+    // We need name (but the value can be blank)
+    ensure!(!fields[0].is_empty(), ERR_INVALID_GET_VALUE_NO_NAME);
+    let value = fields[1..].join("=");
+    GuestComponentsFeatures::from_str(&value)
+        .map_err(|_| anyhow!(ERR_INVALID_GUEST_COMPONENTS_REST_API_VALUE))
+}
+
+#[instrument]
+fn get_guest_components_procs_value(param: &str) -> Result<GuestComponentsProcs> {
+    let fields: Vec<&str> = param.split('=').collect();
+    ensure!(fields.len() >= 2, ERR_INVALID_GET_VALUE_PARAM);
+
+    // We need name (but the value can be blank)
+    ensure!(!fields[0].is_empty(), ERR_INVALID_GET_VALUE_NO_NAME);
+
+    let value = fields[1..].join("=");
+    GuestComponentsProcs::from_str(&value)
+        .map_err(|_| anyhow!(ERR_INVALID_GUEST_COMPONENTS_PROCS_VALUE))
+}
+
 #[cfg(test)]
 mod tests {
     use test_utils::assert_result;
 
     use super::*;
     use anyhow::anyhow;
+    use rstest::*;
+    use serial_test::serial;
     use std::fs::File;
     use std::io::Write;
     use std::time;
@@ -449,12 +880,13 @@ mod tests {
     fn test_new() {
         let config: AgentConfig = Default::default();
         assert!(!config.debug_console);
-        assert!(!config.dev_mode);
         assert_eq!(config.log_level, DEFAULT_LOG_LEVEL);
         assert_eq!(config.hotplug_timeout, DEFAULT_HOTPLUG_TIMEOUT);
     }
 
     #[test]
+    // Run in serial to stop the env set interfering with test_from_cmdline_with_args_overwrites
+    #[serial]
     fn test_from_cmdline() {
         const TEST_SERVER_ADDR: &str = "vsock://-1:1024";
 
@@ -463,13 +895,21 @@ mod tests {
             contents: &'a str,
             env_vars: Vec<&'a str>,
             debug_console: bool,
-            dev_mode: bool,
             log_level: slog::Level,
             hotplug_timeout: time::Duration,
             container_pipe_size: i32,
             server_addr: &'a str,
+            cgroup_no_v1: &'a str,
             unified_cgroup_hierarchy: bool,
             tracing: bool,
+            https_proxy: &'a str,
+            no_proxy: &'a str,
+            guest_components_rest_api: GuestComponentsFeatures,
+            guest_components_procs: GuestComponentsProcs,
+            secure_storage_integrity: bool,
+            #[cfg(feature = "agent-policy")]
+            policy_file: &'a str,
+            mem_agent: Option<MemAgentConfig>,
         }
 
         impl Default for TestData<'_> {
@@ -478,26 +918,28 @@ mod tests {
                     contents: "",
                     env_vars: Vec::new(),
                     debug_console: false,
-                    dev_mode: false,
                     log_level: DEFAULT_LOG_LEVEL,
                     hotplug_timeout: DEFAULT_HOTPLUG_TIMEOUT,
                     container_pipe_size: DEFAULT_CONTAINER_PIPE_SIZE,
                     server_addr: TEST_SERVER_ADDR,
+                    cgroup_no_v1: "",
                     unified_cgroup_hierarchy: false,
                     tracing: false,
+                    https_proxy: "",
+                    no_proxy: "",
+                    guest_components_rest_api: GuestComponentsFeatures::default(),
+                    guest_components_procs: GuestComponentsProcs::default(),
+                    secure_storage_integrity: true,
+                    #[cfg(feature = "agent-policy")]
+                    policy_file: "",
+                    mem_agent: None,
                 }
             }
         }
 
         let tests = &[
             TestData {
-                contents: "agent.debug_consolex agent.devmode",
-                dev_mode: true,
-                ..Default::default()
-            },
-            TestData {
-                contents: "agent.debug_console agent.devmodex",
-                debug_console: true,
+                contents: "agent.debug_consolex",
                 ..Default::default()
             },
             TestData {
@@ -536,10 +978,6 @@ mod tests {
                 ..Default::default()
             },
             TestData {
-                contents: "foo debug_console agent bar devmode",
-                ..Default::default()
-            },
-            TestData {
                 contents: "agent.debug_console",
                 debug_console: true,
                 ..Default::default()
@@ -575,85 +1013,54 @@ mod tests {
                 ..Default::default()
             },
             TestData {
-                contents: "agent.devmode",
-                dev_mode: true,
+                contents: "cgroup_no_v1=1",
+                cgroup_no_v1: "",
                 ..Default::default()
             },
             TestData {
-                contents: "   agent.devmode ",
-                dev_mode: true,
+                contents: "cgroup_no_v1=all",
+                cgroup_no_v1: "all",
                 ..Default::default()
             },
             TestData {
-                contents: "agent.devmode foo",
-                dev_mode: true,
-                ..Default::default()
-            },
-            TestData {
-                contents: " agent.devmode foo",
-                dev_mode: true,
-                ..Default::default()
-            },
-            TestData {
-                contents: "foo agent.devmode bar",
-                dev_mode: true,
-                ..Default::default()
-            },
-            TestData {
-                contents: "foo agent.devmode",
-                dev_mode: true,
-                ..Default::default()
-            },
-            TestData {
-                contents: "foo agent.devmode ",
-                dev_mode: true,
-                ..Default::default()
-            },
-            TestData {
-                contents: "agent.devmode agent.debug_console",
-                debug_console: true,
-                dev_mode: true,
-                ..Default::default()
-            },
-            TestData {
-                contents: "agent.devmode agent.debug_console agent.hotplug_timeout=100 agent.unified_cgroup_hierarchy=a",
-                debug_console: true,
-                dev_mode: true,
-                hotplug_timeout: time::Duration::from_secs(100),
-                ..Default::default()
-            },
-            TestData {
-                contents: "agent.devmode agent.debug_console agent.hotplug_timeout=0 agent.unified_cgroup_hierarchy=11",
-                debug_console: true,
-                dev_mode: true,
+                contents: "cgroup_no_v1=0 systemd.unified_cgroup_hierarchy=1",
+                cgroup_no_v1: "",
                 unified_cgroup_hierarchy: true,
                 ..Default::default()
             },
             TestData {
-                contents: "agent.devmode agent.debug_console agent.container_pipe_size=2097152 agent.unified_cgroup_hierarchy=false",
+                contents: "agent.debug_console agent.hotplug_timeout=100 systemd.unified_cgroup_hierarchy=a",
                 debug_console: true,
-                dev_mode: true,
+                hotplug_timeout: time::Duration::from_secs(100),
+                ..Default::default()
+            },
+            TestData {
+                contents: "agent.debug_console agent.hotplug_timeout=0 systemd.unified_cgroup_hierarchy=11",
+                debug_console: true,
+                unified_cgroup_hierarchy: true,
+                ..Default::default()
+            },
+            TestData {
+                contents: "agent.debug_console agent.container_pipe_size=2097152 systemd.unified_cgroup_hierarchy=false",
+                debug_console: true,
                 container_pipe_size: 2097152,
                 ..Default::default()
             },
             TestData {
-                contents: "agent.devmode agent.debug_console agent.container_pipe_size=100 agent.unified_cgroup_hierarchy=true",
+                contents: "agent.debug_console agent.container_pipe_size=100 systemd.unified_cgroup_hierarchy=true",
                 debug_console: true,
-                dev_mode: true,
                 container_pipe_size: 100,
                 unified_cgroup_hierarchy: true,
                 ..Default::default()
             },
             TestData {
-                contents: "agent.devmode agent.debug_console agent.container_pipe_size=0 agent.unified_cgroup_hierarchy=0",
+                contents: "agent.debug_console agent.container_pipe_size=0 systemd.unified_cgroup_hierarchy=0",
                 debug_console: true,
-                dev_mode: true,
                 ..Default::default()
             },
             TestData {
-                contents: "agent.devmode agent.debug_console agent.container_pip_siz=100 agent.unified_cgroup_hierarchy=1",
+                contents: "agent.debug_console agent.container_pip_siz=100 systemd.unified_cgroup_hierarchy=1",
                 debug_console: true,
-                dev_mode: true,
                 unified_cgroup_hierarchy: true,
                 ..Default::default()
             },
@@ -691,6 +1098,13 @@ mod tests {
                 contents: "",
                 env_vars: vec!["KATA_AGENT_SERVER_ADDR=unix://@/tmp/foo.socket"],
                 server_addr: "unix://@/tmp/foo.socket",
+                ..Default::default()
+            },
+            // Test that env_var has precedence over the command line (which is the current behaviour)
+            TestData {
+                contents: "agent.server_addr=unix:///tmp/ignored.socket",
+                env_vars: vec!["KATA_AGENT_SERVER_ADDR=unix:///tmp/foo.socket"],
+                server_addr: "unix:///tmp/foo.socket",
                 ..Default::default()
             },
             TestData {
@@ -854,6 +1268,134 @@ mod tests {
                 tracing: true,
                 ..Default::default()
             },
+            TestData {
+                contents: "agent.https_proxy=http://proxy.url.com:81/",
+                https_proxy: "http://proxy.url.com:81/",
+                ..Default::default()
+            },
+            TestData {
+                contents: "agent.https_proxy=http://192.168.1.100:81/",
+                https_proxy: "http://192.168.1.100:81/",
+                ..Default::default()
+            },
+            TestData {
+                contents: "agent.no_proxy=*.internal.url.com",
+                no_proxy: "*.internal.url.com",
+                ..Default::default()
+            },
+            TestData {
+                contents: "agent.no_proxy=192.168.1.0/24,172.16.0.0/12",
+                no_proxy: "192.168.1.0/24,172.16.0.0/12",
+                ..Default::default()
+            },
+            TestData {
+               contents: "agent.guest_components_rest_api=attestation",
+               guest_components_rest_api: GuestComponentsFeatures::Attestation,
+                ..Default::default()
+            },
+            TestData {
+                contents: "agent.guest_components_rest_api=resource",
+                guest_components_rest_api: GuestComponentsFeatures::Resource,
+                ..Default::default()
+            },
+            TestData {
+                contents: "agent.guest_components_rest_api=all",
+                guest_components_rest_api: GuestComponentsFeatures::All,
+                ..Default::default()
+            },
+            TestData {
+               contents: "agent.guest_components_procs=api-server-rest",
+               guest_components_procs: GuestComponentsProcs::ApiServerRest,
+                ..Default::default()
+            },
+            TestData {
+                contents: "agent.guest_components_procs=confidential-data-hub",
+                guest_components_procs: GuestComponentsProcs::ConfidentialDataHub,
+                ..Default::default()
+            },
+            TestData {
+                contents: "agent.guest_components_procs=attestation-agent",
+                guest_components_procs: GuestComponentsProcs::AttestationAgent,
+                ..Default::default()
+            },
+            TestData {
+                contents: "agent.guest_components_procs=none",
+                guest_components_procs: GuestComponentsProcs::None,
+                ..Default::default()
+            },
+            TestData {
+                contents: "",
+                secure_storage_integrity: true,
+                ..Default::default()
+            },
+            TestData {
+                contents: "agent.secure_storage_integrity=true",
+                secure_storage_integrity: true,
+                ..Default::default()
+            },
+            TestData {
+                contents: "agent.secure_storage_integrity=false",
+                secure_storage_integrity: false,
+                ..Default::default()
+            },
+            TestData {
+                contents: "agent.secure_storage_integrity=1",
+                secure_storage_integrity: true,
+                ..Default::default()
+            },
+            TestData {
+                contents: "agent.secure_storage_integrity=0",
+                secure_storage_integrity: false,
+                ..Default::default()
+            },
+            #[cfg(feature = "agent-policy")]
+            // Test environment
+            TestData {
+                contents: "",
+                env_vars: vec!["KATA_AGENT_POLICY_FILE=/tmp/policy.rego"],
+                policy_file: "/tmp/policy.rego",
+                ..Default::default()
+            },
+            TestData {
+                contents: "",
+                ..Default::default()
+            },
+            TestData {
+                contents: "agent.mem_agent_enable=1",
+                mem_agent: Some(MemAgentConfig::default()),
+                ..Default::default()
+            },
+            TestData {
+                contents: "agent.mem_agent_enable=1\nagent.mem_agent_memcg_period_secs=300",
+                mem_agent: Some(MemAgentConfig {
+                    memcg_config: mem_agent::memcg::Config {
+                        default: mem_agent::memcg::SingleConfig {
+                            period_secs: 300,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            TestData {
+                contents: "agent.mem_agent_enable=1\nagent.mem_agent_memcg_period_secs=300\nagent.mem_agent_compact_order=6",
+                mem_agent: Some(MemAgentConfig {
+                    memcg_config: mem_agent::memcg::Config {
+                        default: mem_agent::memcg::SingleConfig {
+                            period_secs: 300,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                    compact_config: mem_agent::compact::Config {
+                        compact_order: 6,
+                        ..Default::default()
+                    },
+                }),
+                ..Default::default()
+            },
         ];
 
         let dir = tempdir().expect("failed to create tmpdir");
@@ -861,7 +1403,7 @@ mod tests {
         // Now, test various combinations of file contents and environment
         // variables.
         for (i, d) in tests.iter().enumerate() {
-            let msg = format!("test[{}]: {:?}", i, d);
+            let msg = format!("test[{i}]: {d:?}");
 
             let file_path = dir.path().join("cmdline");
 
@@ -889,18 +1431,35 @@ mod tests {
             let config =
                 AgentConfig::from_cmdline(filename, vec![]).expect("Failed to parse command line");
 
-            assert_eq!(d.debug_console, config.debug_console, "{}", msg);
-            assert_eq!(d.dev_mode, config.dev_mode, "{}", msg);
+            assert_eq!(d.debug_console, config.debug_console, "{msg}");
+            assert_eq!(d.cgroup_no_v1, config.cgroup_no_v1, "{msg}");
             assert_eq!(
                 d.unified_cgroup_hierarchy, config.unified_cgroup_hierarchy,
-                "{}",
-                msg
+                "{msg}"
             );
-            assert_eq!(d.log_level, config.log_level, "{}", msg);
-            assert_eq!(d.hotplug_timeout, config.hotplug_timeout, "{}", msg);
-            assert_eq!(d.container_pipe_size, config.container_pipe_size, "{}", msg);
-            assert_eq!(d.server_addr, config.server_addr, "{}", msg);
-            assert_eq!(d.tracing, config.tracing, "{}", msg);
+            assert_eq!(d.log_level, config.log_level, "{msg}");
+            assert_eq!(d.hotplug_timeout, config.hotplug_timeout, "{msg}");
+            assert_eq!(d.container_pipe_size, config.container_pipe_size, "{msg}");
+            assert_eq!(d.server_addr, config.server_addr, "{msg}");
+            assert_eq!(d.tracing, config.tracing, "{msg}");
+            assert_eq!(d.https_proxy, config.https_proxy, "{msg}");
+            assert_eq!(d.no_proxy, config.no_proxy, "{msg}");
+            assert_eq!(
+                d.guest_components_rest_api, config.guest_components_rest_api,
+                "{msg}"
+            );
+            assert_eq!(
+                d.guest_components_procs, config.guest_components_procs,
+                "{msg}"
+            );
+            assert_eq!(
+                d.secure_storage_integrity, config.secure_storage_integrity,
+                "{msg}"
+            );
+            #[cfg(feature = "agent-policy")]
+            assert_eq!(d.policy_file, config.policy_file, "{msg}");
+
+            assert_eq!(d.mem_agent, config.mem_agent, "{msg}");
 
             for v in vars_to_unset {
                 env::remove_var(v);
@@ -909,15 +1468,15 @@ mod tests {
     }
 
     #[test]
+    // Run in serial to stop the env set interfering with test_from_cmdline
+    #[serial]
     fn test_from_cmdline_with_args_overwrites() {
         let expected = AgentConfig {
-            dev_mode: true,
-            server_addr: "unix://@/tmp/foo.socket".to_string(),
+            server_addr: "unix:///tmp/overwrite.socket".to_string(),
             ..Default::default()
         };
 
-        let example_config_file_contents =
-            "dev_mode = true\nserver_addr = 'unix://@/tmp/foo.socket'";
+        let example_config_file_contents = "server_addr = 'unix:///tmp/ignored.socket'";
         let dir = tempdir().expect("failed to create tmpdir");
         let file_path = dir.path().join("config.toml");
         let filename = file_path.to_str().expect("failed to create filename");
@@ -925,12 +1484,16 @@ mod tests {
         file.write_all(example_config_file_contents.as_bytes())
             .unwrap_or_else(|_| panic!("failed to write file contents"));
 
+        // Ensure that the env has precedence over agent config file
+        env::set_var("KATA_AGENT_SERVER_ADDR", "unix:///tmp/overwrite.socket");
+
         let config =
             AgentConfig::from_cmdline("", vec!["--config".to_string(), filename.to_string()])
                 .expect("Failed to parse command line");
 
+        env::remove_var("KATA_AGENT_SERVER_ADDR");
+
         assert_eq!(expected.debug_console, config.debug_console);
-        assert_eq!(expected.dev_mode, config.dev_mode);
         assert_eq!(
             expected.unified_cgroup_hierarchy,
             config.unified_cgroup_hierarchy,
@@ -942,464 +1505,224 @@ mod tests {
         assert_eq!(expected.tracing, config.tracing);
     }
 
-    #[test]
-    fn test_logrus_to_slog_level() {
-        #[derive(Debug)]
-        struct TestData<'a> {
-            logrus_level: &'a str,
-            result: Result<slog::Level>,
-        }
-
-        let tests = &[
-            TestData {
-                logrus_level: "",
-                result: Err(anyhow!(ERR_INVALID_LOG_LEVEL)),
-            },
-            TestData {
-                logrus_level: "foo",
-                result: Err(anyhow!(ERR_INVALID_LOG_LEVEL)),
-            },
-            TestData {
-                logrus_level: "debugging",
-                result: Err(anyhow!(ERR_INVALID_LOG_LEVEL)),
-            },
-            TestData {
-                logrus_level: "xdebug",
-                result: Err(anyhow!(ERR_INVALID_LOG_LEVEL)),
-            },
-            TestData {
-                logrus_level: "trace",
-                result: Ok(slog::Level::Trace),
-            },
-            TestData {
-                logrus_level: "debug",
-                result: Ok(slog::Level::Debug),
-            },
-            TestData {
-                logrus_level: "info",
-                result: Ok(slog::Level::Info),
-            },
-            TestData {
-                logrus_level: "warn",
-                result: Ok(slog::Level::Warning),
-            },
-            TestData {
-                logrus_level: "warning",
-                result: Ok(slog::Level::Warning),
-            },
-            TestData {
-                logrus_level: "error",
-                result: Ok(slog::Level::Error),
-            },
-            TestData {
-                logrus_level: "critical",
-                result: Ok(slog::Level::Critical),
-            },
-            TestData {
-                logrus_level: "fatal",
-                result: Ok(slog::Level::Critical),
-            },
-            TestData {
-                logrus_level: "panic",
-                result: Ok(slog::Level::Critical),
-            },
-        ];
-
-        for (i, d) in tests.iter().enumerate() {
-            let msg = format!("test[{}]: {:?}", i, d);
-
-            let result = logrus_to_slog_level(d.logrus_level);
-
-            let msg = format!("{}: result: {:?}", msg, result);
-
-            assert_result!(d.result, result, msg);
-        }
+    #[rstest]
+    #[case("", Err(anyhow!(ERR_INVALID_LOG_LEVEL)))]
+    #[case("foo", Err(anyhow!(ERR_INVALID_LOG_LEVEL)))]
+    #[case("debugging", Err(anyhow!(ERR_INVALID_LOG_LEVEL)))]
+    #[case("xdebug", Err(anyhow!(ERR_INVALID_LOG_LEVEL)))]
+    #[case("trace", Ok(slog::Level::Trace))]
+    #[case("debug", Ok(slog::Level::Debug))]
+    #[case("info", Ok(slog::Level::Info))]
+    #[case("warn", Ok(slog::Level::Warning))]
+    #[case("warning", Ok(slog::Level::Warning))]
+    #[case("error", Ok(slog::Level::Error))]
+    #[case("critical", Ok(slog::Level::Critical))]
+    #[case("fatal", Ok(slog::Level::Critical))]
+    #[case("panic", Ok(slog::Level::Critical))]
+    fn test_logrus_to_slog_level(#[case] input: &str, #[case] expected: Result<slog::Level>) {
+        let result = logrus_to_slog_level(input);
+        let msg = format!("expected: {expected:?}, result: {result:?}");
+        assert_result!(expected, result, msg);
     }
 
-    #[test]
-    fn test_get_log_level() {
-        #[derive(Debug)]
-        struct TestData<'a> {
-            param: &'a str,
-            result: Result<slog::Level>,
-        }
-
-        let tests = &[
-            TestData {
-                param: "",
-                result: Err(anyhow!(ERR_INVALID_LOG_LEVEL_PARAM)),
-            },
-            TestData {
-                param: "=",
-                result: Err(anyhow!(ERR_INVALID_LOG_LEVEL_KEY)),
-            },
-            TestData {
-                param: "x=",
-                result: Err(anyhow!(ERR_INVALID_LOG_LEVEL_KEY)),
-            },
-            TestData {
-                param: "=y",
-                result: Err(anyhow!(ERR_INVALID_LOG_LEVEL_KEY)),
-            },
-            TestData {
-                param: "==",
-                result: Err(anyhow!(ERR_INVALID_LOG_LEVEL_PARAM)),
-            },
-            TestData {
-                param: "= =",
-                result: Err(anyhow!(ERR_INVALID_LOG_LEVEL_PARAM)),
-            },
-            TestData {
-                param: "x=y",
-                result: Err(anyhow!(ERR_INVALID_LOG_LEVEL_KEY)),
-            },
-            TestData {
-                param: "agent=debug",
-                result: Err(anyhow!(ERR_INVALID_LOG_LEVEL_KEY)),
-            },
-            TestData {
-                param: "agent.logg=debug",
-                result: Err(anyhow!(ERR_INVALID_LOG_LEVEL_KEY)),
-            },
-            TestData {
-                param: "agent.log=trace",
-                result: Ok(slog::Level::Trace),
-            },
-            TestData {
-                param: "agent.log=debug",
-                result: Ok(slog::Level::Debug),
-            },
-            TestData {
-                param: "agent.log=info",
-                result: Ok(slog::Level::Info),
-            },
-            TestData {
-                param: "agent.log=warn",
-                result: Ok(slog::Level::Warning),
-            },
-            TestData {
-                param: "agent.log=warning",
-                result: Ok(slog::Level::Warning),
-            },
-            TestData {
-                param: "agent.log=error",
-                result: Ok(slog::Level::Error),
-            },
-            TestData {
-                param: "agent.log=critical",
-                result: Ok(slog::Level::Critical),
-            },
-            TestData {
-                param: "agent.log=fatal",
-                result: Ok(slog::Level::Critical),
-            },
-            TestData {
-                param: "agent.log=panic",
-                result: Ok(slog::Level::Critical),
-            },
-        ];
-
-        for (i, d) in tests.iter().enumerate() {
-            let msg = format!("test[{}]: {:?}", i, d);
-
-            let result = get_log_level(d.param);
-
-            let msg = format!("{}: result: {:?}", msg, result);
-
-            assert_result!(d.result, result, msg);
-        }
+    #[rstest]
+    #[case("",Err(anyhow!(ERR_INVALID_LOG_LEVEL_PARAM)))]
+    #[case("=",Err(anyhow!(ERR_INVALID_LOG_LEVEL_KEY)))]
+    #[case("x=",Err(anyhow!(ERR_INVALID_LOG_LEVEL_KEY)))]
+    #[case("=y",Err(anyhow!(ERR_INVALID_LOG_LEVEL_KEY)))]
+    #[case("==",Err(anyhow!(ERR_INVALID_LOG_LEVEL_PARAM)))]
+    #[case("= =",Err(anyhow!(ERR_INVALID_LOG_LEVEL_PARAM)))]
+    #[case("x=y",Err(anyhow!(ERR_INVALID_LOG_LEVEL_KEY)))]
+    #[case("agent=debug",Err(anyhow!(ERR_INVALID_LOG_LEVEL_KEY)))]
+    #[case("agent.logg=debug",Err(anyhow!(ERR_INVALID_LOG_LEVEL_KEY)))]
+    #[case("agent.log=trace", Ok(slog::Level::Trace))]
+    #[case("agent.log=debug", Ok(slog::Level::Debug))]
+    #[case("agent.log=info", Ok(slog::Level::Info))]
+    #[case("agent.log=warn", Ok(slog::Level::Warning))]
+    #[case("agent.log=warning", Ok(slog::Level::Warning))]
+    #[case("agent.log=error", Ok(slog::Level::Error))]
+    #[case("agent.log=critical", Ok(slog::Level::Critical))]
+    #[case("agent.log=fatal", Ok(slog::Level::Critical))]
+    #[case("agent.log=panic", Ok(slog::Level::Critical))]
+    fn test_get_log_level(#[case] input: &str, #[case] expected: Result<slog::Level>) {
+        let result = get_log_level(input);
+        let msg = format!("expected: {expected:?}, result: {result:?}");
+        assert_result!(expected, result, msg);
     }
 
-    #[test]
-    fn test_get_hotplug_timeout() {
-        #[derive(Debug)]
-        struct TestData<'a> {
-            param: &'a str,
-            result: Result<time::Duration>,
-        }
-
-        let tests = &[
-            TestData {
-                param: "",
-                result: Err(anyhow!(ERR_INVALID_HOTPLUG_TIMEOUT)),
-            },
-            TestData {
-                param: "agent.hotplug_timeout",
-                result: Err(anyhow!(ERR_INVALID_HOTPLUG_TIMEOUT)),
-            },
-            TestData {
-                param: "foo=bar",
-                result: Err(anyhow!(ERR_INVALID_HOTPLUG_TIMEOUT_KEY)),
-            },
-            TestData {
-                param: "agent.hotplug_timeot=1",
-                result: Err(anyhow!(ERR_INVALID_HOTPLUG_TIMEOUT_KEY)),
-            },
-            TestData {
-                param: "agent.hotplug_timeout=1",
-                result: Ok(time::Duration::from_secs(1)),
-            },
-            TestData {
-                param: "agent.hotplug_timeout=3",
-                result: Ok(time::Duration::from_secs(3)),
-            },
-            TestData {
-                param: "agent.hotplug_timeout=3600",
-                result: Ok(time::Duration::from_secs(3600)),
-            },
-            TestData {
-                param: "agent.hotplug_timeout=0",
-                result: Ok(time::Duration::from_secs(0)),
-            },
-            TestData {
-                param: "agent.hotplug_timeout=-1",
-                result: Err(anyhow!(
-                    "unable to parse hotplug timeout
+    #[rstest]
+    #[case("", Err(anyhow!(ERR_INVALID_TIMEOUT)))]
+    #[case("agent.hotplug_timeout", Err(anyhow!(ERR_INVALID_TIMEOUT)))]
+    #[case("foo=bar", Err(anyhow!(ERR_INVALID_TIMEOUT_KEY)))]
+    #[case("agent.hotplug_timeot=1", Err(anyhow!(ERR_INVALID_TIMEOUT_KEY)))]
+    #[case("agent.hotplug_timeout=1", Ok(time::Duration::from_secs(1)))]
+    #[case("agent.hotplug_timeout=3", Ok(time::Duration::from_secs(3)))]
+    #[case("agent.hotplug_timeout=3600", Ok(time::Duration::from_secs(3600)))]
+    #[case("agent.hotplug_timeout=0", Ok(time::Duration::from_secs(0)))]
+    #[case("agent.hotplug_timeout=-1", Err(anyhow!(
+        "unable to parse timeout
 
 Caused by:
     invalid digit found in string"
-                )),
-            },
-            TestData {
-                param: "agent.hotplug_timeout=4jbsdja",
-                result: Err(anyhow!(
-                    "unable to parse hotplug timeout
+    )))]
+    #[case("agent.hotplug_timeout=4jbsdja", Err(anyhow!(
+        "unable to parse timeout
 
 Caused by:
     invalid digit found in string"
-                )),
-            },
-            TestData {
-                param: "agent.hotplug_timeout=foo",
-                result: Err(anyhow!(
-                    "unable to parse hotplug timeout
+    )))]
+    #[case("agent.hotplug_timeout=foo", Err(anyhow!(
+        "unable to parse timeout
 
 Caused by:
     invalid digit found in string"
-                )),
-            },
-            TestData {
-                param: "agent.hotplug_timeout=j",
-                result: Err(anyhow!(
-                    "unable to parse hotplug timeout
+    )))]
+    #[case("agent.hotplug_timeout=j", Err(anyhow!(
+        "unable to parse timeout
 
 Caused by:
     invalid digit found in string"
-                )),
-            },
-        ];
-
-        for (i, d) in tests.iter().enumerate() {
-            let msg = format!("test[{}]: {:?}", i, d);
-
-            let result = get_hotplug_timeout(d.param);
-
-            let msg = format!("{}: result: {:?}", msg, result);
-
-            assert_result!(d.result, result, msg);
-        }
+    )))]
+    #[case("agent.chd_api_timeout=1", Err(anyhow!(ERR_INVALID_TIMEOUT_KEY)))]
+    #[case("agent.cdh_api_timeout=600", Ok(time::Duration::from_secs(600)))]
+    #[case("agent.image_pull_timeout=1200", Ok(time::Duration::from_secs(1200)))]
+    #[case("agent.cdi_timeout=320", Ok(time::Duration::from_secs(320)))]
+    #[case("agent.launch_process_timeout=60", Ok(time::Duration::from_secs(60)))]
+    fn test_timeout(#[case] param: &str, #[case] expected: Result<time::Duration>) {
+        let result = get_timeout(param);
+        let msg = format!("expected: {expected:?}, result: {result:?}");
+        assert_result!(expected, result, msg);
     }
 
-    #[test]
-    fn test_get_container_pipe_size() {
-        #[derive(Debug)]
-        struct TestData<'a> {
-            param: &'a str,
-            result: Result<i32>,
-        }
-
-        let tests = &[
-            TestData {
-                param: "",
-                result: Err(anyhow!(ERR_INVALID_CONTAINER_PIPE_SIZE)),
-            },
-            TestData {
-                param: "agent.container_pipe_size",
-                result: Err(anyhow!(ERR_INVALID_CONTAINER_PIPE_SIZE)),
-            },
-            TestData {
-                param: "foo=bar",
-                result: Err(anyhow!(ERR_INVALID_CONTAINER_PIPE_SIZE_KEY)),
-            },
-            TestData {
-                param: "agent.container_pip_siz=1",
-                result: Err(anyhow!(ERR_INVALID_CONTAINER_PIPE_SIZE_KEY)),
-            },
-            TestData {
-                param: "agent.container_pipe_size=1",
-                result: Ok(1),
-            },
-            TestData {
-                param: "agent.container_pipe_size=3",
-                result: Ok(3),
-            },
-            TestData {
-                param: "agent.container_pipe_size=2097152",
-                result: Ok(2097152),
-            },
-            TestData {
-                param: "agent.container_pipe_size=0",
-                result: Ok(0),
-            },
-            TestData {
-                param: "agent.container_pipe_size=-1",
-                result: Err(anyhow!(ERR_INVALID_CONTAINER_PIPE_NEGATIVE)),
-            },
-            TestData {
-                param: "agent.container_pipe_size=foobar",
-                result: Err(anyhow!(
-                    "unable to parse container pipe size
+    #[rstest]
+    #[case("", Err(anyhow!(ERR_INVALID_CONTAINER_PIPE_SIZE)))]
+    #[case("agent.container_pipe_size", Err(anyhow!(ERR_INVALID_CONTAINER_PIPE_SIZE)))]
+    #[case("foo=bar", Err(anyhow!(ERR_INVALID_CONTAINER_PIPE_SIZE_KEY)))]
+    #[case("agent.container_pip_siz=1", Err(anyhow!(ERR_INVALID_CONTAINER_PIPE_SIZE_KEY)))]
+    #[case("agent.container_pipe_size=1", Ok(1))]
+    #[case("agent.container_pipe_size=3", Ok(3))]
+    #[case("agent.container_pipe_size=2097152", Ok(2097152))]
+    #[case("agent.container_pipe_size=0", Ok(0))]
+    #[case("agent.container_pipe_size=-1", Err(anyhow!(ERR_INVALID_CONTAINER_PIPE_NEGATIVE)))]
+    #[case("agent.container_pipe_size=foobar", Err(anyhow!(
+        "unable to parse container pipe size
 
 Caused by:
     invalid digit found in string"
-                )),
-            },
-            TestData {
-                param: "agent.container_pipe_size=j",
-                result: Err(anyhow!(
-                    "unable to parse container pipe size
+    )))]
+    #[case("agent.container_pipe_size=j", Err(anyhow!(
+        "unable to parse container pipe size
 
 Caused by:
     invalid digit found in string",
-                )),
-            },
-            TestData {
-                param: "agent.container_pipe_size=4jbsdja",
-                result: Err(anyhow!(
-                    "unable to parse container pipe size
+    )))]
+    #[case("agent.container_pipe_size=4jbsdja", Err(anyhow!(
+        "unable to parse container pipe size
 
 Caused by:
     invalid digit found in string"
-                )),
-            },
-            TestData {
-                param: "agent.container_pipe_size=4294967296",
-                result: Err(anyhow!(
-                    "unable to parse container pipe size
+    )))]
+    #[case("agent.container_pipe_size=4294967296", Err(anyhow!(
+        "unable to parse container pipe size
 
 Caused by:
     number too large to fit in target type"
-                )),
-            },
-        ];
-
-        for (i, d) in tests.iter().enumerate() {
-            let msg = format!("test[{}]: {:?}", i, d);
-
-            let result = get_container_pipe_size(d.param);
-
-            let msg = format!("{}: result: {:?}", msg, result);
-
-            assert_result!(d.result, result, msg);
-        }
+    )))]
+    fn test_get_container_pipe_size(#[case] param: &str, #[case] expected: Result<i32>) {
+        let result = get_container_pipe_size(param);
+        let msg = format!("expected: {expected:?}, result: {result:?}");
+        assert_result!(expected, result, msg);
     }
 
-    #[test]
-    fn test_get_string_value() {
-        #[derive(Debug)]
-        struct TestData<'a> {
-            param: &'a str,
-            result: Result<String>,
-        }
+    #[rstest]
+    #[case("", Err(anyhow!(ERR_INVALID_GET_VALUE_PARAM)))]
+    #[case("=", Err(anyhow!(ERR_INVALID_GET_VALUE_NO_NAME)))]
+    #[case("==", Err(anyhow!(ERR_INVALID_GET_VALUE_NO_NAME)))]
+    #[case("x=", Err(anyhow!(ERR_INVALID_GET_VALUE_NO_VALUE)))]
+    #[case("x==", Ok("=".into()))]
+    #[case("x===", Ok("==".into()))]
+    #[case("x==x", Ok("=x".into()))]
+    #[case("x=x", Ok("x".into()))]
+    #[case("x=x=", Ok("x=".into()))]
+    #[case("x=x=x", Ok("x=x".into()))]
+    #[case("foo=bar", Ok("bar".into()))]
+    #[case("x= =", Ok(" =".into()))]
+    #[case("x= =", Ok(" =".into()))]
+    #[case("x= = ", Ok(" = ".into()))]
+    fn test_get_string_value(#[case] param: &str, #[case] expected: Result<String>) {
+        let result = get_string_value(param);
+        let msg = format!("expected: {expected:?}, result: {result:?}");
+        assert_result!(expected, result, msg);
+    }
 
-        let tests = &[
-            TestData {
-                param: "",
-                result: Err(anyhow!(ERR_INVALID_GET_VALUE_PARAM)),
-            },
-            TestData {
-                param: "=",
-                result: Err(anyhow!(ERR_INVALID_GET_VALUE_NO_NAME)),
-            },
-            TestData {
-                param: "==",
-                result: Err(anyhow!(ERR_INVALID_GET_VALUE_NO_NAME)),
-            },
-            TestData {
-                param: "x=",
-                result: Err(anyhow!(ERR_INVALID_GET_VALUE_NO_VALUE)),
-            },
-            TestData {
-                param: "x==",
-                result: Ok("=".into()),
-            },
-            TestData {
-                param: "x===",
-                result: Ok("==".into()),
-            },
-            TestData {
-                param: "x==x",
-                result: Ok("=x".into()),
-            },
-            TestData {
-                param: "x=x",
-                result: Ok("x".into()),
-            },
-            TestData {
-                param: "x=x=",
-                result: Ok("x=".into()),
-            },
-            TestData {
-                param: "x=x=x",
-                result: Ok("x=x".into()),
-            },
-            TestData {
-                param: "foo=bar",
-                result: Ok("bar".into()),
-            },
-            TestData {
-                param: "x= =",
-                result: Ok(" =".into()),
-            },
-            TestData {
-                param: "x= =",
-                result: Ok(" =".into()),
-            },
-            TestData {
-                param: "x= = ",
-                result: Ok(" = ".into()),
-            },
-        ];
+    #[rstest]
+    #[case("", Err(anyhow!(ERR_INVALID_GET_VALUE_PARAM)))]
+    #[case("=", Err(anyhow!(ERR_INVALID_GET_VALUE_NO_NAME)))]
+    #[case("==", Err(anyhow!(ERR_INVALID_GET_VALUE_NO_NAME)))]
+    #[case("x=all", Ok(GuestComponentsFeatures::All))]
+    #[case("x=attestation", Ok(GuestComponentsFeatures::Attestation))]
+    #[case("x=resource", Ok(GuestComponentsFeatures::Resource))]
+    #[case("x===", Err(anyhow!(ERR_INVALID_GUEST_COMPONENTS_REST_API_VALUE)))]
+    #[case("x==x", Err(anyhow!(ERR_INVALID_GUEST_COMPONENTS_REST_API_VALUE)))]
+    #[case("x=x", Err(anyhow!(ERR_INVALID_GUEST_COMPONENTS_REST_API_VALUE)))]
+    fn test_get_guest_components_features_value(
+        #[case] input: &str,
+        #[case] expected: Result<GuestComponentsFeatures>,
+    ) {
+        let result = get_guest_components_features_value(input);
+        let msg = format!("expected: {expected:?}, result: {result:?}");
+        assert_result!(expected, result, msg);
+    }
 
-        for (i, d) in tests.iter().enumerate() {
-            let msg = format!("test[{}]: {:?}", i, d);
-
-            let result = get_string_value(d.param);
-
-            let msg = format!("{}: result: {:?}", msg, result);
-
-            assert_result!(d.result, result, msg);
-        }
+    #[rstest]
+    #[case("", Err(anyhow!(ERR_INVALID_GET_VALUE_PARAM)))]
+    #[case("=", Err(anyhow!(ERR_INVALID_GET_VALUE_NO_NAME)))]
+    #[case("==", Err(anyhow!(ERR_INVALID_GET_VALUE_NO_NAME)))]
+    #[case("x=attestation-agent", Ok(GuestComponentsProcs::AttestationAgent))]
+    #[case(
+        "x=confidential-data-hub",
+        Ok(GuestComponentsProcs::ConfidentialDataHub)
+    )]
+    #[case("x=none", Ok(GuestComponentsProcs::None))]
+    #[case("x=api-server-rest", Ok(GuestComponentsProcs::ApiServerRest))]
+    #[case("x===", Err(anyhow!(ERR_INVALID_GUEST_COMPONENTS_PROCS_VALUE)))]
+    #[case("x==x", Err(anyhow!(ERR_INVALID_GUEST_COMPONENTS_PROCS_VALUE)))]
+    #[case("x=x", Err(anyhow!(ERR_INVALID_GUEST_COMPONENTS_PROCS_VALUE)))]
+    fn test_get_guest_components_procs_value(
+        #[case] param: &str,
+        #[case] expected: Result<GuestComponentsProcs>,
+    ) {
+        let result = get_guest_components_procs_value(param);
+        let msg = format!("expected: {expected:?}, result: {result:?}");
+        assert_result!(expected, result, msg);
     }
 
     #[test]
     fn test_config_builder_from_string() {
         let config = AgentConfig::from_str(
             r#"
-               dev_mode = true
                server_addr = 'vsock://8:2048'
-
-               [endpoints]
-               allowed = ["CreateContainer", "StartContainer"]
+               guest_components_procs = "api-server-rest"
+               guest_components_rest_api = "all"
+               mem_agent_enable = true
               "#,
         )
         .unwrap();
 
-        // Verify that the all_allowed flag is false
-        assert!(!config.endpoints.all_allowed);
-
         // Verify that the override worked
-        assert!(config.dev_mode);
         assert_eq!(config.server_addr, "vsock://8:2048");
         assert_eq!(
-            config.endpoints.allowed,
-            ["CreateContainer".to_string(), "StartContainer".to_string()]
-                .iter()
-                .cloned()
-                .collect()
+            config.guest_components_procs,
+            GuestComponentsProcs::ApiServerRest
+        );
+        assert_eq!(
+            config.guest_components_rest_api,
+            GuestComponentsFeatures::All
         );
 
         // Verify that the default values are valid
         assert_eq!(config.hotplug_timeout, DEFAULT_HOTPLUG_TIMEOUT);
+
+        assert_eq!(config.mem_agent, Some(MemAgentConfig::default()),);
     }
 }

@@ -18,8 +18,17 @@ type Bridge struct {
 	//ID is used to identify the bridge in the hypervisor
 	ID string
 
-	// Addr is the PCI/e slot of the bridge
+	// Addr is the PCI/e slot of the bridge on its parent bus
 	Addr int
+
+	// ParentID, when non-empty, is the QEMU ID of the device on whose bus
+	// this bridge is plugged (e.g. a pcie-root-port that sits between the
+	// bridge and the root bus). Empty means the bridge is on pcie.0/pci.0.
+	ParentID string
+
+	// ParentAddr is the slot of the parent device (referenced by ParentID)
+	// on the root bus, used to construct multi-level guest PCI paths.
+	ParentAddr int
 }
 
 // CPUDevice represents a CPU device which was hot-added in a running VM
@@ -30,7 +39,7 @@ type CPUDevice struct {
 
 type HypervisorState struct {
 	BlockIndexMap map[int]struct{}
-	// Type of hypervisor, E.g. qemu/firecracker/acrn.
+	// Type of hypervisor, E.g. qemu/firecracker
 	Type string
 	UUID string
 	// clh sepcific: refer to 'virtcontainers/clh.go:CloudHypervisorState'
@@ -47,4 +56,6 @@ type HypervisorState struct {
 	Pid               int
 	HotPlugVFIO       config.PCIePort
 	ColdPlugVFIO      config.PCIePort
+	PCIeRootPort      uint32
+	PCIeSwitchPort    uint32
 }

@@ -8,8 +8,10 @@ apiVersion: v1
 metadata:
   name: pv-pod
 spec:
-  terminationGracePeriodSeconds: 0
   runtimeClassName: kata
+  securityContext:
+    supplementalGroups: [10]
+  nodeName: NODE
   volumes:
     - name: pv-storage
       persistentVolumeClaim:

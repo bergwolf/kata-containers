@@ -5,20 +5,23 @@
 
 // Description: Client side of ttRPC comms
 
-use crate::types::{Config, Options};
+use crate::types::*;
 use crate::utils;
+use crate::vm;
 use anyhow::{anyhow, Result};
 use byteorder::ByteOrder;
-use nix::sys::socket::{connect, socket, AddressFamily, SockAddr, SockFlag, SockType, UnixAddr};
+use nix::sys::socket::{connect, socket, AddressFamily, SockFlag, SockType, UnixAddr, VsockAddr};
 use protocols::agent::*;
 use protocols::agent_ttrpc::*;
 use protocols::health::*;
 use protocols::health_ttrpc::*;
-use slog::{debug, info};
-use std::io;
+use slog::{debug, info, warn};
+use std::convert::TryFrom;
+use std::fs;
 use std::io::Write; // XXX: for flush()
+use std::io::{self, Read, Seek, SeekFrom};
 use std::io::{BufRead, BufReader};
-use std::os::unix::io::{IntoRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, IntoRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::thread::sleep;
 use std::time::Duration;
@@ -32,7 +35,7 @@ macro_rules! run_if_auto_values {
         let cfg = $ctx.metadata.get(METADATA_CFG_NS);
 
         if let Some(v) = cfg {
-            if v.contains(&NO_AUTO_VALUES_CFG_NAME.to_string()) {
+            if v.contains(&AUTO_VALUES_CFG_NAME.to_string()) {
                 debug!(sl!(), "Running closure to generate values");
 
                 $closure()?;
@@ -101,9 +104,15 @@ const ERR_API_FAILED: &str = "API failed";
 // Value used as a "namespace" in the ttRPC Context's metadata.
 const METADATA_CFG_NS: &str = "agent-ctl-cfg";
 
-// Special value which if found means do not generate any values
+// Special value which if found means generate any values
 // automatically.
-const NO_AUTO_VALUES_CFG_NAME: &str = "no-auto-values";
+const AUTO_VALUES_CFG_NAME: &str = "auto-values";
+
+// Retry count and dial timeout to try connecting to the agent
+// Static value taken from runtime-rs configuration calculation
+// # Retry times = reconnect_timeout_ms / dial_timeout_ms (default: 300)
+const RETRY_AGENT_CONNECT: u64 = 300;
+const DIAL_TIMEOUT: u64 = 10;
 
 static AGENT_CMDS: &[AgentCmd] = &[
     AgentCmd {
@@ -286,6 +295,21 @@ static AGENT_CMDS: &[AgentCmd] = &[
         st: ServiceType::Agent,
         fp: agent_cmd_container_write_stdin,
     },
+    AgentCmd {
+        name: "SetPolicy",
+        st: ServiceType::Agent,
+        fp: agent_cmd_sandbox_set_policy,
+    },
+    AgentCmd {
+        name: "MemAgentMemcgSet",
+        st: ServiceType::Agent,
+        fp: agent_cmd_mem_agent_memcg_set,
+    },
+    AgentCmd {
+        name: "MemAgentCompactSet",
+        st: ServiceType::Agent,
+        fp: agent_cmd_mem_agent_compact_set,
+    },
 ];
 
 static BUILTIN_CMDS: & [BuiltinCmd] = &[
@@ -386,25 +410,43 @@ fn get_builtin_cmd_func(name: &str) -> Result<BuiltinCmdFp> {
 }
 
 fn client_create_vsock_fd(cid: libc::c_uint, port: u32) -> Result<RawFd> {
-    let fd = socket(
-        AddressFamily::Vsock,
-        SockType::Stream,
-        SockFlag::SOCK_CLOEXEC,
-        None,
-    )
-    .map_err(|e| anyhow!(e))?;
+    let sock_addr = VsockAddr::new(cid, port);
 
-    let sock_addr = SockAddr::new_vsock(cid, port);
+    for i in 0..RETRY_AGENT_CONNECT {
+        let fd = socket(
+            AddressFamily::Vsock,
+            SockType::Stream,
+            SockFlag::SOCK_CLOEXEC,
+            None,
+        )
+        .map_err(|e| anyhow!(e))?;
 
-    connect(fd, &sock_addr).map_err(|e| anyhow!(e))?;
+        // Connect the socket to vsock server.
+        match connect(fd.as_raw_fd(), &sock_addr) {
+            Ok(_) => return Ok(fd.into_raw_fd()),
+            Err(e) => {
+                debug!(
+                    sl!(),
+                    "Failed to connect to vsock in attempt:{} error:{:?}", i, e
+                );
+                sleep(Duration::from_millis(DIAL_TIMEOUT));
+                continue;
+            }
+        }
+    }
 
-    Ok(fd)
+    Err(anyhow!("Failed to establish vsock connection with agent"))
 }
 
 // Setup the existing stream by making a Hybrid VSOCK host-initiated
 // connection request to the Hybrid VSOCK-capable hypervisor (CLH or FC),
 // asking it to route the connection to the Kata Agent running inside the VM.
-fn setup_hybrid_vsock(mut stream: &UnixStream, hybrid_vsock_port: u64) -> Result<()> {
+fn setup_hybrid_vsock(path: &str, hybrid_vsock_port: u64) -> Result<UnixStream> {
+    debug!(
+        sl!(),
+        "setup_hybrid_vsock path:{} port: {}", path, hybrid_vsock_port
+    );
+
     // Challenge message sent to the Hybrid VSOCK capable hypervisor asking
     // for a connection to a real VSOCK server running in the VM on the
     // port specified as part of this message.
@@ -414,39 +456,39 @@ fn setup_hybrid_vsock(mut stream: &UnixStream, hybrid_vsock_port: u64) -> Result
     // hypervisor informing the client that the CONNECT_CMD was successful.
     const OK_CMD: &str = "OK";
 
-    // Contact the agent by dialing it's port number and
-    // waiting for the hybrid vsock hypervisor to route the call for us ;)
-    //
-    // See: https://github.com/firecracker-microvm/firecracker/blob/main/docs/vsock.md#host-initiated-connections
-    let msg = format!("{} {}\n", CONNECT_CMD, hybrid_vsock_port);
+    for i in 0..RETRY_AGENT_CONNECT {
+        let mut stream = UnixStream::connect(path)?;
+        // Contact the agent by dialing it's port number and
+        // waiting for the hybrid vsock hypervisor to route the call for us ;)
+        //
+        // See: https://github.com/firecracker-microvm/firecracker/blob/main/docs/vsock.md#host-initiated-connections
+        let msg = format!("{CONNECT_CMD} {hybrid_vsock_port}\n");
+        stream.write_all(msg.as_bytes())?;
 
-    stream.write_all(msg.as_bytes())?;
+        // Now, see if we get the expected response
+        let mut reader = BufReader::new(&mut stream);
 
-    // Now, see if we get the expected response
-    let stream_reader = stream.try_clone()?;
-    let mut reader = BufReader::new(&stream_reader);
+        let mut msg = String::new();
+        reader.read_line(&mut msg)?;
 
-    let mut msg = String::new();
-    reader.read_line(&mut msg)?;
+        if msg.starts_with(OK_CMD) {
+            let response = msg
+                .strip_prefix(OK_CMD)
+                .ok_or(format!("invalid response: {msg:?}"))
+                .map_err(|e| anyhow!(e))?
+                .trim();
 
-    if msg.starts_with(OK_CMD) {
-        let response = msg
-            .strip_prefix(OK_CMD)
-            .ok_or(format!("invalid response: {:?}", msg))
-            .map_err(|e| anyhow!(e))?
-            .trim();
-
-        debug!(sl!(), "Hybrid VSOCK host-side port: {:?}", response);
-    } else {
-        return Err(anyhow!(
-            "failed to setup Hybrid VSOCK connection: response was: {:?}",
-            msg
-        ));
+            // The Unix stream is now connected directly to the VSOCK socket
+            // the Kata agent is listening to in the VM.
+            debug!(sl!(), "Hybrid VSOCK host-side port: {:?}", response);
+            return Ok(stream);
+        } else {
+            debug!(sl!(), "attempt:{} message: {:?}", i, msg);
+            sleep(Duration::from_millis(DIAL_TIMEOUT));
+            continue;
+        }
     }
-
-    // The Unix stream is now connected directly to the VSOCK socket
-    // the Kata agent is listening to in the VM.
-    Ok(())
+    Err(anyhow!("Failed to establish hvsock connection with agent"))
 }
 
 fn create_ttrpc_client(
@@ -507,27 +549,21 @@ fn create_ttrpc_client(
                     }
                 };
 
-                let sock_addr = SockAddr::Unix(unix_addr);
-
-                connect(socket_fd, &sock_addr).map_err(|e| {
+                connect(socket_fd.as_raw_fd(), &unix_addr).map_err(|e| {
                     anyhow!(e).context("Failed to connect to Unix Domain abstract socket")
                 })?;
 
-                socket_fd
+                socket_fd.into_raw_fd()
+            } else if hybrid_vsock {
+                let stream = setup_hybrid_vsock(&path, hybrid_vsock_port)?;
+                stream.into_raw_fd()
             } else {
                 let stream = match UnixStream::connect(path) {
                     Ok(s) => s,
-                    Err(e) => {
-                        return Err(
-                            anyhow!(e).context("failed to create named UNIX Domain stream socket")
-                        )
+                    Err(err) => {
+                        return Err(anyhow!("failed to setup unix stream: {:?}", err));
                     }
                 };
-
-                if hybrid_vsock {
-                    setup_hybrid_vsock(&stream, hybrid_vsock_port)?
-                }
-
                 stream.into_raw_fd()
             }
         }
@@ -561,7 +597,7 @@ fn create_ttrpc_client(
         }
     };
 
-    Ok(ttrpc::Client::new(fd))
+    ttrpc::Client::new(fd).map_err(|err| anyhow!("failed to new a ttrpc client: {:?}", err))
 }
 
 fn kata_service_agent(
@@ -588,13 +624,13 @@ fn announce(cfg: &Config) {
     info!(sl!(), "announce"; "config" => format!("{:?}", cfg));
 }
 
-pub fn client(cfg: &Config, commands: Vec<&str>) -> Result<()> {
+pub fn client(cfg: &mut Config, commands: Vec<&str>) -> Result<()> {
     if commands.len() == 1 && commands[0].eq("list") {
         println!("Built-in commands:\n");
 
         let mut builtin_cmds = get_builtin_cmd_details();
         builtin_cmds.sort();
-        builtin_cmds.iter().for_each(|n| println!("  {}", n));
+        builtin_cmds.iter().for_each(|n| println!("  {n}"));
 
         println!();
 
@@ -602,7 +638,7 @@ pub fn client(cfg: &Config, commands: Vec<&str>) -> Result<()> {
 
         let mut agent_cmds = get_agent_cmd_details();
         agent_cmds.sort();
-        agent_cmds.iter().for_each(|n| println!("  {}", n));
+        agent_cmds.iter().for_each(|n| println!("  {n}"));
 
         println!();
 
@@ -611,6 +647,74 @@ pub fn client(cfg: &Config, commands: Vec<&str>) -> Result<()> {
 
     announce(cfg);
 
+    let vm_ref = handle_vm(cfg)?;
+
+    info!(sl!(), "run commands");
+    let result = run_commands(cfg, commands);
+
+    // stop the vm if booted
+    if let Some(vm_ref) = vm_ref {
+        info!(sl!(), "stopping test vm");
+        // TODO: The error handling here is for cloud-hypervisor.
+        // We use tokio::runtime to call the async operations of
+        // runtime-rs::crates::hypervisor::_vm
+        // These methods can spawn some additional functions, ex
+        // `clh::inner_hypervisor::cloud_hypervisor_log_output`
+        // But since we return from the tokio::runtime block
+        // the runtime is dropped. During stop_vm call, cloud hypervisor
+        // waits for the logger task which is in cancelled state as a result.
+        match vm::remove_vm(vm_ref) {
+            Ok(_) => info!(sl!(), "Successfully shut down test vm"),
+            Err(e) => warn!(sl!(), "Error shutting down vm:{:?}", e),
+        }
+    }
+
+    result.map_err(|e| anyhow!(e))
+}
+
+fn handle_vm(cfg: &mut Config) -> Result<Option<vm::TestVm>> {
+    info!(sl!(), "handle vm request");
+
+    // Return if no vm requested
+    if cfg.hypervisor_name.is_empty() {
+        return Ok(None);
+    }
+
+    // Boot the test vm
+    let vm_instance = vm::setup_vm(&cfg.hypervisor_name)?;
+    info!(
+        sl!(),
+        "booted test vm with hypervisor: {:?}", vm_instance.hypervisor_name
+    );
+
+    // set the vsock server address for connecting with ttrpc server
+    if !vm_instance.socket_addr.is_empty() {
+        match vm_instance.hybrid_vsock {
+            true => {
+                // hybrid vsock URI expects unix prefix
+                let addr_fields: Vec<&str> = vm_instance.socket_addr.split("://").collect();
+                cfg.server_address = format!("{}://{}", "unix", addr_fields[1]);
+                cfg.hybrid_vsock = true;
+            }
+            false => {
+                let addr = vm_instance.socket_addr.clone();
+                cfg.server_address = format!("{}:{}", addr, 1024);
+                cfg.hybrid_vsock = false;
+            }
+        }
+    }
+
+    // set the fs share path in config
+    if vm_instance.share_fs.pid != 0 {
+        debug!(sl!(), "share path: {}", cfg.shared_fs_host_path);
+        cfg.shared_fs_host_path = vm_instance.share_fs.shared_path.clone();
+    }
+
+    info!(sl!(), "socket server addr: {}", cfg.server_address);
+    Ok(Some(vm_instance))
+}
+
+fn run_commands(cfg: &Config, commands: Vec<&str>) -> Result<()> {
     // Create separate connections for each of the services provided
     // by the agent.
     let client = kata_service_agent(
@@ -633,9 +737,8 @@ pub fn client(cfg: &Config, commands: Vec<&str>) -> Result<()> {
     // of this option.
 
     if !cfg.no_auto_values {
-        ttrpc_ctx.add(METADATA_CFG_NS.into(), NO_AUTO_VALUES_CFG_NAME.to_string());
-
-        debug!(sl!(), "Automatic value generation disabled");
+        ttrpc_ctx.add(METADATA_CFG_NS.into(), AUTO_VALUES_CFG_NAME.to_string());
+        debug!(sl!(), "Automatic value generation enabled");
     }
 
     // Special-case loading the OCI config file so it is accessible
@@ -645,6 +748,11 @@ pub fn client(cfg: &Config, commands: Vec<&str>) -> Result<()> {
 
     // Convenience option
     options.insert("bundle-dir".to_string(), cfg.bundle_dir.clone());
+
+    // when running with `--vm`, add host path for fs share to options
+    if !cfg.shared_fs_host_path.is_empty() {
+        options.insert("shared-path".to_string(), cfg.shared_fs_host_path.clone());
+    }
 
     info!(sl!(), "client setup complete";
         "server-address" => cfg.server_address.to_string());
@@ -847,17 +955,17 @@ fn interactive_client_loop(
 }
 
 fn readline(prompt: &str) -> std::result::Result<String, String> {
-    print!("{}: ", prompt);
+    print!("{prompt}: ");
 
     io::stdout()
         .flush()
-        .map_err(|e| format!("failed to flush: {:?}", e))?;
+        .map_err(|e| format!("failed to flush: {e:?}"))?;
 
     let mut line = String::new();
 
     std::io::stdin()
         .read_line(&mut line)
-        .map_err(|e| format!("failed to read line: {:?}", e))?;
+        .map_err(|e| format!("failed to read line: {e:?}"))?;
 
     // Remove NL
     Ok(line.trim_end().to_string())
@@ -914,19 +1022,17 @@ fn agent_cmd_sandbox_create(
     ctx: &Context,
     client: &AgentServiceClient,
     _health: &HealthClient,
-    options: &mut Options,
+    _options: &mut Options,
     args: &str,
 ) -> Result<()> {
     let mut req: CreateSandboxRequest = utils::make_request(args)?;
 
+    // Generate sandbox_id if it is empty
+    if req.sandbox_id.is_empty() {
+        req.set_sandbox_id(utils::random_sandbox_id());
+    }
+
     let ctx = clone_context(ctx);
-
-    run_if_auto_values!(ctx, || -> Result<()> {
-        let sid = utils::get_option("sid", options, args)?;
-        req.set_sandbox_id(sid);
-
-        Ok(())
-    });
 
     debug!(sl!(), "sending request"; "request" => format!("{:?}", req));
 
@@ -970,23 +1076,22 @@ fn agent_cmd_container_create(
     options: &mut Options,
     args: &str,
 ) -> Result<()> {
-    let mut req: CreateContainerRequest = utils::make_request(args)?;
+    let input: CreateContainerInput = utils::make_request(args)?;
+
+    if input.image.is_empty() {
+        info!(sl!(), "create container: error image is empty");
+        return Err(anyhow!("CreateContainer needs image reference"));
+    }
 
     let ctx = clone_context(ctx);
 
-    // FIXME: container create: add back "spec=file:///" support
+    // setup host/guest fs sharing for container rootfs
+    let share_fs_path = match options.get("shared-path") {
+        Some(p) => p.to_string(),
+        None => "".to_string(),
+    };
 
-    run_if_auto_values!(ctx, || -> Result<()> {
-        let cid = utils::get_option("cid", options, args)?;
-        let exec_id = utils::get_option("exec_id", options, args)?;
-        let ttrpc_spec = utils::get_ttrpc_spec(options, &cid).map_err(|e| anyhow!(e))?;
-
-        req.set_container_id(cid);
-        req.set_exec_id(exec_id);
-        req.set_OCI(ttrpc_spec);
-
-        Ok(())
-    });
+    let req = utils::make_create_container_request(input, share_fs_path)?;
 
     debug!(sl!(), "sending request"; "request" => format!("{:?}", req));
 
@@ -1007,15 +1112,9 @@ fn agent_cmd_container_remove(
     options: &mut Options,
     args: &str,
 ) -> Result<()> {
-    let mut req: RemoveContainerRequest = utils::make_request(args)?;
+    let req: RemoveContainerRequest = utils::make_request(args)?;
 
     let ctx = clone_context(ctx);
-
-    run_if_auto_values!(ctx, || -> Result<()> {
-        let cid = utils::get_option("cid", options, args)?;
-        req.set_container_id(cid);
-        Ok(())
-    });
 
     debug!(sl!(), "sending request"; "request" => format!("{:?}", req));
 
@@ -1025,6 +1124,15 @@ fn agent_cmd_container_remove(
 
     info!(sl!(), "response received";
         "response" => format!("{:?}", reply));
+
+    // Unmount the share fs
+    let share_fs_path = match options.get("shared-path") {
+        Some(p) => p.to_string(),
+        None => "".to_string(),
+    };
+
+    // Unmount the rootfs mount point.
+    utils::remove_container_image_mount(req.container_id(), &share_fs_path)?;
 
     Ok(())
 }
@@ -1054,10 +1162,7 @@ fn agent_cmd_container_exec(
         let process = ttrpc_spec
             .Process
             .into_option()
-            .ok_or(format!(
-                "failed to get process from OCI spec: {}",
-                bundle_dir,
-            ))
+            .ok_or(format!("failed to get process from OCI spec: {bundle_dir}",))
             .map_err(|e| anyhow!(e))?;
 
         req.set_container_id(cid);
@@ -1173,19 +1278,12 @@ fn agent_cmd_container_start(
     ctx: &Context,
     client: &AgentServiceClient,
     _health: &HealthClient,
-    options: &mut Options,
+    _options: &mut Options,
     args: &str,
 ) -> Result<()> {
-    let mut req: StartContainerRequest = utils::make_request(args)?;
+    let req: StartContainerRequest = utils::make_request(args)?;
 
     let ctx = clone_context(ctx);
-
-    run_if_auto_values!(ctx, || -> Result<()> {
-        let cid = utils::get_option("cid", options, args)?;
-
-        req.set_container_id(cid);
-        Ok(())
-    });
 
     debug!(sl!(), "sending request"; "request" => format!("{:?}", req));
 
@@ -1705,94 +1803,50 @@ fn agent_cmd_sandbox_copy_file(
     ctx: &Context,
     client: &AgentServiceClient,
     _health: &HealthClient,
-    options: &mut Options,
+    _options: &mut Options,
     args: &str,
 ) -> Result<()> {
-    let mut req: CopyFileRequest = utils::make_request(args)?;
+    let input: CopyFileInput = utils::make_request(args)?;
 
-    let ctx = clone_context(ctx);
+    let mut req: CopyFileRequest = utils::make_copy_file_request(&input)?;
 
-    run_if_auto_values!(ctx, || -> Result<()> {
-        let path = utils::get_option("path", options, args)?;
-        if !path.is_empty() {
-            req.set_path(path);
+    info!(sl!(), "sending request"; "request" => format!("{:?}", req));
+
+    if req.file_size() == 0 {
+        let reply = client
+            .copy_file(clone_context(ctx), &req)
+            .map_err(|e| anyhow!("{:?}", e).context(ERR_API_FAILED))?;
+
+        info!(sl!(), "response received"; "response" => format!("{:?}", reply));
+
+        return Ok(());
+    }
+
+    let chunk_size = 1024 * 1024;
+    let mut remaining_bytes = req.file_size();
+    let mut src_file = fs::File::open(&input.src)?;
+    let mut offset = 0;
+    while remaining_bytes > 0 {
+        let mut copy_size = remaining_bytes;
+        if copy_size > chunk_size {
+            copy_size = chunk_size;
         }
 
-        let file_size_str = utils::get_option("file_size", options, args)?;
+        let mut buf = vec![0; usize::try_from(copy_size)?];
+        src_file.read_exact(&mut buf)?;
+        req.set_data(buf);
+        req.set_offset(offset);
 
-        if !file_size_str.is_empty() {
-            let file_size = file_size_str
-                .parse::<i64>()
-                .map_err(|e| anyhow!(e).context("invalid file_size"))?;
+        let reply = client
+            .copy_file(clone_context(ctx), &req)
+            .map_err(|e| anyhow!("{:?}", e).context(ERR_API_FAILED))?;
 
-            req.set_file_size(file_size);
-        }
+        info!(sl!(), "response received"; "response" => format!("{:?}", reply));
 
-        let file_mode_str = utils::get_option("file_mode", options, args)?;
-
-        if !file_mode_str.is_empty() {
-            let file_mode = file_mode_str
-                .parse::<u32>()
-                .map_err(|e| anyhow!(e).context("invalid file_mode"))?;
-
-            req.set_file_mode(file_mode);
-        }
-
-        let dir_mode_str = utils::get_option("dir_mode", options, args)?;
-
-        if !dir_mode_str.is_empty() {
-            let dir_mode = dir_mode_str
-                .parse::<u32>()
-                .map_err(|e| anyhow!(e).context("invalid dir_mode"))?;
-
-            req.set_dir_mode(dir_mode);
-        }
-
-        let uid_str = utils::get_option("uid", options, args)?;
-
-        if !uid_str.is_empty() {
-            let uid = uid_str
-                .parse::<i32>()
-                .map_err(|e| anyhow!(e).context("invalid uid"))?;
-
-            req.set_uid(uid);
-        }
-
-        let gid_str = utils::get_option("gid", options, args)?;
-
-        if !gid_str.is_empty() {
-            let gid = gid_str
-                .parse::<i32>()
-                .map_err(|e| anyhow!(e).context("invalid gid"))?;
-            req.set_gid(gid);
-        }
-
-        let offset_str = utils::get_option("offset", options, args)?;
-
-        if !offset_str.is_empty() {
-            let offset = offset_str
-                .parse::<i64>()
-                .map_err(|e| anyhow!(e).context("invalid offset"))?;
-            req.set_offset(offset);
-        }
-
-        let data_str = utils::get_option("data", options, args)?;
-        if !data_str.is_empty() {
-            let data = utils::str_to_bytes(&data_str)?;
-            req.set_data(data.to_vec());
-        }
-
-        Ok(())
-    });
-
-    debug!(sl!(), "sending request"; "request" => format!("{:?}", req));
-
-    let reply = client
-        .copy_file(ctx, &req)
-        .map_err(|e| anyhow!("{:?}", e).context(ERR_API_FAILED))?;
-
-    info!(sl!(), "response received";
-        "response" => format!("{:?}", reply));
+        remaining_bytes -= copy_size;
+        offset += copy_size;
+        src_file.seek(SeekFrom::Start(offset as u64))?;
+    }
 
     Ok(())
 }
@@ -2092,7 +2146,7 @@ fn builtin_cmd_sleep(args: &str) -> (Result<()>, bool) {
 }
 
 fn builtin_cmd_echo(args: &str) -> (Result<()>, bool) {
-    println!("{}", args);
+    println!("{args}");
 
     (Ok(()), false)
 }
@@ -2104,7 +2158,7 @@ fn builtin_cmd_quit(_args: &str) -> (Result<()>, bool) {
 fn builtin_cmd_list(_args: &str) -> (Result<()>, bool) {
     let cmds = get_all_cmd_details();
 
-    cmds.iter().for_each(|n| println!(" - {}", n));
+    cmds.iter().for_each(|n| println!(" - {n}"));
 
     println!();
 
@@ -2151,6 +2205,78 @@ fn agent_cmd_sandbox_add_swap(
 
     // FIXME: Implement 'AddSwap' fully.
     eprintln!("FIXME: 'AddSwap' not fully implemented");
+
+    info!(sl!(), "response received";
+        "response" => format!("{:?}", reply));
+
+    Ok(())
+}
+
+fn agent_cmd_sandbox_set_policy(
+    ctx: &Context,
+    client: &AgentServiceClient,
+    _health: &HealthClient,
+    _options: &mut Options,
+    args: &str,
+) -> Result<()> {
+    let input: SetPolicyInput = utils::make_request(args)?;
+
+    let req = utils::make_set_policy_request(&input)?;
+
+    let ctx = clone_context(ctx);
+
+    info!(sl!(), "sending request"; "request" => format!("{:?}", req));
+
+    let reply = client
+        .set_policy(ctx, &req)
+        .map_err(|e| anyhow!("{:?}", e).context(ERR_API_FAILED))?;
+
+    info!(sl!(), "response received";
+        "response" => format!("{:?}", reply));
+
+    Ok(())
+}
+
+fn agent_cmd_mem_agent_memcg_set(
+    ctx: &Context,
+    client: &AgentServiceClient,
+    _health: &HealthClient,
+    _options: &mut Options,
+    args: &str,
+) -> Result<()> {
+    //let req = MemAgentMemcgConfig::default();
+    let req: MemAgentMemcgConfig = utils::make_request(args)?;
+
+    let ctx = clone_context(ctx);
+
+    info!(sl!(), "sending request"; "request" => format!("{:?}", req));
+
+    let reply = client
+        .mem_agent_memcg_set(ctx, &req)
+        .map_err(|e| anyhow!("{:?}", e).context(ERR_API_FAILED))?;
+
+    info!(sl!(), "response received";
+        "response" => format!("{:?}", reply));
+
+    Ok(())
+}
+
+fn agent_cmd_mem_agent_compact_set(
+    ctx: &Context,
+    client: &AgentServiceClient,
+    _health: &HealthClient,
+    _options: &mut Options,
+    args: &str,
+) -> Result<()> {
+    let req: MemAgentCompactConfig = utils::make_request(args)?;
+
+    let ctx = clone_context(ctx);
+
+    info!(sl!(), "sending request"; "request" => format!("{:?}", req));
+
+    let reply = client
+        .mem_agent_compact_set(ctx, &req)
+        .map_err(|e| anyhow!("{:?}", e).context(ERR_API_FAILED))?;
 
     info!(sl!(), "response received";
         "response" => format!("{:?}", reply));

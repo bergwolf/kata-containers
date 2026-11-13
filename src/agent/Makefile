@@ -15,7 +15,7 @@ PROJECT_COMPONENT = kata-agent
 TARGET = $(PROJECT_COMPONENT)
 
 VERSION_FILE := ./VERSION
-VERSION := $(shell grep -v ^\# $(VERSION_FILE))
+VERSION := $(shell grep -v ^\# $(VERSION_FILE) 2>/dev/null || echo "unknown")
 COMMIT_NO := $(shell git rev-parse HEAD 2>/dev/null || true)
 COMMIT := $(if $(shell git status --porcelain --untracked-files=no 2>/dev/null || true),${COMMIT_NO}-dirty,${COMMIT_NO})
 COMMIT_MSG = $(if $(COMMIT),$(COMMIT),unknown)
@@ -41,25 +41,30 @@ ifeq ($(AGENT_POLICY),yes)
     override EXTRA_RUSTFEATURES += agent-policy
 endif
 
+##VAR INIT_DATA=yes|no define if agent enables the init data feature
+INIT_DATA ?= yes
+
+# Enable the init data fature of rust build
+ifeq ($(INIT_DATA),yes)
+    override EXTRA_RUSTFEATURES += init-data
+endif
+
+##VAR USE_DEVMAPPER=yes|no define if agent enables dm-verity (devicemapper) support
+USE_DEVMAPPER ?= no
+
+# Enable the devicemapper feature (links libdevmapper for dm-verity) with GNU libc
+ifeq ($(USE_DEVMAPPER),yes)
+    override EXTRA_RUSTFEATURES += devicemapper
+    override LIBC = gnu
+endif
+
 include ../../utils.mk
-
-ifeq ($(ARCH), ppc64le)
-    override ARCH = powerpc64le
-endif
-
-##VAR STANDARD_OCI_RUNTIME=yes|no define if agent enables standard oci runtime feature
-STANDARD_OCI_RUNTIME := no
-
-# Enable standard oci runtime feature of rust build
-ifeq ($(STANDARD_OCI_RUNTIME),yes)
-    override EXTRA_RUSTFEATURES += standard-oci-runtime
-endif
 
 ifneq ($(EXTRA_RUSTFEATURES),)
     override EXTRA_RUSTFEATURES := --features "$(EXTRA_RUSTFEATURES)"
 endif
 
-TARGET_PATH = target/$(TRIPLE)/$(BUILD_TYPE)/$(TARGET)
+TARGET_PATH = ../../target/$(TRIPLE)/$(BUILD_TYPE)/$(TARGET)
 
 ##VAR DESTDIR=<path> is a directory prepended to each installed target file
 DESTDIR ?=
@@ -71,6 +76,8 @@ INIT := no
 
 # Path to systemd unit directory if installed as not init.
 UNIT_DIR := /usr/lib/systemd/system
+# Path to systemd system generator directory.
+GENERATOR_DIR := /usr/lib/systemd/system-generators
 
 GENERATED_CODE = src/version.rs
 
@@ -95,6 +102,13 @@ ifeq ($(INIT),no)
     GENERATED_FILES += $(UNIT_FILES)
     # Target to be reached in systemd services
     UNIT_FILES += kata-containers.target
+    # Template unit for mounting extension block devices (CoCo, GPU, etc.)
+    UNIT_FILES += kata-extension-mount@.service
+    # Helper scripts for extension mount/umount
+    EXTENSION_SCRIPTS = kata-extension-mount.sh kata-extension-umount.sh
+    # systemd generator that enables the mount template per extension declared
+    # on the kernel command line, so new extensions need no rootfs build change
+    EXTENSION_GENERATOR = kata-extension-mount-generator.sh
 endif
 
 # Display name of command and it's version (or a message if not available).
@@ -126,7 +140,7 @@ $(TARGET): $(GENERATED_CODE) $(TARGET_PATH)
 $(TARGET_PATH): show-summary
 	@RUSTFLAGS="$(EXTRA_RUSTFLAGS) --deny warnings" cargo build --target $(TRIPLE) $(if $(findstring release,$(BUILD_TYPE)),--release) $(EXTRA_RUSTFEATURES)
 
-$(GENERATED_FILES): %: %.in
+$(GENERATED_FILES): %: %.in $(VERSION_FILE)
 	@sed $(foreach r,$(GENERATED_REPLACEMENTS),-e 's|@$r@|$($r)|g') "$<" > "$@"
 
 ##TARGET optimize: optimized  build
@@ -143,13 +157,9 @@ clean:
 	@rm -f $(GENERATED_FILES)
 	@rm -f tarpaulin-report.html
 
-vendor:
-	@cargo vendor
-
-
 #TARGET test: run cargo tests
 test: $(GENERATED_FILES)
-	@cargo test --all --target $(TRIPLE) $(EXTRA_RUSTFEATURES) -- --nocapture
+	@RUST_LIB_BACKTRACE=0 RUST_BACKTRACE=1 cargo test $(PACKAGE_FLAGS) --target $(TRIPLE) $(EXTRA_RUSTFEATURES) -- --nocapture
 
 ##TARGET check: run test
 check: $(GENERATED_FILES) standard_rust_check
@@ -162,6 +172,10 @@ install-services: $(GENERATED_FILES)
 ifeq ($(INIT),no)
 	@echo "Installing systemd unit files..."
 	$(foreach f,$(UNIT_FILES),$(call INSTALL_FILE,$f,$(UNIT_DIR)))
+	@echo "Installing extension helper scripts..."
+	$(foreach f,$(EXTENSION_SCRIPTS),install -D -m 755 $f $(DESTDIR)/usr/libexec/$f || exit 1;)
+	@echo "Installing extension mount generator..."
+	@install -D -m 755 $(EXTENSION_GENERATOR) $(DESTDIR)$(GENERATOR_DIR)/kata-extension-mount-generator
 endif
 
 show-header:
@@ -216,9 +230,15 @@ codecov-html: check_tarpaulin
 	help \
 	optimize \
 	show-header \
-	show-summary \
-	vendor
+	show-summary
 
 ##TARGET generate-protocols: generate/update grpc agent protocols
 generate-protocols:
+	image=$$(docker build -q \
+	  --build-arg GO_VERSION=$$(yq '.languages.golang.version' $(CURDIR)/../../versions.yaml) \
+	  --build-arg PROTOC_VERSION=$$(yq '.externals.protoc.version' $(CURDIR)/../../versions.yaml | grep -oE "[0-9.]+") \
+	  --build-arg PROTOC_GEN_GO_VERSION=$$(yq '.externals.protoc-gen-go.version' $(CURDIR)/../../versions.yaml) \
+	  --build-arg TTRPC_VERSION=$$(yq '.externals.ttrpc.version' $(CURDIR)/../../versions.yaml) \
+	  $(CURDIR)/../../tools/packaging/static-build/codegen) && \
+	docker run --rm --workdir /kata/src/agent -v $(CURDIR)/../..:/kata --user $(shell id -u) $$image \
 	../libs/protocols/hack/update-generated-proto.sh all

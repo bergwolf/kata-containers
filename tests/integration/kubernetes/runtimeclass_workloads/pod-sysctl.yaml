@@ -8,9 +8,9 @@ kind: Pod
 metadata:
   name: sysctl-test
 spec:
-  terminationGracePeriodSeconds: 0
   runtimeClassName: kata
   securityContext:
+    supplementalGroups: [10]
     sysctls:
     - name: kernel.shm_rmid_forced
       value: "0"

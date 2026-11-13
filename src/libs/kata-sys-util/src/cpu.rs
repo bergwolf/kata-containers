@@ -54,7 +54,7 @@ pub fn get_cpu_flags(cpu_info: &str, cpu_flags_tag: &str) -> Result<String> {
     }
 
     if cpu_flags_tag.is_empty() {
-        return Err(anyhow!("cpu flags delimiter string is empty"))?;
+        return Err(anyhow!("cpu flags delimiter string is empty"));
     }
 
     get_cpu_flags_from_file(cpu_info, cpu_flags_tag)
@@ -71,7 +71,7 @@ pub fn get_cpu_flags_vec(cpu_info: &str, cpu_flags_tag: &str) -> Result<Vec<Stri
     }
 
     if cpu_flags_tag.is_empty() {
-        return Err(anyhow!("cpu flags delimiter string is empty"))?;
+        return Err(anyhow!("cpu flags delimiter string is empty"));
     }
 
     let flags = get_cpu_flags_from_file(cpu_info, cpu_flags_tag)?;
@@ -93,7 +93,7 @@ pub fn get_cpu_flags_vec(cpu_info: &str, cpu_flags_tag: &str) -> Result<Vec<Stri
 #[cfg(any(target_arch = "s390x", target_arch = "x86_64"))]
 pub fn contains_cpu_flag(flags_vec: &[String], flag: &str) -> Result<bool> {
     if flag.is_empty() {
-        return Err(anyhow!("parameter specifying flag to look for is empty"))?;
+        return Err(anyhow!("parameter specifying flag to look for is empty"));
     }
 
     Ok(flags_vec.iter().any(|f| f == flag))
@@ -172,7 +172,7 @@ mod tests {
         let path_full = file_path_full.clone();
         let mut file_full = fs::File::create(file_path_full).unwrap();
         let contents = "processor : 0\nvendor_id : VendorExample\nflags : flag_1 flag_2 flag_3 flag_4\nprocessor : 1\n".to_string();
-        writeln!(file_full, "{}", contents).unwrap();
+        writeln!(file_full, "{contents}").unwrap();
 
         // Empty cpuinfo example
         let file_path_empty = dir.path().join("cpuinfo_empty");
@@ -209,16 +209,15 @@ mod tests {
         ];
 
         for (i, d) in tests.iter().enumerate() {
-            let msg = format!("test[{}]: {:?}", i, d);
+            let msg = format!("test[{i}]: {d:?}");
             let result = get_single_cpu_info(d.cpuinfo_path, d.processor_delimiter_str);
-            let msg = format!("{}, result: {:?}", msg, result);
+            let msg = format!("{msg}, result: {result:?}");
 
             if d.result.is_ok() {
                 assert_eq!(
                     result.as_ref().unwrap(),
                     d.result.as_ref().unwrap(),
-                    "{}",
-                    msg
+                    "{msg}"
                 );
                 continue;
             }
@@ -270,16 +269,15 @@ mod tests {
         ];
 
         for (i, d) in tests.iter().enumerate() {
-            let msg = format!("test[{}]: {:?}", i, d);
+            let msg = format!("test[{i}]: {d:?}");
             let result = get_cpu_flags(d.cpu_info_str, d.cpu_flags_tag);
-            let msg = format!("{}, result: {:?}", msg, result);
+            let msg = format!("{msg}, result: {result:?}");
 
             if d.result.is_ok() {
                 assert_eq!(
                     result.as_ref().unwrap(),
                     d.result.as_ref().unwrap(),
-                    "{}",
-                    msg
+                    "{msg}"
                 );
                 continue;
             }
@@ -336,16 +334,15 @@ mod tests {
         ];
 
         for (i, d) in tests.iter().enumerate() {
-            let msg = format!("test[{}]: {:?}", i, d);
+            let msg = format!("test[{i}]: {d:?}");
             let result = get_cpu_flags_vec(d.cpu_info_str, d.cpu_flags_tag);
-            let msg = format!("{}, result: {:?}", msg, result);
+            let msg = format!("{msg}, result: {result:?}");
 
             if d.result.is_ok() {
                 assert_eq!(
                     result.as_ref().unwrap(),
                     d.result.as_ref().unwrap(),
-                    "{}",
-                    msg
+                    "{msg}"
                 );
                 continue;
             }
@@ -392,16 +389,15 @@ mod tests {
         ];
 
         for (i, d) in tests.iter().enumerate() {
-            let msg = format!("test[{}]: {:?}", i, d);
+            let msg = format!("test[{i}]: {d:?}");
             let result = contains_cpu_flag(d.cpu_flags_vec, d.cpu_flag);
-            let msg = format!("{}, result: {:?}", msg, result);
+            let msg = format!("{msg}, result: {result:?}");
 
             if d.result.is_ok() {
                 assert_eq!(
                     result.as_ref().unwrap(),
                     d.result.as_ref().unwrap(),
-                    "{}",
-                    msg
+                    "{msg}"
                 );
                 continue;
             }

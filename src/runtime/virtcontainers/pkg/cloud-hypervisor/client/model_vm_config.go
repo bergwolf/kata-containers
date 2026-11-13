@@ -16,26 +16,33 @@ import (
 
 // VmConfig Virtual machine configuration
 type VmConfig struct {
-	Cpus     *CpusConfig     `json:"cpus,omitempty"`
-	Memory   *MemoryConfig   `json:"memory,omitempty"`
-	Payload  PayloadConfig   `json:"payload"`
-	Disks    *[]DiskConfig   `json:"disks,omitempty"`
-	Net      *[]NetConfig    `json:"net,omitempty"`
-	Rng      *RngConfig      `json:"rng,omitempty"`
-	Balloon  *BalloonConfig  `json:"balloon,omitempty"`
-	Fs       *[]FsConfig     `json:"fs,omitempty"`
-	Pmem     *[]PmemConfig   `json:"pmem,omitempty"`
-	Serial   *ConsoleConfig  `json:"serial,omitempty"`
-	Console  *ConsoleConfig  `json:"console,omitempty"`
-	Devices  *[]DeviceConfig `json:"devices,omitempty"`
-	Vdpa     *[]VdpaConfig   `json:"vdpa,omitempty"`
-	Vsock    *VsockConfig    `json:"vsock,omitempty"`
-	SgxEpc   *[]SgxEpcConfig `json:"sgx_epc,omitempty"`
-	Numa     *[]NumaConfig   `json:"numa,omitempty"`
-	Iommu    *bool           `json:"iommu,omitempty"`
-	Watchdog *bool           `json:"watchdog,omitempty"`
-	Platform *PlatformConfig `json:"platform,omitempty"`
-	Tpm      *TpmConfig      `json:"tpm,omitempty"`
+	Cpus             *CpusConfig               `json:"cpus,omitempty"`
+	Memory           *MemoryConfig             `json:"memory,omitempty"`
+	Payload          PayloadConfig             `json:"payload"`
+	RateLimitGroups  *[]RateLimitGroupConfig   `json:"rate_limit_groups,omitempty"`
+	Disks            *[]DiskConfig             `json:"disks,omitempty"`
+	Net              *[]NetConfig              `json:"net,omitempty"`
+	Rng              *RngConfig                `json:"rng,omitempty"`
+	Balloon          *BalloonConfig            `json:"balloon,omitempty"`
+	Fs               *[]FsConfig               `json:"fs,omitempty"`
+	GenericVhostUser *[]GenericVhostUserConfig `json:"generic_vhost_user,omitempty"`
+	Pmem             *[]PmemConfig             `json:"pmem,omitempty"`
+	Serial           *SerialConfig             `json:"serial,omitempty"`
+	Console          *ConsoleConfig            `json:"console,omitempty"`
+	DebugConsole     *DebugConsoleConfig       `json:"debug_console,omitempty"`
+	Devices          *[]DeviceConfig           `json:"devices,omitempty"`
+	UserDevices      *[]UserDeviceConfig       `json:"user_devices,omitempty"`
+	Vdpa             *[]VdpaConfig             `json:"vdpa,omitempty"`
+	Vsock            *VsockConfig              `json:"vsock,omitempty"`
+	Numa             *[]NumaConfig             `json:"numa,omitempty"`
+	Watchdog         *bool                     `json:"watchdog,omitempty"`
+	Rtc              *RtcConfig                `json:"rtc,omitempty"`
+	Pvpanic          *bool                     `json:"pvpanic,omitempty"`
+	PciSegments      *[]PciSegmentConfig       `json:"pci_segments,omitempty"`
+	Platform         *PlatformConfig           `json:"platform,omitempty"`
+	Tpm              *TpmConfig                `json:"tpm,omitempty"`
+	LandlockEnable   *bool                     `json:"landlock_enable,omitempty"`
+	LandlockRules    *[]LandlockConfig         `json:"landlock_rules,omitempty"`
 }
 
 // NewVmConfig instantiates a new VmConfig object
@@ -45,10 +52,12 @@ type VmConfig struct {
 func NewVmConfig(payload PayloadConfig) *VmConfig {
 	this := VmConfig{}
 	this.Payload = payload
-	var iommu bool = false
-	this.Iommu = &iommu
 	var watchdog bool = false
 	this.Watchdog = &watchdog
+	var pvpanic bool = false
+	this.Pvpanic = &pvpanic
+	var landlockEnable bool = false
+	this.LandlockEnable = &landlockEnable
 	return &this
 }
 
@@ -57,10 +66,12 @@ func NewVmConfig(payload PayloadConfig) *VmConfig {
 // but it doesn't guarantee that properties required by API are set
 func NewVmConfigWithDefaults() *VmConfig {
 	this := VmConfig{}
-	var iommu bool = false
-	this.Iommu = &iommu
 	var watchdog bool = false
 	this.Watchdog = &watchdog
+	var pvpanic bool = false
+	this.Pvpanic = &pvpanic
+	var landlockEnable bool = false
+	this.LandlockEnable = &landlockEnable
 	return &this
 }
 
@@ -150,6 +161,38 @@ func (o *VmConfig) GetPayloadOk() (*PayloadConfig, bool) {
 // SetPayload sets field value
 func (o *VmConfig) SetPayload(v PayloadConfig) {
 	o.Payload = v
+}
+
+// GetRateLimitGroups returns the RateLimitGroups field value if set, zero value otherwise.
+func (o *VmConfig) GetRateLimitGroups() []RateLimitGroupConfig {
+	if o == nil || o.RateLimitGroups == nil {
+		var ret []RateLimitGroupConfig
+		return ret
+	}
+	return *o.RateLimitGroups
+}
+
+// GetRateLimitGroupsOk returns a tuple with the RateLimitGroups field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+func (o *VmConfig) GetRateLimitGroupsOk() (*[]RateLimitGroupConfig, bool) {
+	if o == nil || o.RateLimitGroups == nil {
+		return nil, false
+	}
+	return o.RateLimitGroups, true
+}
+
+// HasRateLimitGroups returns a boolean if a field has been set.
+func (o *VmConfig) HasRateLimitGroups() bool {
+	if o != nil && o.RateLimitGroups != nil {
+		return true
+	}
+
+	return false
+}
+
+// SetRateLimitGroups gets a reference to the given []RateLimitGroupConfig and assigns it to the RateLimitGroups field.
+func (o *VmConfig) SetRateLimitGroups(v []RateLimitGroupConfig) {
+	o.RateLimitGroups = &v
 }
 
 // GetDisks returns the Disks field value if set, zero value otherwise.
@@ -312,6 +355,38 @@ func (o *VmConfig) SetFs(v []FsConfig) {
 	o.Fs = &v
 }
 
+// GetGenericVhostUser returns the GenericVhostUser field value if set, zero value otherwise.
+func (o *VmConfig) GetGenericVhostUser() []GenericVhostUserConfig {
+	if o == nil || o.GenericVhostUser == nil {
+		var ret []GenericVhostUserConfig
+		return ret
+	}
+	return *o.GenericVhostUser
+}
+
+// GetGenericVhostUserOk returns a tuple with the GenericVhostUser field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+func (o *VmConfig) GetGenericVhostUserOk() (*[]GenericVhostUserConfig, bool) {
+	if o == nil || o.GenericVhostUser == nil {
+		return nil, false
+	}
+	return o.GenericVhostUser, true
+}
+
+// HasGenericVhostUser returns a boolean if a field has been set.
+func (o *VmConfig) HasGenericVhostUser() bool {
+	if o != nil && o.GenericVhostUser != nil {
+		return true
+	}
+
+	return false
+}
+
+// SetGenericVhostUser gets a reference to the given []GenericVhostUserConfig and assigns it to the GenericVhostUser field.
+func (o *VmConfig) SetGenericVhostUser(v []GenericVhostUserConfig) {
+	o.GenericVhostUser = &v
+}
+
 // GetPmem returns the Pmem field value if set, zero value otherwise.
 func (o *VmConfig) GetPmem() []PmemConfig {
 	if o == nil || o.Pmem == nil {
@@ -345,9 +420,9 @@ func (o *VmConfig) SetPmem(v []PmemConfig) {
 }
 
 // GetSerial returns the Serial field value if set, zero value otherwise.
-func (o *VmConfig) GetSerial() ConsoleConfig {
+func (o *VmConfig) GetSerial() SerialConfig {
 	if o == nil || o.Serial == nil {
-		var ret ConsoleConfig
+		var ret SerialConfig
 		return ret
 	}
 	return *o.Serial
@@ -355,7 +430,7 @@ func (o *VmConfig) GetSerial() ConsoleConfig {
 
 // GetSerialOk returns a tuple with the Serial field value if set, nil otherwise
 // and a boolean to check if the value has been set.
-func (o *VmConfig) GetSerialOk() (*ConsoleConfig, bool) {
+func (o *VmConfig) GetSerialOk() (*SerialConfig, bool) {
 	if o == nil || o.Serial == nil {
 		return nil, false
 	}
@@ -371,8 +446,8 @@ func (o *VmConfig) HasSerial() bool {
 	return false
 }
 
-// SetSerial gets a reference to the given ConsoleConfig and assigns it to the Serial field.
-func (o *VmConfig) SetSerial(v ConsoleConfig) {
+// SetSerial gets a reference to the given SerialConfig and assigns it to the Serial field.
+func (o *VmConfig) SetSerial(v SerialConfig) {
 	o.Serial = &v
 }
 
@@ -408,6 +483,38 @@ func (o *VmConfig) SetConsole(v ConsoleConfig) {
 	o.Console = &v
 }
 
+// GetDebugConsole returns the DebugConsole field value if set, zero value otherwise.
+func (o *VmConfig) GetDebugConsole() DebugConsoleConfig {
+	if o == nil || o.DebugConsole == nil {
+		var ret DebugConsoleConfig
+		return ret
+	}
+	return *o.DebugConsole
+}
+
+// GetDebugConsoleOk returns a tuple with the DebugConsole field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+func (o *VmConfig) GetDebugConsoleOk() (*DebugConsoleConfig, bool) {
+	if o == nil || o.DebugConsole == nil {
+		return nil, false
+	}
+	return o.DebugConsole, true
+}
+
+// HasDebugConsole returns a boolean if a field has been set.
+func (o *VmConfig) HasDebugConsole() bool {
+	if o != nil && o.DebugConsole != nil {
+		return true
+	}
+
+	return false
+}
+
+// SetDebugConsole gets a reference to the given DebugConsoleConfig and assigns it to the DebugConsole field.
+func (o *VmConfig) SetDebugConsole(v DebugConsoleConfig) {
+	o.DebugConsole = &v
+}
+
 // GetDevices returns the Devices field value if set, zero value otherwise.
 func (o *VmConfig) GetDevices() []DeviceConfig {
 	if o == nil || o.Devices == nil {
@@ -438,6 +545,38 @@ func (o *VmConfig) HasDevices() bool {
 // SetDevices gets a reference to the given []DeviceConfig and assigns it to the Devices field.
 func (o *VmConfig) SetDevices(v []DeviceConfig) {
 	o.Devices = &v
+}
+
+// GetUserDevices returns the UserDevices field value if set, zero value otherwise.
+func (o *VmConfig) GetUserDevices() []UserDeviceConfig {
+	if o == nil || o.UserDevices == nil {
+		var ret []UserDeviceConfig
+		return ret
+	}
+	return *o.UserDevices
+}
+
+// GetUserDevicesOk returns a tuple with the UserDevices field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+func (o *VmConfig) GetUserDevicesOk() (*[]UserDeviceConfig, bool) {
+	if o == nil || o.UserDevices == nil {
+		return nil, false
+	}
+	return o.UserDevices, true
+}
+
+// HasUserDevices returns a boolean if a field has been set.
+func (o *VmConfig) HasUserDevices() bool {
+	if o != nil && o.UserDevices != nil {
+		return true
+	}
+
+	return false
+}
+
+// SetUserDevices gets a reference to the given []UserDeviceConfig and assigns it to the UserDevices field.
+func (o *VmConfig) SetUserDevices(v []UserDeviceConfig) {
+	o.UserDevices = &v
 }
 
 // GetVdpa returns the Vdpa field value if set, zero value otherwise.
@@ -504,38 +643,6 @@ func (o *VmConfig) SetVsock(v VsockConfig) {
 	o.Vsock = &v
 }
 
-// GetSgxEpc returns the SgxEpc field value if set, zero value otherwise.
-func (o *VmConfig) GetSgxEpc() []SgxEpcConfig {
-	if o == nil || o.SgxEpc == nil {
-		var ret []SgxEpcConfig
-		return ret
-	}
-	return *o.SgxEpc
-}
-
-// GetSgxEpcOk returns a tuple with the SgxEpc field value if set, nil otherwise
-// and a boolean to check if the value has been set.
-func (o *VmConfig) GetSgxEpcOk() (*[]SgxEpcConfig, bool) {
-	if o == nil || o.SgxEpc == nil {
-		return nil, false
-	}
-	return o.SgxEpc, true
-}
-
-// HasSgxEpc returns a boolean if a field has been set.
-func (o *VmConfig) HasSgxEpc() bool {
-	if o != nil && o.SgxEpc != nil {
-		return true
-	}
-
-	return false
-}
-
-// SetSgxEpc gets a reference to the given []SgxEpcConfig and assigns it to the SgxEpc field.
-func (o *VmConfig) SetSgxEpc(v []SgxEpcConfig) {
-	o.SgxEpc = &v
-}
-
 // GetNuma returns the Numa field value if set, zero value otherwise.
 func (o *VmConfig) GetNuma() []NumaConfig {
 	if o == nil || o.Numa == nil {
@@ -568,38 +675,6 @@ func (o *VmConfig) SetNuma(v []NumaConfig) {
 	o.Numa = &v
 }
 
-// GetIommu returns the Iommu field value if set, zero value otherwise.
-func (o *VmConfig) GetIommu() bool {
-	if o == nil || o.Iommu == nil {
-		var ret bool
-		return ret
-	}
-	return *o.Iommu
-}
-
-// GetIommuOk returns a tuple with the Iommu field value if set, nil otherwise
-// and a boolean to check if the value has been set.
-func (o *VmConfig) GetIommuOk() (*bool, bool) {
-	if o == nil || o.Iommu == nil {
-		return nil, false
-	}
-	return o.Iommu, true
-}
-
-// HasIommu returns a boolean if a field has been set.
-func (o *VmConfig) HasIommu() bool {
-	if o != nil && o.Iommu != nil {
-		return true
-	}
-
-	return false
-}
-
-// SetIommu gets a reference to the given bool and assigns it to the Iommu field.
-func (o *VmConfig) SetIommu(v bool) {
-	o.Iommu = &v
-}
-
 // GetWatchdog returns the Watchdog field value if set, zero value otherwise.
 func (o *VmConfig) GetWatchdog() bool {
 	if o == nil || o.Watchdog == nil {
@@ -630,6 +705,102 @@ func (o *VmConfig) HasWatchdog() bool {
 // SetWatchdog gets a reference to the given bool and assigns it to the Watchdog field.
 func (o *VmConfig) SetWatchdog(v bool) {
 	o.Watchdog = &v
+}
+
+// GetRtc returns the Rtc field value if set, zero value otherwise.
+func (o *VmConfig) GetRtc() RtcConfig {
+	if o == nil || o.Rtc == nil {
+		var ret RtcConfig
+		return ret
+	}
+	return *o.Rtc
+}
+
+// GetRtcOk returns a tuple with the Rtc field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+func (o *VmConfig) GetRtcOk() (*RtcConfig, bool) {
+	if o == nil || o.Rtc == nil {
+		return nil, false
+	}
+	return o.Rtc, true
+}
+
+// HasRtc returns a boolean if a field has been set.
+func (o *VmConfig) HasRtc() bool {
+	if o != nil && o.Rtc != nil {
+		return true
+	}
+
+	return false
+}
+
+// SetRtc gets a reference to the given RtcConfig and assigns it to the Rtc field.
+func (o *VmConfig) SetRtc(v RtcConfig) {
+	o.Rtc = &v
+}
+
+// GetPvpanic returns the Pvpanic field value if set, zero value otherwise.
+func (o *VmConfig) GetPvpanic() bool {
+	if o == nil || o.Pvpanic == nil {
+		var ret bool
+		return ret
+	}
+	return *o.Pvpanic
+}
+
+// GetPvpanicOk returns a tuple with the Pvpanic field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+func (o *VmConfig) GetPvpanicOk() (*bool, bool) {
+	if o == nil || o.Pvpanic == nil {
+		return nil, false
+	}
+	return o.Pvpanic, true
+}
+
+// HasPvpanic returns a boolean if a field has been set.
+func (o *VmConfig) HasPvpanic() bool {
+	if o != nil && o.Pvpanic != nil {
+		return true
+	}
+
+	return false
+}
+
+// SetPvpanic gets a reference to the given bool and assigns it to the Pvpanic field.
+func (o *VmConfig) SetPvpanic(v bool) {
+	o.Pvpanic = &v
+}
+
+// GetPciSegments returns the PciSegments field value if set, zero value otherwise.
+func (o *VmConfig) GetPciSegments() []PciSegmentConfig {
+	if o == nil || o.PciSegments == nil {
+		var ret []PciSegmentConfig
+		return ret
+	}
+	return *o.PciSegments
+}
+
+// GetPciSegmentsOk returns a tuple with the PciSegments field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+func (o *VmConfig) GetPciSegmentsOk() (*[]PciSegmentConfig, bool) {
+	if o == nil || o.PciSegments == nil {
+		return nil, false
+	}
+	return o.PciSegments, true
+}
+
+// HasPciSegments returns a boolean if a field has been set.
+func (o *VmConfig) HasPciSegments() bool {
+	if o != nil && o.PciSegments != nil {
+		return true
+	}
+
+	return false
+}
+
+// SetPciSegments gets a reference to the given []PciSegmentConfig and assigns it to the PciSegments field.
+func (o *VmConfig) SetPciSegments(v []PciSegmentConfig) {
+	o.PciSegments = &v
 }
 
 // GetPlatform returns the Platform field value if set, zero value otherwise.
@@ -696,6 +867,70 @@ func (o *VmConfig) SetTpm(v TpmConfig) {
 	o.Tpm = &v
 }
 
+// GetLandlockEnable returns the LandlockEnable field value if set, zero value otherwise.
+func (o *VmConfig) GetLandlockEnable() bool {
+	if o == nil || o.LandlockEnable == nil {
+		var ret bool
+		return ret
+	}
+	return *o.LandlockEnable
+}
+
+// GetLandlockEnableOk returns a tuple with the LandlockEnable field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+func (o *VmConfig) GetLandlockEnableOk() (*bool, bool) {
+	if o == nil || o.LandlockEnable == nil {
+		return nil, false
+	}
+	return o.LandlockEnable, true
+}
+
+// HasLandlockEnable returns a boolean if a field has been set.
+func (o *VmConfig) HasLandlockEnable() bool {
+	if o != nil && o.LandlockEnable != nil {
+		return true
+	}
+
+	return false
+}
+
+// SetLandlockEnable gets a reference to the given bool and assigns it to the LandlockEnable field.
+func (o *VmConfig) SetLandlockEnable(v bool) {
+	o.LandlockEnable = &v
+}
+
+// GetLandlockRules returns the LandlockRules field value if set, zero value otherwise.
+func (o *VmConfig) GetLandlockRules() []LandlockConfig {
+	if o == nil || o.LandlockRules == nil {
+		var ret []LandlockConfig
+		return ret
+	}
+	return *o.LandlockRules
+}
+
+// GetLandlockRulesOk returns a tuple with the LandlockRules field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+func (o *VmConfig) GetLandlockRulesOk() (*[]LandlockConfig, bool) {
+	if o == nil || o.LandlockRules == nil {
+		return nil, false
+	}
+	return o.LandlockRules, true
+}
+
+// HasLandlockRules returns a boolean if a field has been set.
+func (o *VmConfig) HasLandlockRules() bool {
+	if o != nil && o.LandlockRules != nil {
+		return true
+	}
+
+	return false
+}
+
+// SetLandlockRules gets a reference to the given []LandlockConfig and assigns it to the LandlockRules field.
+func (o *VmConfig) SetLandlockRules(v []LandlockConfig) {
+	o.LandlockRules = &v
+}
+
 func (o VmConfig) MarshalJSON() ([]byte, error) {
 	toSerialize := map[string]interface{}{}
 	if o.Cpus != nil {
@@ -706,6 +941,9 @@ func (o VmConfig) MarshalJSON() ([]byte, error) {
 	}
 	if true {
 		toSerialize["payload"] = o.Payload
+	}
+	if o.RateLimitGroups != nil {
+		toSerialize["rate_limit_groups"] = o.RateLimitGroups
 	}
 	if o.Disks != nil {
 		toSerialize["disks"] = o.Disks
@@ -722,6 +960,9 @@ func (o VmConfig) MarshalJSON() ([]byte, error) {
 	if o.Fs != nil {
 		toSerialize["fs"] = o.Fs
 	}
+	if o.GenericVhostUser != nil {
+		toSerialize["generic_vhost_user"] = o.GenericVhostUser
+	}
 	if o.Pmem != nil {
 		toSerialize["pmem"] = o.Pmem
 	}
@@ -731,8 +972,14 @@ func (o VmConfig) MarshalJSON() ([]byte, error) {
 	if o.Console != nil {
 		toSerialize["console"] = o.Console
 	}
+	if o.DebugConsole != nil {
+		toSerialize["debug_console"] = o.DebugConsole
+	}
 	if o.Devices != nil {
 		toSerialize["devices"] = o.Devices
+	}
+	if o.UserDevices != nil {
+		toSerialize["user_devices"] = o.UserDevices
 	}
 	if o.Vdpa != nil {
 		toSerialize["vdpa"] = o.Vdpa
@@ -740,23 +987,32 @@ func (o VmConfig) MarshalJSON() ([]byte, error) {
 	if o.Vsock != nil {
 		toSerialize["vsock"] = o.Vsock
 	}
-	if o.SgxEpc != nil {
-		toSerialize["sgx_epc"] = o.SgxEpc
-	}
 	if o.Numa != nil {
 		toSerialize["numa"] = o.Numa
 	}
-	if o.Iommu != nil {
-		toSerialize["iommu"] = o.Iommu
-	}
 	if o.Watchdog != nil {
 		toSerialize["watchdog"] = o.Watchdog
+	}
+	if o.Rtc != nil {
+		toSerialize["rtc"] = o.Rtc
+	}
+	if o.Pvpanic != nil {
+		toSerialize["pvpanic"] = o.Pvpanic
+	}
+	if o.PciSegments != nil {
+		toSerialize["pci_segments"] = o.PciSegments
 	}
 	if o.Platform != nil {
 		toSerialize["platform"] = o.Platform
 	}
 	if o.Tpm != nil {
 		toSerialize["tpm"] = o.Tpm
+	}
+	if o.LandlockEnable != nil {
+		toSerialize["landlock_enable"] = o.LandlockEnable
+	}
+	if o.LandlockRules != nil {
+		toSerialize["landlock_rules"] = o.LandlockRules
 	}
 	return json.Marshal(toSerialize)
 }

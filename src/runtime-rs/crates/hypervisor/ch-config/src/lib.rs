@@ -9,14 +9,10 @@ use std::path::PathBuf;
 pub mod ch_api;
 pub mod convert;
 pub mod net_util;
-mod virtio_devices;
 
-use crate::virtio_devices::RateLimiterConfig;
-use kata_sys_util::protection::GuestProtection;
 use kata_types::config::hypervisor::Hypervisor as HypervisorConfig;
+use kata_types::config::hypervisor::RateLimiterConfig;
 pub use net_util::MacAddr;
-
-pub const MAX_NUM_PCI_SEGMENTS: u16 = 16;
 
 mod errors;
 
@@ -42,13 +38,31 @@ impl CmdlineConfig {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub enum IommuType {
+    #[default]
+    Off,
+    Virtio,
+    Smmuv3,
+}
+
+impl From<bool> for IommuType {
+    fn from(enabled: bool) -> Self {
+        if enabled {
+            Self::Virtio
+        } else {
+            Self::Off
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
 pub struct ConsoleConfig {
     //#[serde(default = "default_consoleconfig_file")]
     pub file: Option<PathBuf>,
     pub mode: ConsoleOutputMode,
     #[serde(default)]
-    pub iommu: bool,
+    pub iommu: IommuType,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
@@ -63,19 +77,22 @@ pub enum ConsoleOutputMode {
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
 pub struct CpuAffinity {
-    pub vcpu: u8,
-    pub host_cpus: Vec<u8>,
+    pub vcpu: u32,
+    pub host_cpus: Vec<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
 pub struct CpusConfig {
-    pub boot_vcpus: u8,
-    pub max_vcpus: u8,
+    pub boot_vcpus: u32,
+    pub max_vcpus: u32,
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub topology: Option<CpuTopology>,
     #[serde(default)]
     pub kvm_hyperv: bool,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nested: Option<bool>,
     #[serde(skip_serializing_if = "u8_is_zero")]
     pub max_phys_bits: u8,
     #[serde(default)]
@@ -94,24 +111,35 @@ pub struct CpuFeatures {
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
 pub struct CpuTopology {
-    pub threads_per_core: u8,
-    pub cores_per_die: u8,
-    pub dies_per_package: u8,
-    pub packages: u8,
+    pub threads_per_core: u16,
+    pub cores_per_die: u16,
+    pub dies_per_package: u16,
+    pub packages: u16,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
 pub struct DeviceConfig {
     pub path: PathBuf,
     #[serde(default)]
-    pub iommu: bool,
+    pub iommu: IommuType,
     #[serde(default)]
     pub id: Option<String>,
     #[serde(default)]
     pub pci_segment: u16,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ImageType {
+    FlatVmdk,
+    FixedVhd,
+    Qcow2,
+    Raw,
+    Vhdx,
+    #[default]
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct DiskConfig {
     pub path: Option<PathBuf>,
     #[serde(default)]
@@ -119,7 +147,7 @@ pub struct DiskConfig {
     #[serde(default)]
     pub direct: bool,
     #[serde(default)]
-    pub iommu: bool,
+    pub iommu: IommuType,
     //#[serde(default = "default_diskconfig_num_queues")]
     pub num_queues: usize,
     //#[serde(default = "default_diskconfig_queue_size")]
@@ -131,11 +159,46 @@ pub struct DiskConfig {
     pub rate_limiter_config: Option<RateLimiterConfig>,
     #[serde(default)]
     pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serial: Option<String>,
     // For testing use only. Not exposed in API.
     #[serde(default)]
     pub disable_io_uring: bool,
     #[serde(default)]
     pub pci_segment: u16,
+    #[serde(default)]
+    pub backing_files: bool,
+    #[serde(default = "default_diskconfig_sparse")]
+    pub sparse: bool,
+    #[serde(default)]
+    pub image_type: ImageType,
+}
+
+pub fn default_diskconfig_sparse() -> bool {
+    true
+}
+
+impl Default for DiskConfig {
+    fn default() -> Self {
+        Self {
+            path: None,
+            readonly: false,
+            direct: false,
+            iommu: IommuType::Off,
+            num_queues: 0,
+            queue_size: 0,
+            vhost_user: false,
+            vhost_socket: None,
+            rate_limiter_config: None,
+            id: None,
+            serial: None,
+            disable_io_uring: false,
+            pci_segment: 0,
+            backing_files: false,
+            sparse: default_diskconfig_sparse(),
+            image_type: ImageType::default(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
@@ -218,6 +281,11 @@ pub struct MemoryZoneConfig {
     pub prefault: bool,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ProtectionDevConfig {
+    pub host_data: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct NetConfig {
     //#[serde(default = "default_netconfig_tap")]
@@ -236,7 +304,7 @@ pub struct NetConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mtu: Option<u16>,
     #[serde(default)]
-    pub iommu: bool,
+    pub iommu: IommuType,
     //#[serde(default = "default_netconfig_num_queues")]
     #[serde(skip_serializing_if = "usize_is_zero")]
     pub num_queues: usize,
@@ -267,12 +335,12 @@ impl Default for NetConfig {
     fn default() -> Self {
         NetConfig {
             tap: None,
-            ip: Ipv4Addr::new(0, 0, 0, 0),
-            mask: Ipv4Addr::new(0, 0, 0, 0),
+            ip: Ipv4Addr::new(192, 168, 249, 1),
+            mask: Ipv4Addr::new(255, 255, 255, 0),
             mac: MacAddr::default(),
             host_mac: None,
             mtu: None,
-            iommu: false,
+            iommu: IommuType::Off,
             num_queues: 0,
             queue_size: 0,
             vhost_user: false,
@@ -291,7 +359,7 @@ pub struct NumaConfig {
     #[serde(default)]
     pub guest_numa_id: u32,
     #[serde(default)]
-    pub cpus: Option<Vec<u8>>,
+    pub cpus: Option<Vec<u32>>,
     #[serde(default)]
     pub distances: Option<Vec<NumaDistance>>,
     #[serde(default)]
@@ -319,6 +387,8 @@ pub struct PayloadConfig {
     pub cmdline: Option<String>,
     #[serde(default)]
     pub initramfs: Option<PathBuf>,
+    #[serde(default)]
+    pub host_data: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
@@ -333,8 +403,6 @@ pub struct PlatformConfig {
     pub uuid: Option<String>,
     #[serde(default)]
     pub oem_strings: Option<Vec<String>>,
-    #[serde(default)]
-    pub tdx: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
@@ -343,7 +411,7 @@ pub struct PmemConfig {
     #[serde(default)]
     pub size: Option<u64>,
     #[serde(default)]
-    pub iommu: bool,
+    pub iommu: IommuType,
     #[serde(default)]
     pub discard_writes: bool,
     #[serde(default)]
@@ -356,7 +424,7 @@ pub struct PmemConfig {
 pub struct RngConfig {
     pub src: PathBuf,
     #[serde(default)]
-    pub iommu: bool,
+    pub iommu: IommuType,
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -384,7 +452,7 @@ pub struct VdpaConfig {
     //#[serde(default = "default_vdpaconfig_num_queues")]
     pub num_queues: usize,
     #[serde(default)]
-    pub iommu: bool,
+    pub iommu: IommuType,
     #[serde(default)]
     pub id: Option<String>,
     #[serde(default)]
@@ -446,18 +514,16 @@ pub struct VmConfig {
     pub numa: Option<Vec<NumaConfig>>,
     #[serde(default)]
     pub watchdog: bool,
-    #[cfg(feature = "guest_debug")]
-    pub gdb: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub platform: Option<PlatformConfig>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
 pub struct VsockConfig {
-    pub cid: u64,
+    pub cid: u32,
     pub socket: PathBuf,
     #[serde(default)]
-    pub iommu: bool,
+    pub iommu: IommuType,
     #[serde(default)]
     pub id: Option<String>,
     #[serde(default)]
@@ -493,18 +559,37 @@ pub struct NamedHypervisorConfig {
 
     pub shared_fs_devices: Option<Vec<FsConfig>>,
     pub network_devices: Option<Vec<NetConfig>>,
+    pub host_devices: Option<Vec<DeviceConfig>>,
 
-    // Set to the available guest protection *iff* BOTH of the following
-    // conditions are true:
-    //
-    // - The hardware supports guest protection.
-    // - The user has requested that guest protection be used.
-    pub guest_protection_to_use: GuestProtection,
+    pub boot_disks: Option<Vec<DiskConfig>>,
+
+    pub protection_device: Option<ProtectionDevConfig>,
 }
 
-// Returns true if the enabled guest protection is Intel TDX.
-pub fn guest_protection_is_tdx(guest_protection_to_use: GuestProtection) -> bool {
-    matches!(guest_protection_to_use, GuestProtection::Tdx)
+#[derive(Clone, Debug, Deserialize, Serialize, Default)]
+pub struct VmResize {
+    pub desired_vcpus: Option<u32>,
+    pub desired_ram: Option<u64>,
+    pub desired_balloon: Option<u64>,
+}
+
+/// VmInfo : Virtual Machine information
+#[derive(Clone, Default, Debug, Serialize, Deserialize)]
+pub struct VmInfo {
+    pub config: VmConfig,
+    pub state: State,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_actual_size: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum State {
+    #[default]
+    Created,
+    Running,
+    Shutdown,
+    Paused,
 }
 
 #[cfg(test)]
@@ -512,56 +597,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_guest_protection_is_tdx() {
-        #[derive(Debug)]
-        struct TestData {
-            protection: GuestProtection,
-            result: bool,
+    fn test_device_iommu_api_values() {
+        for (enabled, expected) in [(false, "Off"), (true, "Virtio")] {
+            let disk = DiskConfig {
+                iommu: enabled.into(),
+                ..Default::default()
+            };
+            let json = serde_json::to_value(&disk).unwrap();
+            assert_eq!(json["iommu"], expected);
+            assert_eq!(serde_json::from_value::<DiskConfig>(json).unwrap(), disk);
         }
+        assert_eq!(
+            serde_json::from_str::<IommuType>("\"Smmuv3\"").unwrap(),
+            IommuType::Smmuv3
+        );
+    }
 
-        let tests = &[
-            TestData {
-                protection: GuestProtection::NoProtection,
-                result: false,
-            },
-            TestData {
-                protection: GuestProtection::Pef,
-                result: false,
-            },
-            TestData {
-                protection: GuestProtection::Se,
-                result: false,
-            },
-            TestData {
-                protection: GuestProtection::Sev,
-                result: false,
-            },
-            TestData {
-                protection: GuestProtection::Snp,
-                result: false,
-            },
-            TestData {
-                protection: GuestProtection::Tdx,
-                result: true,
-            },
-        ];
+    #[test]
+    fn test_vm_resize_serialization_preserves_cpu_count() {
+        for vcpus in [256, 512] {
+            let resize = VmResize {
+                desired_vcpus: Some(vcpus),
+                ..Default::default()
+            };
 
-        for (i, d) in tests.iter().enumerate() {
-            let msg = format!("test[{}]: {:?}", i, d);
-
-            let result = guest_protection_is_tdx(d.protection.clone());
-
-            let msg = format!("{}: actual result: {:?}", msg, result);
-
-            if std::env::var("DEBUG").is_ok() {
-                eprintln!("DEBUG: {}", msg);
-            }
-
-            if d.result {
-                assert!(result, "{}", msg);
-            } else {
-                assert!(!result, "{}", msg);
-            }
+            assert_eq!(
+                serde_json::to_value(resize).unwrap(),
+                serde_json::json!({
+                    "desired_vcpus": vcpus,
+                    "desired_ram": null,
+                    "desired_balloon": null,
+                })
+            );
         }
     }
 }

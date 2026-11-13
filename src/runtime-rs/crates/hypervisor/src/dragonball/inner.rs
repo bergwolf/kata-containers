@@ -6,30 +6,45 @@
 
 use super::vmm_instance::VmmInstance;
 use crate::{
-    device::DeviceType, hypervisor_persist::HypervisorState, kernel_param::KernelParams, VmmState,
-    DEV_HUGEPAGES, HUGETLBFS, HUGE_SHMEM, HYPERVISOR_DRAGONBALL, SHMEM,
+    device::DeviceType, firecracker::sl, hypervisor_persist::HypervisorState,
+    kernel_param::KernelParams, MemoryConfig, VmmState, DEV_HUGEPAGES, HUGETLBFS, HUGE_SHMEM,
+    HYPERVISOR_DRAGONBALL, SHMEM,
 };
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use dragonball::{
     api::v1::{BootSourceConfig, VcpuResizeInfo},
+    device_manager::{
+        balloon_dev_mgr::BalloonDeviceConfigInfo, mem_dev_mgr::MemDeviceConfigInfo,
+        rng_dev_mgr::RngDeviceConfigInfo,
+    },
     vm::VmConfigInfo,
 };
 
+use crate::DEFAULT_HOTPLUG_TIMEOUT;
 use kata_sys_util::mount;
 use kata_types::{
     capabilities::{Capabilities, CapabilityBits},
     config::{
         hypervisor::{HugePageType, Hypervisor as HypervisorConfig},
-        KATA_PATH,
+        KATA_PATH, PASSFD_LISTENER_PORT,
     },
 };
 use nix::mount::MsFlags;
 use persist::sandbox_persist::Persist;
+use std::{cmp::Ordering, time::Duration};
 use std::{collections::HashSet, fs::create_dir_all};
+use tokio::sync::mpsc;
 
 const DRAGONBALL_KERNEL: &str = "vmlinux";
+const DRAGONBALL_INITRD: &str = "initrd";
 const DRAGONBALL_ROOT_FS: &str = "rootfs";
+const BALLOON_DEVICE_ID: &str = "balloon0";
+const MEM_DEVICE_ID: &str = "memmr0";
+
+fn should_insert_host_rng(entropy_source: &str, confidential_guest: bool) -> bool {
+    !entropy_source.is_empty() && !confidential_guest
+}
 
 #[derive(Debug)]
 pub struct DragonballInner {
@@ -68,15 +83,31 @@ pub struct DragonballInner {
 
     /// dragonball capabilities
     pub(crate) capabilities: Capabilities,
+
+    /// the size of memory block of guest OS
+    pub(crate) guest_memory_block_size_mb: u32,
+
+    /// the hotplug memory size
+    pub(crate) mem_hotplug_size_mb: u32,
+
+    /// the balloon size
+    pub(crate) balloon_size: u32,
+
+    /// guest-side fd passthrough io listener port, used to initialize
+    /// connections for io
+    pub(crate) passfd_listener_port: Option<u32>,
 }
 
 impl DragonballInner {
-    pub fn new() -> DragonballInner {
+    pub fn new(exit_notify: mpsc::Sender<i32>) -> DragonballInner {
         let mut capabilities = Capabilities::new();
         capabilities.set(
             CapabilityBits::BlockDeviceSupport
                 | CapabilityBits::BlockDeviceHotplugSupport
-                | CapabilityBits::FsSharingSupport,
+                | CapabilityBits::BlockDeviceDiscardSupport
+                | CapabilityBits::FsSharingSupport
+                | CapabilityBits::HybridVsockSupport
+                | CapabilityBits::GuestMemoryProbe,
         );
         DragonballInner {
             id: "".to_string(),
@@ -87,10 +118,28 @@ impl DragonballInner {
             pending_devices: vec![],
             state: VmmState::NotReady,
             jailed: false,
-            vmm_instance: VmmInstance::new(""),
+            vmm_instance: VmmInstance::new("", exit_notify),
             run_dir: "".to_string(),
             cached_block_devices: Default::default(),
             capabilities,
+            guest_memory_block_size_mb: 0,
+            mem_hotplug_size_mb: 0,
+            balloon_size: 0,
+            passfd_listener_port: None,
+        }
+    }
+
+    pub(crate) async fn try_insert_balloon_f_reporting(&mut self) {
+        let balloon_config = BalloonDeviceConfigInfo {
+            balloon_id: BALLOON_DEVICE_ID.to_owned(),
+            size_mib: 0,
+            use_shared_irq: None,
+            use_generic_irq: None,
+            f_deflate_on_oom: false,
+            f_reporting: true,
+        };
+        if let Err(e) = self.vmm_instance.insert_balloon_device(balloon_config) {
+            error!(sl(), "failed to insert f_reporting balloon device: {:?}", e);
         }
     }
 
@@ -98,30 +147,36 @@ impl DragonballInner {
         info!(sl!(), "start sandbox cold");
 
         self.set_vm_base_config().context("set vm base config")?;
+        self.configure_boot_source()?;
 
-        // get rootfs driver
-        let rootfs_driver = self.config.blockdev_info.block_device_driver.clone();
-
-        // get kernel params
-        let mut kernel_params = KernelParams::new(self.config.debug_info.enable_debug);
-        kernel_params.append(&mut KernelParams::new_rootfs_kernel_params(
-            &rootfs_driver,
-            &self.config.boot_info.rootfs_type,
-        )?);
-        kernel_params.append(&mut KernelParams::from_string(
-            &self.config.boot_info.kernel_params,
-        ));
-        info!(sl!(), "prepared kernel_params={:?}", kernel_params);
-
-        // set boot source
-        let kernel_path = self.config.boot_info.kernel.clone();
-        self.set_boot_source(
-            &kernel_path,
-            &kernel_params
-                .to_string()
-                .context("kernel params to string")?,
-        )
-        .context("set_boot_source")?;
+        // insert the virtio-rng device before boot: it is cold-plug only
+        let entropy_source = &self.config.machine_info.entropy_source;
+        let confidential_guest = self.config.security_info.confidential_guest;
+        if should_insert_host_rng(entropy_source, confidential_guest) {
+            // The VMM opens the entropy source while creating the devices and
+            // reports a failure there as a fatal boot error. Probe it first so
+            // that a source which is configured but not readable at runtime
+            // only costs the VM its virtio-rng device instead of preventing
+            // every container on the host from starting.
+            match std::fs::File::open(entropy_source) {
+                Ok(_) => {
+                    let rng_config = RngDeviceConfigInfo {
+                        src: entropy_source.clone(),
+                        use_shared_irq: None,
+                        use_generic_irq: None,
+                    };
+                    self.vmm_instance
+                        .insert_rng_device(rng_config)
+                        .context("insert rng device")?;
+                }
+                Err(e) => warn!(
+                    sl!(),
+                    "skip virtio-rng, entropy source {} is not readable: {}", entropy_source, e
+                ),
+            }
+        } else if confidential_guest && !entropy_source.is_empty() {
+            warn!(sl!(), "skip host-backed virtio-rng for confidential guest");
+        }
 
         // add pending devices
         while let Some(dev) = self.pending_devices.pop() {
@@ -133,6 +188,51 @@ impl DragonballInner {
         self.wait_vmm_ready(timeout).context("wait vmm")?;
 
         Ok(())
+    }
+
+    fn configure_boot_source(&mut self) -> Result<()> {
+        if self.config.vm_template.boot_from_template {
+            return Ok(());
+        }
+
+        let kernel_params = self.get_kernel_params()?;
+        self.set_boot_source(&kernel_params)
+            .context("set_boot_source")
+    }
+
+    fn get_kernel_params(&self) -> Result<String> {
+        let mut kernel_params = KernelParams::new(self.config.debug_info.enable_debug);
+
+        if self.config.boot_info.initrd.is_empty() {
+            // When booting from the image, add rootfs and verity parameters here.
+            let mut rootfs_params = KernelParams::new_image_rootfs_kernel_params(
+                &self.config.boot_info.image,
+                &self.config.boot_info.kernel_verity_params,
+                &self.config.boot_info.vm_rootfs_driver,
+                &self.config.boot_info.rootfs_type,
+                true,
+            )?;
+            kernel_params.append(&mut rootfs_params);
+        }
+
+        kernel_params.append(&mut KernelParams::from_string(
+            &self.config.boot_info.kernel_params,
+        ));
+        // A bare key still activates extensions that do not use dm-verity.
+        for extra in &self.config.guest_extension_images {
+            kernel_params.append(&mut KernelParams::from_string(&format!(
+                "kata.extension.{}.verity_params={}",
+                extra.name, extra.verity_params
+            )));
+        }
+        if let Some(passfd_listener_port) = self.passfd_listener_port {
+            kernel_params.append(&mut KernelParams::from_string(&format!(
+                "{PASSFD_LISTENER_PORT}={passfd_listener_port}"
+            )));
+        }
+        info!(sl!(), "prepared kernel_params={:?}", kernel_params);
+
+        kernel_params.to_string().context("kernel params to string")
     }
 
     pub(crate) fn run_vmm_server(&mut self) -> Result<()> {
@@ -158,21 +258,21 @@ impl DragonballInner {
         Ok(())
     }
 
-    pub(crate) fn cleanup_resource(&self) {
+    pub(crate) fn cleanup_resource(&self) -> Result<()> {
         if self.jailed {
-            self.umount_jail_resource(DRAGONBALL_KERNEL).ok();
-            self.umount_jail_resource(DRAGONBALL_ROOT_FS).ok();
+            // A failed unjail must fail the step too: the directory removal
+            // below must never walk over something still mounted.
+            self.umount_jail_resource(DRAGONBALL_KERNEL)?;
+            self.umount_jail_resource(DRAGONBALL_ROOT_FS)?;
             for id in &self.cached_block_devices {
-                self.umount_jail_resource(id.as_str()).ok();
+                self.umount_jail_resource(id.as_str())?;
             }
         }
 
-        std::fs::remove_dir_all(&self.vm_path)
-            .map_err(|err| {
-                error!(sl!(), "failed to remove dir all for {}", &self.vm_path);
-                err
-            })
-            .ok();
+        // A removal that failed must fail the step: the state is only kept
+        // for a retry while the cleanup reports what it could not do.
+        crate::utils::remove_vm_dir(&self.id, &self.vm_path)
+            .with_context(|| format!("remove the VM directory {}", self.vm_path))
     }
 
     fn set_vm_base_config(&mut self) -> Result<()> {
@@ -188,10 +288,11 @@ impl DragonballInner {
         let vm_config = VmConfigInfo {
             serial_path: Some(serial_path),
             mem_size_mib: self.config.memory_info.default_memory as usize,
-            vcpu_count: self.config.cpu_info.default_vcpus as u8,
+            vcpu_count: self.config.cpu_info.default_vcpus.ceil() as u8,
             max_vcpu_count: self.config.cpu_info.default_maxvcpus as u8,
             mem_type,
             mem_file_path,
+            pci_hotplug_enabled: true,
             ..Default::default()
         };
         info!(sl!(), "vm config: {:?}", vm_config);
@@ -203,8 +304,12 @@ impl DragonballInner {
 
     pub(crate) fn umount_jail_resource(&self, jailed_path: &str) -> Result<()> {
         let path = [self.jailer_root.as_str(), jailed_path].join("/");
-        nix::mount::umount2(path.as_str(), nix::mount::MntFlags::MNT_DETACH)
-            .with_context(|| format!("umount path {}", &path))
+        // Lazy, and tolerant of a resource that is not mounted any more: a
+        // retried cleanup meets its own earlier work.
+        match nix::mount::umount2(path.as_str(), nix::mount::MntFlags::MNT_DETACH) {
+            Ok(()) | Err(nix::errno::Errno::EINVAL | nix::errno::Errno::ENOENT) => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("umount path {}", path)),
+        }
     }
 
     pub(crate) fn get_resource(&self, src: &str, dst: &str) -> Result<String> {
@@ -230,16 +335,33 @@ impl DragonballInner {
         Ok(abs_path)
     }
 
-    fn set_boot_source(&mut self, kernel_path: &str, kernel_params: &str) -> Result<()> {
+    fn set_boot_source(&mut self, kernel_params: &str) -> Result<()> {
+        // set boot source
+        let kernel_path = self.config.boot_info.kernel.as_str();
+        let initrd_path = self.config.boot_info.initrd.as_str();
+
         info!(
             sl!(),
-            "kernel path {} kernel params {}", kernel_path, kernel_params
+            "kernel path {}, initrd path {}, kernel params {}",
+            kernel_path,
+            initrd_path,
+            kernel_params
         );
+
+        let mut initrd = None;
+
+        if !initrd_path.is_empty() {
+            initrd = Some(
+                self.get_resource(initrd_path, DRAGONBALL_INITRD)
+                    .context("get initrd resource")?,
+            );
+        }
 
         let mut boot_cfg = BootSourceConfig {
             kernel_path: self
                 .get_resource(kernel_path, DRAGONBALL_KERNEL)
-                .context("get resource")?,
+                .context("get kernel resource")?,
+            initrd_path: initrd,
             ..Default::default()
         };
 
@@ -254,9 +376,46 @@ impl DragonballInner {
 
     fn start_vmm_instance(&mut self) -> Result<()> {
         info!(sl!(), "Starting VM");
-        self.vmm_instance
-            .instance_start()
-            .context("Failed to start vmm")?;
+        // Boot from a VM template snapshot instead of cold booting when
+        // configured (mirrors the QEMU boot_from_template flow).
+        #[cfg(target_arch = "x86_64")]
+        if self.config.vm_template.boot_from_template {
+            let template = &self.config.vm_template;
+            if template.device_state_path.is_empty() || template.memory_path.is_empty() {
+                return Err(anyhow!(
+                    "vm_template memory_path/device_state_path are not configured"
+                ));
+            }
+            info!(
+                sl!(),
+                "Starting VM from template snapshot";
+                "device_state_path" => &template.device_state_path,
+                "memory_path" => &template.memory_path,
+            );
+            self.vmm_instance
+                .instance_start_from_snapshot(
+                    template.device_state_path.clone(),
+                    template.memory_path.clone(),
+                )
+                .context("Failed to start vmm from template snapshot")?;
+            self.state = VmmState::VmRunning;
+            return Ok(());
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        if self.config.vm_template.boot_from_template {
+            return Err(anyhow!(
+                "boot_from_template is not supported on this architecture"
+            ));
+        }
+        if self.config.vm_template.boot_to_be_template {
+            self.vmm_instance
+                .instance_start_for_template()
+                .context("Failed to start template vmm")?;
+        } else {
+            self.vmm_instance
+                .instance_start()
+                .context("Failed to start vmm")?;
+        }
         self.state = VmmState::VmRunning;
         Ok(())
     }
@@ -330,12 +489,98 @@ impl DragonballInner {
             vcpu_count: Some(new_vcpus as u8),
         };
         self.vmm_instance
-            .resize_vcpu(&cpu_resize_info)
+            .resize_vcpu(
+                &cpu_resize_info,
+                Some(Duration::from_millis(DEFAULT_HOTPLUG_TIMEOUT)),
+            )
             .context(format!(
-                "failed to do_resize_vcpus on new_vcpus={:?}",
-                new_vcpus
+                "failed to do_resize_vcpus on new_vcpus={new_vcpus:?}"
             ))?;
         Ok((old_vcpus, new_vcpus))
+    }
+
+    pub(crate) fn resize_memory(&mut self, new_mem_mb: u32) -> Result<(u32, MemoryConfig)> {
+        // check the invalid request memory
+        if new_mem_mb > self.hypervisor_config().memory_info.default_maxmemory {
+            warn!(
+                sl!(),
+                "memory size unchanged, the request memory size {} is greater than the max memory size {}",
+                new_mem_mb, self.hypervisor_config().memory_info.default_maxmemory
+            );
+
+            return Ok((
+                0,
+                MemoryConfig {
+                    ..Default::default()
+                },
+            ));
+        }
+
+        let had_mem_mb = self.config.memory_info.default_memory + self.mem_hotplug_size_mb;
+        match new_mem_mb.cmp(&had_mem_mb) {
+            Ordering::Greater => {
+                // clean virtio-ballon device before hotplug memory, resize to 0
+                if self.balloon_size > 0 {
+                    let balloon_config = BalloonDeviceConfigInfo {
+                        balloon_id: BALLOON_DEVICE_ID.to_owned(),
+                        size_mib: 0,
+                        use_shared_irq: None,
+                        use_generic_irq: None,
+                        f_deflate_on_oom: false,
+                        f_reporting: self.config.device_info.reclaim_guest_freed_memory,
+                    };
+                    self.vmm_instance
+                        .insert_balloon_device(balloon_config)
+                        .context("failed to insert balloon device")?;
+                }
+
+                // update the hotplug size
+                self.mem_hotplug_size_mb = new_mem_mb - self.config.memory_info.default_memory;
+                self.balloon_size = 0;
+
+                let add_mem_mb = new_mem_mb - had_mem_mb;
+                self.vmm_instance.insert_mem_device(MemDeviceConfigInfo {
+                    mem_id: MEM_DEVICE_ID.to_owned(),
+                    size_mib: add_mem_mb as u64,
+                    capacity_mib: self.hypervisor_config().memory_info.default_maxmemory as u64,
+                    multi_region: true,
+                    host_numa_node_id: None,
+                    guest_numa_node_id: None,
+                    use_shared_irq: None,
+                    use_generic_irq: None,
+                })?;
+            }
+            Ordering::Less => {
+                // we only use one balloon device here, and resize it to release memory
+                // the operation we do here is inserting a new BALLOON_DEVICE_ID device or resizing it
+                let balloon_config = BalloonDeviceConfigInfo {
+                    balloon_id: BALLOON_DEVICE_ID.to_owned(),
+                    size_mib: (had_mem_mb - new_mem_mb) as u64,
+                    use_shared_irq: None,
+                    use_generic_irq: None,
+                    f_deflate_on_oom: false,
+                    f_reporting: self.config.device_info.reclaim_guest_freed_memory,
+                };
+                self.balloon_size = had_mem_mb - new_mem_mb;
+                self.vmm_instance
+                    .insert_balloon_device(balloon_config)
+                    .context("failed to insert balloon device")?;
+            }
+            Ordering::Equal => {
+                // Everything is already set up
+                info!(
+                    sl!(),
+                    "memory size unchanged, no need to do memory resizing"
+                );
+            }
+        };
+
+        Ok((
+            new_mem_mb,
+            MemoryConfig {
+                ..Default::default()
+            },
+        ))
     }
 
     pub fn set_hypervisor_config(&mut self, config: HypervisorConfig) {
@@ -345,12 +590,28 @@ impl DragonballInner {
     pub fn hypervisor_config(&self) -> HypervisorConfig {
         self.config.clone()
     }
+
+    pub(crate) fn set_capabilities(&mut self, flag: CapabilityBits) {
+        self.capabilities.add(flag);
+    }
+
+    pub(crate) fn set_guest_memory_block_size(&mut self, size: u32) {
+        self.guest_memory_block_size_mb = size;
+    }
+
+    pub(crate) fn guest_memory_block_size_mb(&self) -> u32 {
+        self.guest_memory_block_size_mb
+    }
+
+    pub fn set_passfd_listener_port(&mut self, port: u32) {
+        self.passfd_listener_port = Some(port);
+    }
 }
 
 #[async_trait]
 impl Persist for DragonballInner {
     type State = HypervisorState;
-    type ConstructorArgs = ();
+    type ConstructorArgs = mpsc::Sender<i32>;
 
     /// Save a state of hypervisor
     async fn save(&self) -> Result<Self::State> {
@@ -360,17 +621,14 @@ impl Persist for DragonballInner {
             vm_path: self.vm_path.clone(),
             jailed: self.jailed,
             jailer_root: self.jailer_root.clone(),
-            netns: self.netns.clone(),
             config: self.hypervisor_config(),
-            run_dir: self.run_dir.clone(),
             cached_block_devices: self.cached_block_devices.clone(),
-            ..Default::default()
         })
     }
 
     /// Restore hypervisor
     async fn restore(
-        _hypervisor_args: Self::ConstructorArgs,
+        hypervisor_args: Self::ConstructorArgs,
         hypervisor_state: Self::State,
     ) -> Result<Self> {
         Ok(DragonballInner {
@@ -378,14 +636,127 @@ impl Persist for DragonballInner {
             vm_path: hypervisor_state.vm_path,
             jailed: hypervisor_state.jailed,
             jailer_root: hypervisor_state.jailer_root,
-            netns: hypervisor_state.netns,
+            netns: None,
             config: hypervisor_state.config,
             state: VmmState::NotReady,
-            vmm_instance: VmmInstance::new(""),
-            run_dir: hypervisor_state.run_dir,
+            vmm_instance: VmmInstance::new("", hypervisor_args),
+            run_dir: String::new(),
             pending_devices: vec![],
             cached_block_devices: hypervisor_state.cached_block_devices,
             capabilities: Capabilities::new(),
+            guest_memory_block_size_mb: 0,
+            mem_hotplug_size_mb: 0,
+            balloon_size: 0,
+            passfd_listener_port: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rootfs_partition_identity() {
+        let image = crate::kernel_param::tests::rootfs_image();
+        let (tx, _) = mpsc::channel(1);
+        let mut inner = DragonballInner::new(tx);
+        inner.config.boot_info.image = image.path().to_str().unwrap().into();
+        inner.config.boot_info.rootfs_type = "ext4".into();
+        // Match the VM rootfs driver even when container disks use a different
+        // transport. Both Dragonball rootfs transports need stable identities.
+        inner.config.blockdev_info.block_device_driver = "virtio-scsi".into();
+        for driver in [crate::VM_ROOTFS_DRIVER_BLK, crate::VM_ROOTFS_DRIVER_MMIO] {
+            inner.config.boot_info.vm_rootfs_driver = driver.into();
+            for verity in [
+                "",
+                "root_hash=abc,salt=def,data_blocks=1,data_block_size=4096,hash_block_size=4096",
+            ] {
+                inner.config.boot_info.kernel_verity_params = verity.into();
+                let params = inner.get_kernel_params().unwrap();
+                assert!(!params.contains("/dev/vda"));
+                if verity.is_empty() {
+                    assert!(params.contains("root=PARTUUID=603f58ab-01"));
+                    assert!(params.split_whitespace().any(|param| param == "rootwait"));
+                } else {
+                    assert!(params.contains("root=/dev/dm-0"));
+                    assert!(params.contains("verity 1 PARTUUID=603f58ab-01 PARTUUID=603f58ab-02 "));
+                    assert!(
+                        params.contains("dm-mod.waitfor=PARTUUID=603f58ab-01,PARTUUID=603f58ab-02")
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_initrd_skips_rootfs_partition_identity() {
+        let (tx, _) = mpsc::channel(1);
+        let mut inner = DragonballInner::new(tx);
+        inner.config.boot_info.initrd = "/initrd.img".into();
+        inner.config.boot_info.image = "/image-must-not-be-opened".into();
+        let params = inner.get_kernel_params().unwrap();
+        assert!(!params.contains("root="));
+        assert!(!params.contains("PARTUUID"));
+        assert!(!params.contains("dm-mod."));
+    }
+
+    #[test]
+    fn test_guest_extension_kernel_params() {
+        use kata_types::config::hypervisor::GuestExtensionImage;
+
+        let (tx, _) = mpsc::channel(1);
+        let mut inner = DragonballInner::new(tx);
+        inner.config.boot_info.initrd = "/initrd.img".into();
+        inner.config.guest_extension_images = vec![
+            GuestExtensionImage {
+                name: "coco".into(),
+                path: "/coco.img".into(),
+                verity_params: "root_hash=abc,salt=def,data_blocks=1234".into(),
+            },
+            GuestExtensionImage {
+                name: "devkit".into(),
+                path: "/devkit.img".into(),
+                verity_params: String::new(),
+            },
+        ];
+        inner.passfd_listener_port = Some(1234);
+
+        // Exercise both initrd and image boot paths without starting a VMM.
+        for initrd in ["/initrd.img", ""] {
+            inner.config.boot_info.initrd = initrd.into();
+            inner.config.boot_info.rootfs_type = "erofs".into();
+            inner.config.boot_info.vm_rootfs_driver = crate::VM_ROOTFS_DRIVER_BLK.into();
+            let params = inner.get_kernel_params().unwrap();
+            let tokens: Vec<&str> = params.split_whitespace().collect();
+            assert!(tokens.contains(
+                &"kata.extension.coco.verity_params=root_hash=abc,salt=def,data_blocks=1234"
+            ));
+            assert!(tokens.contains(&"kata.extension.devkit.verity_params"));
+            assert!(tokens.contains(&format!("{PASSFD_LISTENER_PORT}=1234").as_str()));
+        }
+
+        inner.config.guest_extension_images.clear();
+        assert!(!inner
+            .get_kernel_params()
+            .unwrap()
+            .contains("kata.extension."));
+    }
+
+    #[test]
+    fn test_template_restore_skips_boot_source_configuration() {
+        let (tx, _) = mpsc::channel(1);
+        let mut inner = DragonballInner::new(tx);
+        inner.config.vm_template.boot_from_template = true;
+        inner.config.boot_info.kernel = "/kernel-must-not-be-opened".to_string();
+
+        inner.configure_boot_source().unwrap();
+    }
+
+    #[test]
+    fn test_should_insert_host_rng() {
+        assert!(should_insert_host_rng("/dev/urandom", false));
+        assert!(!should_insert_host_rng("", false));
+        assert!(!should_insert_host_rng("/dev/urandom", true));
     }
 }

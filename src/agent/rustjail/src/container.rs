@@ -5,16 +5,21 @@
 
 use anyhow::{anyhow, Context, Result};
 use libc::pid_t;
-use oci::{ContainerState, LinuxDevice, LinuxIdMapping};
-use oci::{Linux, LinuxNamespace, LinuxResources, Spec};
+use oci::{Linux, LinuxDevice, LinuxIdMapping, LinuxNamespace, LinuxResources, Spec};
+use oci_spec::runtime as oci;
+use runtime_spec as spec;
+use serde::{Deserialize, Serialize};
+use spec::{ContainerState, State as OCIState};
 use std::clone::Clone;
 use std::ffi::CString;
 use std::fmt::Display;
 use std::fs;
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{AsFd, BorrowedFd, IntoRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
+use tokio::fs::File;
 
+use crate::cgroups_rs as cgroups;
 use cgroups::freezer::FreezerState;
 
 use crate::capabilities;
@@ -23,11 +28,10 @@ use crate::cgroups::fs::Manager as FsManager;
 #[cfg(test)]
 use crate::cgroups::mock::Manager as FsManager;
 use crate::cgroups::systemd::manager::Manager as SystemdManager;
-use crate::cgroups::Manager;
-#[cfg(feature = "standard-oci-runtime")]
-use crate::console;
+use crate::cgroups::{DevicesCgroupInfo, Manager};
 use crate::log_child;
 use crate::process::Process;
+use crate::process::ProcessOperations;
 #[cfg(feature = "seccomp")]
 use crate::seccomp;
 use crate::selinux;
@@ -50,12 +54,11 @@ use std::os::unix::io::AsRawFd;
 
 use protobuf::MessageField;
 
-use oci::State as OCIState;
 use regex::Regex;
 use std::collections::HashMap;
 use std::os::unix::io::FromRawFd;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use slog::{info, o, Logger};
 
@@ -81,7 +84,6 @@ const FIFO_FD: &str = "FIFO_FD";
 const HOME_ENV_KEY: &str = "HOME";
 const PIDNS_FD: &str = "PIDNS_FD";
 const PIDNS_ENABLED: &str = "PIDNS_ENABLED";
-const CONSOLE_SOCKET_FD: &str = "CONSOLE_SOCKET_FD";
 
 #[derive(Debug)]
 pub struct ContainerStatus {
@@ -129,82 +131,88 @@ lazy_static! {
         m.insert("user", CloneFlags::CLONE_NEWUSER);
         m.insert("ipc", CloneFlags::CLONE_NEWIPC);
         m.insert("pid", CloneFlags::CLONE_NEWPID);
-        m.insert("network", CloneFlags::CLONE_NEWNET);
-        m.insert("mount", CloneFlags::CLONE_NEWNS);
+        m.insert("net", CloneFlags::CLONE_NEWNET);
+        m.insert("mnt", CloneFlags::CLONE_NEWNS);
         m.insert("uts", CloneFlags::CLONE_NEWUTS);
         m.insert("cgroup", CloneFlags::CLONE_NEWCGROUP);
         m
     };
 
-// type to name hashmap, better to be in NAMESPACES
-    pub static ref TYPETONAME: HashMap<&'static str, &'static str> = {
+    // type to name hashmap, better to be in NAMESPACES
+    pub static ref TYPETONAME: HashMap<oci::LinuxNamespaceType, &'static str> = {
         let mut m = HashMap::new();
-        m.insert("ipc", "ipc");
-        m.insert("user", "user");
-        m.insert("pid", "pid");
-        m.insert("network", "net");
-        m.insert("mount", "mnt");
-        m.insert("cgroup", "cgroup");
-        m.insert("uts", "uts");
+        m.insert(oci::LinuxNamespaceType::Ipc, "ipc");
+        m.insert(oci::LinuxNamespaceType::User, "user");
+        m.insert(oci::LinuxNamespaceType::Pid, "pid");
+        m.insert(oci::LinuxNamespaceType::Network, "net");
+        m.insert(oci::LinuxNamespaceType::Mount, "mnt");
+        m.insert(oci::LinuxNamespaceType::Cgroup, "cgroup");
+        m.insert(oci::LinuxNamespaceType::Uts, "uts");
         m
     };
 
     pub static ref DEFAULT_DEVICES: Vec<LinuxDevice> = {
         vec![
-            LinuxDevice {
-                path: "/dev/null".to_string(),
-                r#type: "c".to_string(),
-                major: 1,
-                minor: 3,
-                file_mode: Some(0o666),
-                uid: Some(0xffffffff),
-                gid: Some(0xffffffff),
-            },
-            LinuxDevice {
-                path: "/dev/zero".to_string(),
-                r#type: "c".to_string(),
-                major: 1,
-                minor: 5,
-                file_mode: Some(0o666),
-                uid: Some(0xffffffff),
-                gid: Some(0xffffffff),
-            },
-            LinuxDevice {
-                path: "/dev/full".to_string(),
-                r#type: "c".to_string(),
-                major: 1,
-                minor: 7,
-                file_mode: Some(0o666),
-                uid: Some(0xffffffff),
-                gid: Some(0xffffffff),
-            },
-            LinuxDevice {
-                path: "/dev/tty".to_string(),
-                r#type: "c".to_string(),
-                major: 5,
-                minor: 0,
-                file_mode: Some(0o666),
-                uid: Some(0xffffffff),
-                gid: Some(0xffffffff),
-            },
-            LinuxDevice {
-                path: "/dev/urandom".to_string(),
-                r#type: "c".to_string(),
-                major: 1,
-                minor: 9,
-                file_mode: Some(0o666),
-                uid: Some(0xffffffff),
-                gid: Some(0xffffffff),
-            },
-            LinuxDevice {
-                path: "/dev/random".to_string(),
-                r#type: "c".to_string(),
-                major: 1,
-                minor: 8,
-                file_mode: Some(0o666),
-                uid: Some(0xffffffff),
-                gid: Some(0xffffffff),
-            },
+            oci::LinuxDeviceBuilder::default()
+                .path(PathBuf::from("/dev/null"))
+                .typ(oci::LinuxDeviceType::C)
+                .major(1)
+                .minor(3)
+                .file_mode(0o666_u32)
+                .uid(0xffffffff_u32)
+                .gid(0xffffffff_u32)
+                .build()
+                .unwrap(),
+            oci::LinuxDeviceBuilder::default()
+                .path(PathBuf::from("/dev/zero"))
+                .typ(oci::LinuxDeviceType::C)
+                .major(1)
+                .minor(5)
+                .file_mode(0o666_u32)
+                .uid(0xffffffff_u32)
+                .gid(0xffffffff_u32)
+                .build()
+                .unwrap(),
+            oci::LinuxDeviceBuilder::default()
+                .path(PathBuf::from("/dev/full"))
+                .typ(oci::LinuxDeviceType::C)
+                .major(1)
+                .minor(7)
+                .file_mode(0o666_u32)
+                .uid(0xffffffff_u32)
+                .gid(0xffffffff_u32)
+                .build()
+                .unwrap(),
+            oci::LinuxDeviceBuilder::default()
+                .path(PathBuf::from("/dev/tty"))
+                .typ(oci::LinuxDeviceType::C)
+                .major(5)
+                .minor(0)
+                .file_mode(0o666_u32)
+                .uid(0xffffffff_u32)
+                .gid(0xffffffff_u32)
+                .build()
+                .unwrap(),
+            oci::LinuxDeviceBuilder::default()
+                .path(PathBuf::from("/dev/urandom"))
+                .typ(oci::LinuxDeviceType::C)
+                .major(1)
+                .minor(9)
+                .file_mode(0o666_u32)
+                .uid(0xffffffff_u32)
+                .gid(0xffffffff_u32)
+                .build()
+                .unwrap(),
+            oci::LinuxDeviceBuilder::default()
+                .path(PathBuf::from("/dev/random"))
+                .typ(oci::LinuxDeviceType::C)
+                .major(1)
+                .minor(8)
+                .file_mode(0o666_u32)
+                .uid(0xffffffff_u32)
+                .gid(0xffffffff_u32)
+                .build()
+                .unwrap(),
         ]
     };
 
@@ -247,17 +255,19 @@ pub struct LinuxContainer {
     pub id: String,
     pub root: String,
     pub config: Config,
-    pub cgroup_manager: Box<dyn Manager + Send + Sync>,
+    pub cgroup_manager: Arc<dyn Manager + Send + Sync>,
     pub init_process_pid: pid_t,
     pub init_process_start_time: u64,
     pub uid_map_path: String,
     pub gid_map_path: String,
-    pub processes: HashMap<pid_t, Process>,
+    pub processes: HashMap<String, Process>,
     pub status: ContainerStatus,
     pub created: SystemTime,
     pub logger: Logger,
-    #[cfg(feature = "standard-oci-runtime")]
-    pub console_socket: PathBuf,
+    // The map only owns the files; later execs use the corresponding agent proc-fd
+    // paths stored in the OCI spec. Keeping the files open makes those paths continue
+    // to resolve to the original namespaces.
+    pinned_namespace_fds: HashMap<oci::LinuxNamespaceType, fs::File>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -336,7 +346,7 @@ pub fn init_child() {
         Ok(_) => log_child!(cfd_log, "temporary parent process exit successfully"),
         Err(e) => {
             log_child!(cfd_log, "temporary parent process exit:child exit: {:?}", e);
-            let _ = write_sync(cwfd, SYNC_FAILED, format!("{:?}", e).as_str());
+            let _ = write_sync(cwfd, SYNC_FAILED, format!("{e:?}").as_str());
         }
     }
 }
@@ -357,9 +367,12 @@ fn do_init_child(cwfd: RawFd) -> Result<()> {
         // by unshare from the parent pidns.
         match std::env::var(PIDNS_FD) {
             Ok(fd) => {
-                let pidns_fd = fd.parse::<i32>().context("get parent pidns fd")?;
-                sched::setns(pidns_fd, CloneFlags::CLONE_NEWPID).context("failed to join pidns")?;
-                let _ = unistd::close(pidns_fd);
+                let pidns_fd = unsafe {
+                    OwnedFd::from_raw_fd(fd.parse::<i32>().context("get parent pidns fd")?)
+                };
+                sched::setns(&pidns_fd, CloneFlags::CLONE_NEWPID)
+                    .context("failed to join pidns")?;
+                // close is automatic on drop
             }
             Err(_e) => {
                 sched::unshare(CloneFlags::CLONE_NEWPID)?;
@@ -401,7 +414,7 @@ fn do_init_child(cwfd: RawFd) -> Result<()> {
 
     let buf = read_sync(crfd)?;
     let state_str = std::str::from_utf8(&buf)?;
-    let mut state: oci::State = serde_json::from_str(state_str)?;
+    let mut state: OCIState = serde_json::from_str(state_str)?;
     log_child!(cfd_log, "notify parent to send cgroup manager");
     write_sync(cwfd, SYNC_SUCCESS, "")?;
 
@@ -412,50 +425,43 @@ fn do_init_child(cwfd: RawFd) -> Result<()> {
     let fs_cm: Result<FsManager, serde_json::Error> = serde_json::from_str(cm_str);
     let systemd_cm: Result<SystemdManager, serde_json::Error> = serde_json::from_str(cm_str);
 
-    #[cfg(feature = "standard-oci-runtime")]
-    let csocket_fd = console::setup_console_socket(&std::env::var(CONSOLE_SOCKET_FD)?)?;
+    let p = spec
+        .process()
+        .as_ref()
+        .ok_or_else(|| anyhow!("didn't find process in Spec"))?;
 
-    let p = if spec.process.is_some() {
-        spec.process.as_ref().unwrap()
-    } else {
-        return Err(anyhow!("didn't find process in Spec"));
-    };
-
-    if spec.linux.is_none() {
-        return Err(anyhow!(MissingLinux));
-    }
-    let linux = spec.linux.as_ref().unwrap();
+    let linux = spec.linux().as_ref().ok_or_else(|| anyhow!(MissingLinux))?;
 
     // get namespace vector to join/new
     let nses = get_namespaces(linux);
 
     let mut userns = false;
     let mut to_new = CloneFlags::empty();
-    let mut to_join = Vec::new();
+    let mut to_join: Vec<(CloneFlags, OwnedFd)> = Vec::new();
 
     for ns in &nses {
-        let s = NAMESPACES.get(&ns.r#type.as_str());
+        let ns_type = ns.typ().to_string();
+        let s = NAMESPACES.get(&ns_type.as_str());
         if s.is_none() {
             return Err(anyhow!(InvalidNamespace));
         }
         let s = s.unwrap();
 
-        if ns.path.is_empty() {
+        if ns.path().as_ref().is_none_or(|p| p.as_os_str().is_empty()) {
             // skip the pidns since it has been done in parent process.
             if *s != CloneFlags::CLONE_NEWPID {
                 to_new.set(*s, true);
             }
         } else {
-            let fd =
-                fcntl::open(ns.path.as_str(), OFlag::O_CLOEXEC, Mode::empty()).map_err(|e| {
+            let fd = fcntl::open(ns.path().as_ref().unwrap(), OFlag::O_CLOEXEC, Mode::empty())
+                .inspect_err(|e| {
                     log_child!(
                         cfd_log,
                         "cannot open type: {} path: {}",
-                        ns.r#type.clone(),
-                        ns.path.clone()
+                        &ns.typ().to_string(),
+                        ns.path().as_ref().unwrap().display()
                     );
-                    log_child!(cfd_log, "error is : {:?}", e);
-                    e
+                    log_child!(cfd_log, "error is : {:?}", e)
                 })?;
 
             if *s != CloneFlags::CLONE_NEWPID {
@@ -468,21 +474,23 @@ fn do_init_child(cwfd: RawFd) -> Result<()> {
         userns = true;
     }
 
-    if p.oom_score_adj.is_some() {
-        log_child!(cfd_log, "write oom score {}", p.oom_score_adj.unwrap());
+    if p.oom_score_adj().is_some() {
+        log_child!(cfd_log, "write oom score {}", p.oom_score_adj().unwrap());
         fs::write(
             "/proc/self/oom_score_adj",
-            p.oom_score_adj.unwrap().to_string().as_bytes(),
+            p.oom_score_adj().unwrap().to_string().as_bytes(),
         )?;
     }
 
     // set rlimit
-    for rl in p.rlimits.iter() {
+    let default_rlimits = Vec::new();
+    let process_rlimits = p.rlimits().as_ref().unwrap_or(&default_rlimits);
+    for rl in process_rlimits.iter() {
         log_child!(cfd_log, "set resource limit: {:?}", rl);
         setrlimit(
-            Resource::from_str(&rl.r#type)?,
-            Rlim::from_raw(rl.soft),
-            Rlim::from_raw(rl.hard),
+            Resource::from_str(&rl.typ().to_string())?,
+            Rlim::from_raw(rl.soft()),
+            Rlim::from_raw(rl.hard()),
         )?;
     }
 
@@ -520,25 +528,25 @@ fn do_init_child(cwfd: RawFd) -> Result<()> {
         setid(Uid::from_raw(0), Gid::from_raw(0))?;
     }
 
-    let mut mount_fd = -1;
+    let mut mount_fd: Option<OwnedFd> = None;
     let mut bind_device = false;
     for (s, fd) in to_join {
         if s == CloneFlags::CLONE_NEWNS {
-            mount_fd = fd;
+            mount_fd = Some(fd);
             continue;
         }
 
         log_child!(cfd_log, "join namespace {:?}", s);
-        sched::setns(fd, s).or_else(|e| {
+        sched::setns(&fd, s).or_else(|e| {
             if s == CloneFlags::CLONE_NEWUSER {
                 if e != Errno::EINVAL {
-                    let _ = write_sync(cwfd, SYNC_FAILED, format!("{:?}", e).as_str());
+                    let _ = write_sync(cwfd, SYNC_FAILED, format!("{e:?}").as_str());
                     return Err(e);
                 }
 
                 Ok(())
             } else {
-                let _ = write_sync(cwfd, SYNC_FAILED, format!("{:?}", e).as_str());
+                let _ = write_sync(cwfd, SYNC_FAILED, format!("{e:?}").as_str());
                 Err(e)
             }
         })?;
@@ -555,17 +563,26 @@ fn do_init_child(cwfd: RawFd) -> Result<()> {
 
     sched::unshare(to_new & !CloneFlags::CLONE_NEWUSER)?;
 
+    if cgroups::hierarchies::is_cgroup2_unified_mode() {
+        sched::unshare(CloneFlags::CLONE_NEWCGROUP)?;
+    }
+
     if userns {
         bind_device = true;
     }
 
     if to_new.contains(CloneFlags::CLONE_NEWUTS) {
-        unistd::sethostname(&spec.hostname)?;
+        unistd::sethostname(
+            spec.hostname()
+                .as_ref()
+                .map_or("".to_string(), |x| x.clone()),
+        )?;
     }
 
-    let rootfs = spec.root.as_ref().unwrap().path.as_str();
-    log_child!(cfd_log, "setup rootfs {}", rootfs);
-    let root = fs::canonicalize(rootfs)?;
+    let rootfs = spec.root().as_ref().unwrap().path().display().to_string();
+
+    log_child!(cfd_log, "setup rootfs {}", &rootfs);
+    let root = fs::canonicalize(&rootfs)?;
     let rootfs = root.to_str().unwrap();
 
     if to_new.contains(CloneFlags::CLONE_NEWNS) {
@@ -591,9 +608,32 @@ fn do_init_child(cwfd: RawFd) -> Result<()> {
         read_sync(crfd)?;
     }
 
-    if mount_fd != -1 {
-        sched::setns(mount_fd, CloneFlags::CLONE_NEWNS)?;
-        unistd::close(mount_fd)?;
+    if let Some(mount_fd) = mount_fd {
+        sched::setns(&mount_fd, CloneFlags::CLONE_NEWNS)?;
+        // mount_fd will be automatically closed when dropped
+    }
+
+    if init {
+        // CreateContainer Hooks:
+        // before pivot_root after prestart, createruntime
+        state.pid = std::process::id() as i32;
+        state.status = spec::ContainerState::Created;
+        if let Some(hooks) = spec.hooks().as_ref() {
+            log_child!(
+                cfd_log,
+                "create_container hooks {:?}",
+                hooks.create_container()
+            );
+            let mut create_container_states = HookStates::new();
+            create_container_states.execute_hooks(
+                hooks
+                    .create_container()
+                    .clone()
+                    .unwrap_or_default()
+                    .as_slice(),
+                Some(state.clone()),
+            )?;
+        }
     }
 
     if to_new.contains(CloneFlags::CLONE_NEWNS) {
@@ -606,22 +646,26 @@ fn do_init_child(cwfd: RawFd) -> Result<()> {
         }
 
         // setup sysctl
-        set_sysctls(&linux.sysctl)?;
+        set_sysctls(&linux.sysctl().clone().unwrap_or_default())?;
         unistd::chdir("/")?;
     }
 
     if to_new.contains(CloneFlags::CLONE_NEWNS) {
-        mount::finish_rootfs(cfd_log, &spec, &oci_process)?;
+        mount::finish_rootfs(cfd_log, &spec, &oci_process, selinux_enabled)?;
     }
 
-    if !oci_process.cwd.is_empty() {
-        unistd::chdir(oci_process.cwd.as_str())?;
+    if !oci_process.cwd().as_os_str().is_empty() {
+        unistd::chdir(oci_process.cwd().display().to_string().as_str())?;
     }
+    verify_cwd()?;
+    // Create new session for init/exec process rather than inheriting parent's session
+    // This ensures the init/exec process owns independent session ID, which aligns with runc behavior.
+    unistd::setsid().context("create a new session")?;
 
-    let guser = &oci_process.user;
+    let guser = &oci_process.user();
 
-    let uid = Uid::from_raw(guser.uid);
-    let gid = Gid::from_raw(guser.gid);
+    let uid = Uid::from_raw(guser.uid());
+    let gid = Gid::from_raw(guser.gid());
 
     // only change stdio devices owner when user
     // isn't root.
@@ -631,31 +675,33 @@ fn do_init_child(cwfd: RawFd) -> Result<()> {
 
     setid(uid, gid)?;
 
-    if !guser.additional_gids.is_empty() {
-        let gids: Vec<Gid> = guser
-            .additional_gids
+    if let Some(additional_gids) = guser.additional_gids() {
+        let gids: Vec<Gid> = additional_gids
             .iter()
             .map(|gid| Gid::from_raw(*gid))
             .collect();
 
-        unistd::setgroups(&gids).map_err(|e| {
+        unistd::setgroups(&gids).inspect_err(|e| {
             let _ = write_sync(
                 cwfd,
                 SYNC_FAILED,
-                format!("setgroups failed: {:?}", e).as_str(),
+                format!("setgroups failed: {e:?}").as_str(),
             );
-
-            e
         })?;
     }
 
     // NoNewPrivileges
-    if oci_process.no_new_privileges {
+    if oci_process.no_new_privileges().unwrap_or_default() {
         capctl::prctl::set_no_new_privs().map_err(|_| anyhow!("cannot set no new privileges"))?;
     }
 
     // Set SELinux label
-    if !oci_process.selinux_label.is_empty() {
+    if !oci_process
+        .selinux_label()
+        .clone()
+        .unwrap_or_default()
+        .is_empty()
+    {
         if !selinux_enabled {
             return Err(anyhow!(
                 "SELinux label for the process is provided but SELinux is not enabled on the running kernel"
@@ -663,35 +709,48 @@ fn do_init_child(cwfd: RawFd) -> Result<()> {
         }
 
         log_child!(cfd_log, "Set SELinux label to the container process");
-        selinux::set_exec_label(&oci_process.selinux_label)?;
+        let default_label = String::new();
+        selinux::set_exec_label(
+            oci_process
+                .selinux_label()
+                .as_ref()
+                .unwrap_or(&default_label),
+        )?;
     }
 
     // Log unknown seccomp system calls in advance before the log file descriptor closes.
     #[cfg(feature = "seccomp")]
-    if let Some(ref scmp) = linux.seccomp {
+    if let Some(ref scmp) = linux.seccomp() {
         if let Some(syscalls) = seccomp::get_unknown_syscalls(scmp) {
             log_child!(cfd_log, "unknown seccomp system calls: {:?}", syscalls);
         }
     }
 
-    // Without NoNewPrivileges, we need to set seccomp
-    // before dropping capabilities because the calling thread
-    // must have the CAP_SYS_ADMIN.
+    // Restrict the bounding set before installing the workload seccomp filter.
+    // A filter can reject selected PR_CAPBSET_READ operations and make kernel
+    // capability discovery appear incomplete.
+    if let Some(caps) = oci_process.capabilities().as_ref() {
+        capabilities::restrict_bounding_set(cfd_log, caps)?;
+    }
+
+    // Without NoNewPrivileges, install seccomp while the calling thread still
+    // has effective CAP_SYS_ADMIN. The bounding set is already restricted.
     #[cfg(feature = "seccomp")]
-    if !oci_process.no_new_privileges {
-        if let Some(ref scmp) = linux.seccomp {
+    if !oci_process.no_new_privileges().unwrap_or_default() {
+        if let Some(ref scmp) = linux.seccomp() {
             seccomp::init_seccomp(scmp)?;
         }
     }
 
-    // Drop capabilities
-    if oci_process.capabilities.is_some() {
-        let c = oci_process.capabilities.as_ref().unwrap();
+    // Drop remaining capabilities
+    if oci_process.capabilities().is_some() {
+        let c = oci_process.capabilities().as_ref().unwrap();
         capabilities::drop_privileges(cfd_log, c)?;
     }
 
-    let args = oci_process.args.to_vec();
-    let env = oci_process.env.to_vec();
+    let default_vec = Vec::new();
+    let args = oci_process.args().as_ref().unwrap_or(&default_vec).to_vec();
+    let env = oci_process.env().as_ref().unwrap_or(&default_vec).to_vec();
 
     let mut fifofd = -1;
     if init {
@@ -713,7 +772,7 @@ fn do_init_child(cwfd: RawFd) -> Result<()> {
 
     if env::var_os(HOME_ENV_KEY).is_none() {
         // try to set "HOME" env by uid
-        if let Ok(Some(user)) = User::from_uid(Uid::from_raw(guser.uid)) {
+        if let Ok(Some(user)) = User::from_uid(Uid::from_raw(guser.uid())) {
             if let Ok(user_home_dir) = user.dir.into_os_string().into_string() {
                 env::set_var(HOME_ENV_KEY, user_home_dir);
             }
@@ -727,7 +786,7 @@ fn do_init_child(cwfd: RawFd) -> Result<()> {
     let exec_file = Path::new(&args[0]);
     log_child!(cfd_log, "process command: {:?}", &args);
     if !exec_file.exists() {
-        find_file(exec_file).ok_or_else(|| anyhow!("the file {} was not found", &args[0]))?;
+        find_file(exec_file).ok_or_else(|| anyhow!("the file {} was not found", args[0]))?;
     }
 
     // notify parent that the child's ready to start
@@ -737,25 +796,13 @@ fn do_init_child(cwfd: RawFd) -> Result<()> {
     let _ = unistd::close(crfd);
     let _ = unistd::close(cwfd);
 
-    if oci_process.terminal {
-        cfg_if::cfg_if! {
-            if #[cfg(feature = "standard-oci-runtime")] {
-                if let Some(csocket_fd) = csocket_fd {
-                    console::setup_master_console(csocket_fd)?;
-                } else {
-                    return Err(anyhow!("failed to get console master socket fd"));
-                }
-            }
-            else {
-                unistd::setsid().context("create a new session")?;
-                unsafe { libc::ioctl(0, libc::TIOCSCTTY) };
-            }
-        }
+    if oci_process.terminal().unwrap_or_default() {
+        unsafe { libc::ioctl(0, libc::TIOCSCTTY) };
     }
 
     if init {
         let fd = fcntl::open(
-            format!("/proc/self/fd/{}", fifofd).as_str(),
+            format!("/proc/self/fd/{fifofd}").as_str(),
             OFlag::O_RDONLY | OFlag::O_CLOEXEC,
             Mode::from_bits_truncate(0),
         )?;
@@ -770,10 +817,17 @@ fn do_init_child(cwfd: RawFd) -> Result<()> {
         // * should be run after container is created and before container is started (before user-specific command is executed)
         // * spec details: https://github.com/opencontainers/runtime-spec/blob/c1662686cff159595277b79322d0272f5182941b/config.md#startcontainer-hooks
         state.pid = std::process::id() as i32;
-        state.status = oci::ContainerState::Created;
-        if let Some(hooks) = spec.hooks.as_ref() {
+        state.status = spec::ContainerState::Created;
+        if let Some(hooks) = spec.hooks().as_ref() {
             let mut start_container_states = HookStates::new();
-            start_container_states.execute_hooks(&hooks.start_container, Some(state))?;
+            start_container_states.execute_hooks(
+                hooks
+                    .start_container()
+                    .clone()
+                    .unwrap_or_default()
+                    .as_slice(),
+                Some(state),
+            )?;
         }
     }
 
@@ -781,13 +835,25 @@ fn do_init_child(cwfd: RawFd) -> Result<()> {
     // do_exec as possible in order to reduce the amount of
     // system calls in the seccomp profiles.
     #[cfg(feature = "seccomp")]
-    if oci_process.no_new_privileges {
-        if let Some(ref scmp) = linux.seccomp {
+    if oci_process.no_new_privileges().unwrap_or_default() {
+        if let Some(ref scmp) = linux.seccomp() {
             seccomp::init_seccomp(scmp)?;
         }
     }
 
     do_exec(&args);
+}
+
+// Verify that chdir did not follow a procfs magic link outside the container
+// mount namespace. libc reports ENOENT when cwd is unreachable from root.
+fn verify_cwd() -> Result<()> {
+    match unistd::getcwd() {
+        Err(Errno::ENOENT) => Err(anyhow!(
+            "current working directory is outside the container mount namespace root"
+        )),
+        Err(e) => Err(anyhow!("failed to verify current working directory: {e}")),
+        Ok(_) => Ok(()),
+    }
 }
 
 // set_stdio_permissions fixes the permissions of PID 1's STDIO
@@ -803,7 +869,8 @@ fn set_stdio_permissions(uid: Uid) -> Result<()> {
     ];
 
     for fd in &fds {
-        let stat = stat::fstat(*fd)?;
+        let borrowed_fd = unsafe { BorrowedFd::borrow_raw(*fd) };
+        let stat = stat::fstat(borrowed_fd)?;
         // Skip chown of /dev/null if it was used as one of the STDIO fds.
         if stat.st_rdev == meta.rdev() {
             continue;
@@ -815,7 +882,8 @@ fn set_stdio_permissions(uid: Uid) -> Result<()> {
         // that users expect to be able to actually use their console. Without
         // this code, you couldn't effectively run as a non-root user inside a
         // container and also have a console set up.
-        unistd::fchown(*fd, Some(uid), None).with_context(|| "set stdio permissions failed")?;
+        unistd::fchown(borrowed_fd, Some(uid), None)
+            .with_context(|| "set stdio permissions failed")?;
     }
 
     Ok(())
@@ -848,8 +916,8 @@ impl BaseContainer for LinuxContainer {
             0
         };
 
-        let root = match oci.root.as_ref() {
-            Some(s) => s.path.as_str(),
+        let root = match oci.root().as_ref() {
+            Some(s) => s.path().display().to_string(),
             None => return Err(anyhow!("Unable to get root path: oci.root is none")),
         };
 
@@ -860,12 +928,12 @@ impl BaseContainer for LinuxContainer {
         };
 
         Ok(OCIState {
-            version: oci.version.clone(),
+            version: oci.version().clone(),
             id: self.id(),
             status,
             pid,
             bundle,
-            annotations: oci.annotations.clone(),
+            annotations: oci.annotations().clone().unwrap_or_default(),
         })
     }
 
@@ -874,17 +942,13 @@ impl BaseContainer for LinuxContainer {
     }
 
     fn processes(&self) -> Result<Vec<i32>> {
-        Ok(self.processes.keys().cloned().collect())
+        Ok(self.processes.values().map(|p| p.pid).collect())
     }
 
     fn get_process(&mut self, eid: &str) -> Result<&mut Process> {
-        for (_, v) in self.processes.iter_mut() {
-            if eid == v.exec_id.as_str() {
-                return Ok(v);
-            }
-        }
-
-        Err(anyhow!("invalid eid {}", eid))
+        self.processes
+            .get_mut(eid)
+            .ok_or_else(|| anyhow!("invalid eid {}", eid))
     }
 
     fn stats(&self) -> Result<StatsContainerResponse> {
@@ -899,21 +963,23 @@ impl BaseContainer for LinuxContainer {
     fn set(&mut self, r: LinuxResources) -> Result<()> {
         self.cgroup_manager.as_ref().set(&r, true)?;
 
-        self.config
-            .spec
-            .as_mut()
-            .unwrap()
-            .linux
-            .as_mut()
-            .unwrap()
-            .resources = Some(r);
+        if let Some(linux) = self.config.spec.as_mut().unwrap().linux_mut() {
+            linux.set_resources(Some(r));
+        }
+
         Ok(())
     }
 
     async fn start(&mut self, mut p: Process) -> Result<()> {
         let logger = self.logger.new(o!("eid" => p.exec_id.clone()));
+
+        // Check if exec_id is already in use to prevent collisions
+        if self.processes.contains_key(p.exec_id.as_str()) {
+            return Err(anyhow!("exec_id '{}' already exists", p.exec_id));
+        }
+
         let tty = p.tty;
-        let fifo_file = format!("{}/{}", &self.root, EXEC_FIFO_FILENAME);
+        let fifo_file = format!("{}/{}", self.root, EXEC_FIFO_FILENAME);
         info!(logger, "enter container.start!");
         let mut fifofd: RawFd = -1;
         if p.init {
@@ -922,11 +988,12 @@ impl BaseContainer for LinuxContainer {
             }
             unistd::mkfifo(fifo_file.as_str(), Mode::from_bits(0o644).unwrap())?;
 
-            fifofd = fcntl::open(
+            let fd = fcntl::open(
                 fifo_file.as_str(),
                 OFlag::O_PATH,
                 Mode::from_bits(0).unwrap(),
             )?;
+            fifofd = fd.into_raw_fd();
         }
         info!(logger, "exec fifo opened!");
 
@@ -935,44 +1002,45 @@ impl BaseContainer for LinuxContainer {
         }
 
         let spec = self.config.spec.as_ref().unwrap();
-        if spec.linux.is_none() {
+        if spec.linux().is_none() {
             return Err(anyhow!("no linux config"));
         }
-        let linux = spec.linux.as_ref().unwrap();
+        let linux = spec.linux().as_ref().unwrap();
 
-        if p.oci.capabilities.is_none() {
+        if p.oci.capabilities().is_none() {
             // No capabilities, inherit from container process
             let process = spec
-                .process
+                .process()
                 .as_ref()
                 .ok_or_else(|| anyhow!("no process config"))?;
-            p.oci.capabilities = Some(
+            p.oci.set_capabilities(Some(
                 process
-                    .capabilities
+                    .capabilities()
                     .clone()
                     .ok_or_else(|| anyhow!("missing process capabilities"))?,
-            );
+            ));
         }
 
         let (pfd_log, cfd_log) = unistd::pipe().context("failed to create pipe")?;
 
-        let _ = fcntl::fcntl(pfd_log, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))
+        let _ = fcntl::fcntl(&pfd_log, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))
             .map_err(|e| warn!(logger, "fcntl pfd log FD_CLOEXEC {:?}", e));
 
         let child_logger = logger.new(o!("action" => "child process log"));
-        let log_handler = setup_child_logger(pfd_log, child_logger);
+        let log_stream = PipeStream::new(pfd_log.into_raw_fd())?;
+        let log_handler = setup_child_logger(log_stream, child_logger);
 
         let (prfd, cwfd) = unistd::pipe().context("failed to create pipe")?;
         let (crfd, pwfd) = unistd::pipe().context("failed to create pipe")?;
 
-        let _ = fcntl::fcntl(prfd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))
+        let _ = fcntl::fcntl(&prfd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))
             .map_err(|e| warn!(logger, "fcntl prfd FD_CLOEXEC {:?}", e));
 
-        let _ = fcntl::fcntl(pwfd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))
+        let _ = fcntl::fcntl(&pwfd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))
             .map_err(|e| warn!(logger, "fcntl pwfd FD_COLEXEC {:?}", e));
 
-        let mut pipe_r = PipeStream::from_fd(prfd);
-        let mut pipe_w = PipeStream::from_fd(pwfd);
+        let mut pipe_r = PipeStream::new(prfd.into_raw_fd())?;
+        let mut pipe_w = PipeStream::new(pwfd.into_raw_fd())?;
 
         let child_stdin: std::process::Stdio;
         let child_stdout: std::process::Stdio;
@@ -980,26 +1048,116 @@ impl BaseContainer for LinuxContainer {
 
         if tty {
             let pseudo = pty::openpty(None, None)?;
-            p.term_master = Some(pseudo.master);
-            let _ = fcntl::fcntl(pseudo.master, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))
+            let _ = fcntl::fcntl(&pseudo.master, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))
                 .map_err(|e| warn!(logger, "fnctl pseudo.master {:?}", e));
-            let _ = fcntl::fcntl(pseudo.slave, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))
+            let _ = fcntl::fcntl(&pseudo.slave, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))
                 .map_err(|e| warn!(logger, "fcntl pseudo.slave {:?}", e));
 
-            child_stdin = unsafe { std::process::Stdio::from_raw_fd(pseudo.slave) };
-            child_stdout = unsafe { std::process::Stdio::from_raw_fd(pseudo.slave) };
-            child_stderr = unsafe { std::process::Stdio::from_raw_fd(pseudo.slave) };
+            // Transfer ownership of master to raw fd for multiple uses
+            let master_raw = pseudo.master.into_raw_fd();
+            p.term_master = Some(master_raw);
+
+            let slave_raw = pseudo.slave.into_raw_fd();
+            child_stdin = unsafe { std::process::Stdio::from_raw_fd(slave_raw) };
+            // Create temporary OwnedFd for dup operations, then forget it since stdin owns the fd
+            let slave_fd = unsafe { OwnedFd::from_raw_fd(slave_raw) };
+            child_stdout =
+                unsafe { std::process::Stdio::from_raw_fd(unistd::dup(&slave_fd)?.into_raw_fd()) };
+            child_stderr =
+                unsafe { std::process::Stdio::from_raw_fd(unistd::dup(&slave_fd)?.into_raw_fd()) };
+            std::mem::forget(slave_fd); // Don't close - stdin owns it
+
+            if let Some(proc_io) = &mut p.proc_io {
+                // A reference count used to clean up the term master fd.
+                let term_closer = Arc::from(unsafe { File::from_raw_fd(master_raw) });
+
+                // Copy from stdin to term_master
+                if let Some(mut stdin_stream) = proc_io.stdin.take() {
+                    let mut term_master = unsafe { File::from_raw_fd(master_raw) };
+                    let logger = logger.clone();
+                    let term_closer = term_closer.clone();
+                    tokio::spawn(async move {
+                        let res = tokio::io::copy(&mut stdin_stream, &mut term_master).await;
+                        debug!(logger, "copy from stdin to term_master end: {:?}", res);
+
+                        std::mem::forget(term_master); // Avoid auto closing of term_master
+                        drop(term_closer);
+                    });
+                }
+
+                // Copy from term_master to stdout
+                if let Some(mut stdout_stream) = proc_io.stdout.take() {
+                    let wgw_output = proc_io.wg_output.worker();
+                    let mut term_master = unsafe { File::from_raw_fd(master_raw) };
+                    let logger = logger.clone();
+                    let term_closer = term_closer;
+                    tokio::spawn(async move {
+                        let res = tokio::io::copy(&mut term_master, &mut stdout_stream).await;
+                        debug!(logger, "copy from term_master to stdout end: {:?}", res);
+                        wgw_output.done();
+                        std::mem::forget(term_master); // Avoid auto closing of term_master
+                        drop(term_closer);
+                    });
+                }
+            }
         } else {
+            // not using a terminal
             let stdin = p.stdin.unwrap();
             let stdout = p.stdout.unwrap();
             let stderr = p.stderr.unwrap();
             child_stdin = unsafe { std::process::Stdio::from_raw_fd(stdin) };
             child_stdout = unsafe { std::process::Stdio::from_raw_fd(stdout) };
             child_stderr = unsafe { std::process::Stdio::from_raw_fd(stderr) };
+
+            if let Some(proc_io) = &mut p.proc_io {
+                // Here we copy from vsock stdin stream to parent_stdin manually.
+                // This is because we need to close the stdin fifo when the stdin stream
+                // is drained.
+                if let Some(mut stdin_stream) = proc_io.stdin.take() {
+                    debug!(logger, "copy from stdin to parent_stdin");
+                    let mut parent_stdin = unsafe { File::from_raw_fd(p.parent_stdin.unwrap()) };
+                    let logger = logger.clone();
+                    tokio::spawn(async move {
+                        let res = tokio::io::copy(&mut stdin_stream, &mut parent_stdin).await;
+                        debug!(logger, "copy from stdin to term_master end: {:?}", res);
+                    });
+                }
+
+                // copy from parent_stdout to stdout stream
+                if let Some(mut stdout_stream) = proc_io.stdout.take() {
+                    debug!(logger, "copy from parent_stdout to stdout stream");
+                    let wgw_output = proc_io.wg_output.worker();
+                    let mut parent_stdout = unsafe { File::from_raw_fd(p.parent_stdout.unwrap()) };
+                    let logger = logger.clone();
+                    tokio::spawn(async move {
+                        let res = tokio::io::copy(&mut parent_stdout, &mut stdout_stream).await;
+                        debug!(
+                            logger,
+                            "copy from parent_stdout to stdout stream end: {:?}", res
+                        );
+                        wgw_output.done();
+                    });
+                }
+
+                // copy from parent_stderr to stderr stream
+                if let Some(mut stderr_stream) = proc_io.stderr.take() {
+                    debug!(logger, "copy from parent_stderr to stderr stream");
+                    let wgw_output = proc_io.wg_output.worker();
+                    let mut parent_stderr = unsafe { File::from_raw_fd(p.parent_stderr.unwrap()) };
+                    let logger = logger.clone();
+                    tokio::spawn(async move {
+                        let res = tokio::io::copy(&mut parent_stderr, &mut stderr_stream).await;
+                        debug!(
+                            logger,
+                            "copy from parent_stderr to stderr stream end: {:?}", res
+                        );
+                        wgw_output.done();
+                    });
+                }
+            }
         }
 
         let pidns = get_pid_namespace(&self.logger, linux)?;
-        #[cfg(not(feature = "standard-oci-runtime"))]
         if !pidns.enabled {
             return Err(anyhow!("cannot find the pid ns"));
         }
@@ -1011,13 +1169,6 @@ impl BaseContainer for LinuxContainer {
         let exec_path = std::env::current_exe()?;
         let mut child = std::process::Command::new(exec_path);
 
-        #[allow(unused_mut)]
-        let mut console_name = PathBuf::from("");
-        #[cfg(feature = "standard-oci-runtime")]
-        if !self.console_socket.as_os_str().is_empty() {
-            console_name = self.console_socket.clone();
-        }
-
         let mut child = child
             .arg("init")
             .stdin(child_stdin)
@@ -1025,25 +1176,25 @@ impl BaseContainer for LinuxContainer {
             .stderr(child_stderr)
             .env(INIT, format!("{}", p.init))
             .env(NO_PIVOT, format!("{}", self.config.no_pivot_root))
-            .env(CRFD_FD, format!("{}", crfd))
-            .env(CWFD_FD, format!("{}", cwfd))
-            .env(CLOG_FD, format!("{}", cfd_log))
-            .env(CONSOLE_SOCKET_FD, console_name)
+            .env(CRFD_FD, format!("{}", crfd.as_fd().as_raw_fd()))
+            .env(CWFD_FD, format!("{}", cwfd.as_fd().as_raw_fd()))
+            .env(CLOG_FD, format!("{}", cfd_log.as_fd().as_raw_fd()))
             .env(PIDNS_ENABLED, format!("{}", pidns.enabled));
 
         if p.init {
-            child = child.env(FIFO_FD, format!("{}", fifofd));
+            child = child.env(FIFO_FD, format!("{fifofd}"));
         }
 
-        if pidns.fd.is_some() {
-            child = child.env(PIDNS_FD, format!("{}", pidns.fd.unwrap()));
+        if let Some(fd) = pidns.fd {
+            child = child.env(PIDNS_FD, format!("{fd}"));
         }
 
         child.spawn()?;
 
-        unistd::close(crfd)?;
-        unistd::close(cwfd)?;
-        unistd::close(cfd_log)?;
+        // OwnedFd will be automatically closed when dropped
+        drop(crfd);
+        drop(cwfd);
+        drop(cfd_log);
 
         // get container process's pid
         let pid_buf = read_async(&mut pipe_r).await?;
@@ -1096,9 +1247,18 @@ impl BaseContainer for LinuxContainer {
 
         if p.init {
             let spec = self.config.spec.as_mut().unwrap();
-            update_namespaces(&self.logger, spec, p.pid)?;
+            if let Err(e) =
+                update_namespaces(&self.logger, spec, p.pid, &mut self.pinned_namespace_fds)
+            {
+                // Pinning failed before the init process was added to self.processes.
+                // Kill it so an untracked child is not left blocked on the exec FIFO.
+                let _ = signal::kill(Pid::from_raw(p.pid), Some(Signal::SIGKILL)).map_err(
+                    |kill_error| warn!(logger, "failed to kill process: {:?}", kill_error),
+                );
+                return Err(e);
+            }
         }
-        self.processes.insert(p.pid, p);
+        self.processes.insert(p.exec_id.clone(), p);
 
         info!(logger, "wait on child log handler");
         let _ = log_handler
@@ -1124,13 +1284,13 @@ impl BaseContainer for LinuxContainer {
         let spec = self.config.spec.as_ref().unwrap();
         let st = self.oci_state()?;
 
-        for pid in self.processes.keys() {
-            match signal::kill(Pid::from_raw(*pid), Some(Signal::SIGKILL)) {
+        for process in self.processes.values() {
+            match signal::kill(process.pid(), Some(Signal::SIGKILL)) {
                 Err(Errno::ESRCH) => {
                     info!(
                         self.logger,
                         "kill encounters ESRCH, pid: {}, container: {}",
-                        pid,
+                        process.pid(),
                         self.id.clone()
                     );
                     continue;
@@ -1144,40 +1304,75 @@ impl BaseContainer for LinuxContainer {
         // * should be executed after the container is deleted but before the delete operation returns
         // * the executable file is in agent namespace
         // * should also be executed in agent namespace.
-        if let Some(hooks) = spec.hooks.as_ref() {
+        if let Some(hooks) = spec.hooks().as_ref() {
             info!(self.logger, "guest Poststop hook");
             let mut hook_states = HookStates::new();
-            hook_states.execute_hooks(&hooks.poststop, Some(st))?;
+            hook_states.execute_hooks(
+                hooks.poststop().clone().unwrap_or_default().as_slice(),
+                Some(st),
+            )?;
         }
 
         self.status.transition(ContainerState::Stopped);
-        mount::umount2(
-            spec.root.as_ref().unwrap().path.as_str(),
-            MntFlags::MNT_DETACH,
-        )?;
-        fs::remove_dir_all(&self.root)?;
 
-        let cgm = self.cgroup_manager.as_mut();
         // Kill all of the processes created in this container to prevent
         // the leak of some daemon process when this container shared pidns
         // with the sandbox.
+        let cgm = self.cgroup_manager.as_ref();
         let pids = cgm.get_pids().context("get cgroup pids")?;
-        for i in pids {
-            if let Err(e) = signal::kill(Pid::from_raw(i), Signal::SIGKILL) {
+        info!(
+            self.logger,
+            "destroy: container {} cgroup has {} processes: {:?}",
+            self.id,
+            pids.len(),
+            pids
+        );
+        for i in &pids {
+            info!(
+                self.logger,
+                "destroy: killing process {} in container {}", i, self.id
+            );
+            if let Err(e) = signal::kill(Pid::from_raw(*i), Signal::SIGKILL) {
                 warn!(self.logger, "kill the process {} error: {:?}", i, e);
             }
         }
 
+        info!(
+            self.logger,
+            "destroy: destroying cgroup for container {}", self.id
+        );
         cgm.destroy().context("destroy cgroups")?;
+
+        // Now umount and remove the container's root directory.
+        // This is done after process cleanup to ensure processes are killed
+        // even if filesystem cleanup fails (e.g., due to read-only mounts).
+        mount::umount2(
+            spec.root()
+                .as_ref()
+                .unwrap()
+                .path()
+                .display()
+                .to_string()
+                .as_str(),
+            MntFlags::MNT_DETACH,
+        )
+        .or_else(|e| {
+            if e.ne(&nix::Error::EINVAL) {
+                return Err(anyhow!(e));
+            }
+            warn!(self.logger, "rootfs not mounted");
+            Ok(())
+        })?;
+        fs::remove_dir_all(&self.root)?;
 
         Ok(())
     }
 
     async fn exec(&mut self) -> Result<()> {
-        let fifo = format!("{}/{}", &self.root, EXEC_FIFO_FILENAME);
+        let fifo = format!("{}/{}", self.root, EXEC_FIFO_FILENAME);
         let fd = fcntl::open(fifo.as_str(), OFlag::O_WRONLY, Mode::from_bits_truncate(0))?;
         let data: &[u8] = &[0];
-        unistd::write(fd, data)?;
+        unistd::write(&fd, data)?;
         info!(self.logger, "container started");
         self.init_process_start_time = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -1197,10 +1392,13 @@ impl BaseContainer for LinuxContainer {
         // * should be executed after the container is started but before the delete operation returns
         // * the executable file is in agent namespace
         // * should also be executed in agent namespace.
-        if let Some(hooks) = spec.hooks.as_ref() {
+        if let Some(hooks) = spec.hooks().as_ref() {
             info!(self.logger, "guest Poststart hook");
             let mut hook_states = HookStates::new();
-            hook_states.execute_hooks(&hooks.poststart, Some(st))?;
+            hook_states.execute_hooks(
+                hooks.poststart().clone().unwrap_or_default().as_slice(),
+                Some(st),
+            )?;
         }
 
         unistd::close(fd)?;
@@ -1245,24 +1443,53 @@ fn do_exec(args: &[String]) -> ! {
     unreachable!()
 }
 
-pub fn update_namespaces(logger: &Logger, spec: &mut Spec, init_pid: RawFd) -> Result<()> {
+pub fn update_namespaces(
+    logger: &Logger,
+    spec: &mut Spec,
+    init_pid: RawFd,
+    pinned_namespace_fds: &mut HashMap<oci::LinuxNamespaceType, fs::File>,
+) -> Result<()> {
     info!(logger, "updating namespaces");
     let linux = spec
-        .linux
+        .linux_mut()
         .as_mut()
         .ok_or_else(|| anyhow!("Spec didn't contain linux field"))?;
 
-    let namespaces = linux.namespaces.as_mut_slice();
-    for namespace in namespaces.iter_mut() {
-        if TYPETONAME.contains_key(namespace.r#type.as_str()) {
-            let ns_path = format!(
-                "/proc/{}/ns/{}",
-                init_pid,
-                TYPETONAME.get(namespace.r#type.as_str()).unwrap()
-            );
+    if let Some(namespaces) = linux.namespaces_mut().as_mut() {
+        for namespace in namespaces.iter_mut() {
+            if TYPETONAME.contains_key(&namespace.typ()) {
+                let ns_path = format!(
+                    "/proc/{}/ns/{}",
+                    init_pid,
+                    TYPETONAME.get(&namespace.typ()).unwrap()
+                );
 
-            if namespace.path.is_empty() {
-                namespace.path = ns_path;
+                if namespace
+                    .path()
+                    .as_ref()
+                    .is_none_or(|p| p.as_os_str().is_empty())
+                {
+                    // This path disappears when the init process exits. If its numeric PID is later
+                    // reused, the same path can identify an unrelated process's namespace. Open it
+                    // now to pin the original namespace independently of the init process's lifetime.
+                    let fd = fcntl::open(
+                        ns_path.as_str(),
+                        OFlag::O_RDONLY | OFlag::O_CLOEXEC,
+                        Mode::empty(),
+                    )
+                    .with_context(|| format!("failed to pin namespace {}", ns_path))?;
+                    let file = fs::File::from(fd);
+
+                    // Later namespace setup runs in a separately exec'd helper. This O_CLOEXEC FD
+                    // remains owned by the agent, so address it through the agent's proc directory;
+                    // `/proc/self/fd` in the helper would refer to the helper's descriptor table.
+                    let agent_pid = std::process::id();
+                    let namespace_fd = file.as_raw_fd();
+                    let pinned_path = PathBuf::from(format!("/proc/{agent_pid}/fd/{namespace_fd}"));
+
+                    namespace.set_path(Some(pinned_path));
+                    pinned_namespace_fds.insert(namespace.typ(), file);
+                }
             }
         }
     }
@@ -1271,26 +1498,28 @@ pub fn update_namespaces(logger: &Logger, spec: &mut Spec, init_pid: RawFd) -> R
 }
 
 fn get_pid_namespace(logger: &Logger, linux: &Linux) -> Result<PidNs> {
-    for ns in &linux.namespaces {
-        if ns.r#type == "pid" {
-            if ns.path.is_empty() {
-                return Ok(PidNs::new(true, None));
-            }
-
-            let fd =
-                fcntl::open(ns.path.as_str(), OFlag::O_RDONLY, Mode::empty()).map_err(|e| {
+    let linux_namespaces = linux.namespaces().clone().unwrap_or_default();
+    for ns in &linux_namespaces {
+        if &ns.typ().to_string() == "pid" {
+            let fd = match ns.path() {
+                None => return Ok(PidNs::new(true, None)),
+                Some(ns_path) => fcntl::open(
+                    ns_path.display().to_string().as_str(),
+                    OFlag::O_RDONLY,
+                    Mode::empty(),
+                )
+                .inspect_err(|e| {
                     error!(
                         logger,
                         "cannot open type: {} path: {}",
-                        ns.r#type.clone(),
-                        ns.path.clone()
+                        &ns.typ().to_string(),
+                        ns_path.display()
                     );
-                    error!(logger, "error is : {:?}", e);
+                    error!(logger, "error is : {:?}", e)
+                })?,
+            };
 
-                    e
-                })?;
-
-            return Ok(PidNs::new(true, Some(fd)));
+            return Ok(PidNs::new(true, Some(fd.into_raw_fd())));
         }
     }
 
@@ -1299,25 +1528,34 @@ fn get_pid_namespace(logger: &Logger, linux: &Linux) -> Result<PidNs> {
 
 fn is_userns_enabled(linux: &Linux) -> bool {
     linux
-        .namespaces
+        .namespaces()
+        .clone()
+        .unwrap_or_default()
         .iter()
-        .any(|ns| ns.r#type == "user" && ns.path.is_empty())
+        .any(|ns| &ns.typ().to_string() == "user" && ns.path().is_none())
 }
 
 fn get_namespaces(linux: &Linux) -> Vec<LinuxNamespace> {
     linux
-        .namespaces
+        .namespaces()
+        .clone()
+        .unwrap_or_default()
         .iter()
-        .map(|ns| LinuxNamespace {
-            r#type: ns.r#type.clone(),
-            path: ns.path.clone(),
+        .map(|ns| {
+            let mut namespace = LinuxNamespace::default();
+            namespace.set_typ(ns.typ());
+            namespace.set_path(ns.path().clone());
+
+            namespace
         })
         .collect()
 }
 
-pub fn setup_child_logger(fd: RawFd, child_logger: Logger) -> tokio::task::JoinHandle<()> {
+pub fn setup_child_logger(
+    log_file_stream: PipeStream,
+    child_logger: Logger,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let log_file_stream = PipeStream::from_fd(fd);
         let buf_reader_stream = tokio::io::BufReader::new(log_file_stream);
         let mut lines = buf_reader_stream.lines();
 
@@ -1352,8 +1590,11 @@ async fn join_namespaces(
 ) -> Result<()> {
     let logger = logger.new(o!("action" => "join-namespaces"));
 
-    let linux = spec.linux.as_ref().unwrap();
-    let res = linux.resources.as_ref();
+    let linux = spec
+        .linux()
+        .as_ref()
+        .ok_or_else(|| anyhow!("Spec didn't contain linux field"))?;
+    let res = linux.resources().as_ref();
 
     let userns = is_userns_enabled(linux);
 
@@ -1391,17 +1632,11 @@ async fn join_namespaces(
 
     if userns {
         info!(logger, "setup uid/gid mappings");
+        let uid_mappings = linux.uid_mappings().clone().unwrap_or_default();
+        let gid_mappings = linux.gid_mappings().clone().unwrap_or_default();
         // setup uid/gid mappings
-        write_mappings(
-            &logger,
-            &format!("/proc/{}/uid_map", p.pid),
-            &linux.uid_mappings,
-        )?;
-        write_mappings(
-            &logger,
-            &format!("/proc/{}/gid_map", p.pid),
-            &linux.gid_mappings,
-        )?;
+        write_mappings(&logger, &format!("/proc/{}/uid_map", p.pid), &uid_mappings)?;
+        write_mappings(&logger, &format!("/proc/{}/gid_map", p.pid), &gid_mappings)?;
     }
 
     // apply cgroups
@@ -1412,9 +1647,11 @@ async fn join_namespaces(
         cm.apply(p.pid)?;
     }
 
-    if p.init && res.is_some() {
-        info!(logger, "set properties to cgroups!");
-        cm.set(res.unwrap(), false)?;
+    if p.init {
+        if let Some(resource) = res {
+            info!(logger, "set properties to cgroups!");
+            cm.set(resource, false)?;
+        }
     }
 
     info!(logger, "notify child to continue");
@@ -1431,10 +1668,13 @@ async fn join_namespaces(
         // * should be executed during the start operation, and before the container command is executed
         // * the executable file is in agent namespace
         // * should also be executed in agent namespace.
-        if let Some(hooks) = spec.hooks.as_ref() {
+        if let Some(hooks) = spec.hooks().as_ref() {
             info!(logger, "guest Prestart hook");
             let mut hook_states = HookStates::new();
-            hook_states.execute_hooks(&hooks.prestart, Some(st.clone()))?;
+            hook_states.execute_hooks(
+                hooks.prestart().clone().unwrap_or_default().as_slice(),
+                Some(st.clone()),
+            )?;
         }
 
         // notify child run prestart hooks completed
@@ -1451,19 +1691,17 @@ async fn join_namespaces(
 fn write_mappings(logger: &Logger, path: &str, maps: &[LinuxIdMapping]) -> Result<()> {
     let data = maps
         .iter()
-        .filter(|m| m.size != 0)
-        .map(|m| format!("{} {} {}\n", m.container_id, m.host_id, m.size))
+        .filter(|m| m.size() != 0)
+        .map(|m| format!("{} {} {}\n", m.container_id(), m.host_id(), m.size()))
         .collect::<Vec<_>>()
         .join("");
 
     info!(logger, "mapping: {}", data);
     if !data.is_empty() {
         let fd = fcntl::open(path, OFlag::O_WRONLY, Mode::empty())?;
-        defer!(unistd::close(fd).unwrap());
-        unistd::write(fd, data.as_bytes()).map_err(|e| {
-            info!(logger, "cannot write mapping");
-            e
-        })?;
+        // OwnedFd will be automatically closed when dropped
+        unistd::write(&fd, data.as_bytes())
+            .inspect_err(|_| info!(logger, "cannot write mapping"))?;
     }
     Ok(())
 }
@@ -1494,6 +1732,7 @@ impl LinuxContainer {
     pub fn new<T: Into<String> + Display + Clone>(
         id: T,
         base: T,
+        devcg_info: Option<Arc<RwLock<DevicesCgroupInfo>>>,
         config: Config,
         logger: &Logger,
     ) -> Result<Self> {
@@ -1509,7 +1748,7 @@ impl LinuxContainer {
                 return anyhow!(e).context(format!("container {} already exists", id.as_str()));
             }
 
-            anyhow!(e).context(format!("fail to create container directory {}", root))
+            anyhow!(e).context(format!("fail to create container directory {root}"))
         })?;
 
         unistd::chown(
@@ -1517,37 +1756,36 @@ impl LinuxContainer {
             Some(unistd::getuid()),
             Some(unistd::getgid()),
         )
-        .context(format!("Cannot change owner of container {} root", id))?;
+        .context(format!("Cannot change owner of container {id} root"))?;
 
         let spec = config.spec.as_ref().unwrap();
-        let linux = spec.linux.as_ref().unwrap();
+        let linux_cgroups_path = spec
+            .linux()
+            .as_ref()
+            .unwrap()
+            .cgroups_path()
+            .as_ref()
+            .map_or(String::new(), |cgrp| cgrp.display().to_string());
         let cpath = if config.use_systemd_cgroup {
-            if linux.cgroups_path.len() == 2 {
+            if linux_cgroups_path.len() == 2 {
                 format!("system.slice:kata_agent:{}", id.as_str())
             } else {
-                linux.cgroups_path.clone()
+                linux_cgroups_path.clone()
             }
-        } else if linux.cgroups_path.is_empty() {
+        } else if linux_cgroups_path.is_empty() {
             format!("/{}", id.as_str())
         } else {
             // if we have a systemd cgroup path we need to convert it to a fs cgroup path
-            linux.cgroups_path.replace(':', "/")
+            linux_cgroups_path.replace(':', "/")
         };
 
-        let cgroup_manager: Box<dyn Manager + Send + Sync> = if config.use_systemd_cgroup {
-            Box::new(SystemdManager::new(cpath.as_str()).map_err(|e| {
-                anyhow!(format!(
-                    "fail to create cgroup manager with path {}: {:}",
-                    cpath, e
-                ))
-            })?)
+        let cgroup_manager: Arc<dyn Manager + Send + Sync> = if config.use_systemd_cgroup {
+            Arc::new(SystemdManager::new(cpath.as_str()).context("Create systemd manager")?)
         } else {
-            Box::new(FsManager::new(cpath.as_str()).map_err(|e| {
-                anyhow!(format!(
-                    "fail to create cgroup manager with path {}: {:}",
-                    cpath, e
-                ))
-            })?)
+            Arc::new(
+                FsManager::new(cpath.as_str(), spec, devcg_info)
+                    .context("Create cgroupfs manager")?,
+            )
         };
         info!(logger, "new cgroup_manager {:?}", &cgroup_manager);
 
@@ -1567,15 +1805,8 @@ impl LinuxContainer {
                 .unwrap()
                 .as_secs(),
             logger: logger.new(o!("module" => "rustjail", "subsystem" => "container", "cid" => id)),
-            #[cfg(feature = "standard-oci-runtime")]
-            console_socket: Path::new("").to_path_buf(),
+            pinned_namespace_fds: HashMap::new(),
         })
-    }
-
-    #[cfg(feature = "standard-oci-runtime")]
-    pub fn set_console_socket(&mut self, console_socket: &Path) -> Result<()> {
-        self.console_socket = console_socket.to_path_buf();
-        Ok(())
     }
 }
 
@@ -1611,11 +1842,19 @@ mod tests {
     use super::*;
     use crate::process::Process;
     use nix::unistd::Uid;
+    use oci::{
+        LinuxBuilder, LinuxDeviceCgroupBuilder, LinuxNamespaceBuilder, LinuxResourcesBuilder, Root,
+        SpecBuilder,
+    };
+    use oci_spec::runtime as oci;
     use std::fs;
     use std::os::unix::fs::MetadataExt;
     use std::os::unix::io::AsRawFd;
+    use std::time::UNIX_EPOCH;
     use tempfile::tempdir;
     use test_utils::skip_if_not_root;
+
+    const CGROUP_PARENT: &str = "kata.agent.test.k8s.io";
 
     fn sl() -> slog::Logger {
         slog_scope::logger()
@@ -1643,20 +1882,33 @@ mod tests {
     fn test_set_stdio_permissions() {
         skip_if_not_root!();
 
-        let meta = fs::metadata("/dev/stdin").unwrap();
-        let old_uid = meta.uid();
+        let null_rdev = fs::metadata("/dev/null").unwrap().rdev();
+        let fds = [
+            std::io::stdin().as_raw_fd(),
+            std::io::stdout().as_raw_fd(),
+            std::io::stderr().as_raw_fd(),
+        ];
+
+        // SAFETY: the stdio fds stay open for the duration of the test.
+        let old_uid = stat::fstat(unsafe { BorrowedFd::borrow_raw(fds[0]) })
+            .unwrap()
+            .st_uid;
 
         let uid = 1000;
         set_stdio_permissions(Uid::from_raw(uid)).unwrap();
 
-        let meta = fs::metadata("/dev/stdin").unwrap();
-        assert_eq!(meta.uid(), uid);
-
-        let meta = fs::metadata("/dev/stdout").unwrap();
-        assert_eq!(meta.uid(), uid);
-
-        let meta = fs::metadata("/dev/stderr").unwrap();
-        assert_eq!(meta.uid(), uid);
+        // Check the stdio fds themselves rather than the /dev/std* paths:
+        // the fds may not point at those nodes (e.g. when stdio is
+        // redirected), which is also why set_stdio_permissions operates on
+        // the fds. Mirror its skipping of /dev/null backed fds.
+        for fd in &fds {
+            // SAFETY: the stdio fds stay open for the duration of the test.
+            let stat = stat::fstat(unsafe { BorrowedFd::borrow_raw(*fd) }).unwrap();
+            if stat.st_rdev == null_rdev {
+                continue;
+            }
+            assert_eq!(stat.st_uid, uid);
+        }
 
         // restore the uid
         set_stdio_permissions(Uid::from_raw(old_uid)).unwrap();
@@ -1676,10 +1928,10 @@ mod tests {
         let ns = NAMESPACES.get("pid");
         assert!(ns.is_some());
 
-        let ns = NAMESPACES.get("network");
+        let ns = NAMESPACES.get("net");
         assert!(ns.is_some());
 
-        let ns = NAMESPACES.get("mount");
+        let ns = NAMESPACES.get("mnt");
         assert!(ns.is_some());
 
         let ns = NAMESPACES.get("uts");
@@ -1694,36 +1946,107 @@ mod tests {
         lazy_static::initialize(&TYPETONAME);
         assert_eq!(TYPETONAME.len(), 7);
 
-        let ns = TYPETONAME.get("user");
+        let ns = TYPETONAME.get(&oci::LinuxNamespaceType::User);
         assert!(ns.is_some());
 
-        let ns = TYPETONAME.get("ipc");
+        let ns = TYPETONAME.get(&oci::LinuxNamespaceType::Ipc);
         assert!(ns.is_some());
 
-        let ns = TYPETONAME.get("pid");
+        let ns = TYPETONAME.get(&oci::LinuxNamespaceType::Pid);
         assert!(ns.is_some());
 
-        let ns = TYPETONAME.get("network");
+        let ns = TYPETONAME.get(&oci::LinuxNamespaceType::Network);
         assert!(ns.is_some());
 
-        let ns = TYPETONAME.get("mount");
+        let ns = TYPETONAME.get(&oci::LinuxNamespaceType::Mount);
         assert!(ns.is_some());
 
-        let ns = TYPETONAME.get("uts");
+        let ns = TYPETONAME.get(&oci::LinuxNamespaceType::Uts);
         assert!(ns.is_some());
 
-        let ns = TYPETONAME.get("cgroup");
+        let ns = TYPETONAME.get(&oci::LinuxNamespaceType::Cgroup);
         assert!(ns.is_some());
     }
 
-    fn create_dummy_opts() -> CreateOpts {
-        let mut root = oci::Root::default();
-        root.path = "/tmp".to_string();
+    #[test]
+    fn test_update_namespaces_pins_namespace_fds() {
+        let mount_namespace = LinuxNamespaceBuilder::default()
+            .typ(oci::LinuxNamespaceType::Mount)
+            .build()
+            .unwrap();
+        let mut spec = SpecBuilder::default()
+            .linux(
+                LinuxBuilder::default()
+                    .namespaces(vec![mount_namespace])
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+            .unwrap();
+        let mut pinned_namespace_fds = HashMap::new();
 
-        let linux = Linux::default();
-        let mut spec = Spec::default();
-        spec.root = Some(root).into();
-        spec.linux = Some(linux).into();
+        update_namespaces(
+            &sl(),
+            &mut spec,
+            std::process::id() as RawFd,
+            &mut pinned_namespace_fds,
+        )
+        .unwrap();
+
+        let namespace = &spec
+            .linux()
+            .as_ref()
+            .unwrap()
+            .namespaces()
+            .as_ref()
+            .unwrap()[0];
+        let pinned_path = namespace.path().as_ref().unwrap();
+        let agent_pid = std::process::id();
+        assert!(pinned_path.starts_with(format!("/proc/{agent_pid}/fd")));
+        assert_eq!(pinned_namespace_fds.len(), 1);
+        assert_eq!(
+            fs::metadata(pinned_path).unwrap().ino(),
+            fs::metadata("/proc/self/ns/mnt").unwrap().ino()
+        );
+    }
+
+    fn create_dummy_opts() -> CreateOpts {
+        let start = SystemTime::now();
+        let since_the_epoch = start
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards");
+
+        let mut root = Root::default();
+        root.set_path(String::from("/tmp").into());
+
+        let linux_resources = LinuxResourcesBuilder::default()
+            .devices(vec![LinuxDeviceCgroupBuilder::default()
+                .allow(true)
+                .typ(oci::LinuxDeviceType::C)
+                .access("rwm")
+                .build()
+                .unwrap()])
+            .build()
+            .unwrap();
+
+        let cgroups_path = format!(
+            "/{}/dummycontainer{}",
+            CGROUP_PARENT,
+            since_the_epoch.as_micros()
+        );
+
+        let mut spec = SpecBuilder::default()
+            .linux(
+                LinuxBuilder::default()
+                    .cgroups_path(cgroups_path)
+                    .resources(linux_resources)
+                    .build()
+                    .unwrap(),
+            )
+            .root(root)
+            .build()
+            .unwrap();
+        spec.set_process(None);
 
         CreateOpts {
             cgroup_name: "".to_string(),
@@ -1733,6 +2056,7 @@ mod tests {
             spec: Some(spec),
             rootless_euid: false,
             rootless_cgroup: false,
+            container_name: "".to_string(),
         }
     }
 
@@ -1746,7 +2070,8 @@ mod tests {
         (
             LinuxContainer::new(
                 "some_id",
-                &dir.path().join("rootfs").to_str().unwrap(),
+                dir.path().join("rootfs").to_str().unwrap(),
+                None,
                 create_dummy_opts(),
                 &slog_scope::logger(),
             ),
@@ -1776,9 +2101,10 @@ mod tests {
     #[test]
     fn test_linuxcontainer_pause() {
         let ret = new_linux_container_and_then(|mut c: LinuxContainer| {
-            c.cgroup_manager = Box::new(FsManager::new("").map_err(|e| {
-                anyhow!(format!("fail to create cgroup manager with path: {:}", e))
-            })?);
+            c.cgroup_manager =
+                Arc::new(FsManager::new("", &Spec::default(), None).map_err(|e| {
+                    anyhow!(format!("fail to create cgroup manager with path: {:}", e))
+                })?);
             c.pause().map_err(|e| anyhow!(e))
         });
 
@@ -1800,9 +2126,10 @@ mod tests {
     #[test]
     fn test_linuxcontainer_resume() {
         let ret = new_linux_container_and_then(|mut c: LinuxContainer| {
-            c.cgroup_manager = Box::new(FsManager::new("").map_err(|e| {
-                anyhow!(format!("fail to create cgroup manager with path: {:}", e))
-            })?);
+            c.cgroup_manager =
+                Arc::new(FsManager::new("", &Spec::default(), None).map_err(|e| {
+                    anyhow!(format!("fail to create cgroup manager with path: {:}", e))
+                })?);
             // Change status to paused, this way we can resume it
             c.status.transition(ContainerState::Paused);
             c.resume().map_err(|e| anyhow!(e))
@@ -1825,7 +2152,14 @@ mod tests {
     #[test]
     fn test_linuxcontainer_oci_state_no_root_parent() {
         let ret = new_linux_container_and_then(|mut c: LinuxContainer| {
-            c.config.spec.as_mut().unwrap().root.as_mut().unwrap().path = "/".to_string();
+            c.config
+                .spec
+                .as_mut()
+                .unwrap()
+                .root_mut()
+                .as_mut()
+                .unwrap()
+                .set_path("/".to_string().into());
             c.oci_state()
         });
         assert!(ret.is_err(), "Expecting Err, Got {:?}", ret);
@@ -1868,13 +2202,14 @@ mod tests {
         });
     }
 
-    #[test]
-    fn test_linuxcontainer_get_process() {
+    #[tokio::test]
+    async fn test_linuxcontainer_get_process() {
         let _ = new_linux_container_and_then(|mut c: LinuxContainer| {
-            c.processes.insert(
-                1,
-                Process::new(&sl(), &oci::Process::default(), "123", true, 1).unwrap(),
-            );
+            let process =
+                Process::new(&sl(), &oci::Process::default(), "123", true, 1, None).unwrap();
+            let exec_id = process.exec_id.clone();
+            c.processes.insert(exec_id, process);
+
             let p = c.get_process("123");
             assert!(p.is_ok(), "Expecting Ok, Got {:?}", p);
             Ok(())
@@ -1898,21 +2233,25 @@ mod tests {
     #[tokio::test]
     async fn test_linuxcontainer_start() {
         let (c, _dir) = new_linux_container();
+        let mut oci_process = oci::Process::default();
+        oci_process.set_capabilities(None);
         let ret = c
             .unwrap()
-            .start(Process::new(&sl(), &oci::Process::default(), "123", true, 1).unwrap())
+            .start(Process::new(&sl(), &oci_process, "123", true, 1, None).unwrap())
             .await;
-        assert!(ret.is_err(), "Expecting Err, Got {:?}", ret);
+        assert!(format!("{:?}", ret).contains("no process config"));
     }
 
     #[tokio::test]
     async fn test_linuxcontainer_run() {
         let (c, _dir) = new_linux_container();
+        let mut oci_process = oci::Process::default();
+        oci_process.set_capabilities(None);
         let ret = c
             .unwrap()
-            .run(Process::new(&sl(), &oci::Process::default(), "123", true, 1).unwrap())
+            .run(Process::new(&sl(), &oci_process, "123", true, 1, None).unwrap())
             .await;
-        assert!(ret.is_err(), "Expecting Err, Got {:?}", ret);
+        assert!(format!("{:?}", ret).contains("no process config"));
     }
 
     #[tokio::test]

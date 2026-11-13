@@ -7,14 +7,18 @@ package virtcontainers
 
 import (
 	"context"
-	"fmt"
+	"encoding/json"
 	"net"
+	"os"
 	"reflect"
 	"testing"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/containernetworking/plugins/pkg/ns"
 	ktu "github.com/kata-containers/kata-containers/src/runtime/pkg/katatestutils"
 	pbTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/agent/protocols"
+	vctypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/vishvananda/netlink"
@@ -77,7 +81,7 @@ func TestGenerateInterfacesAndRoutes(t *testing.T) {
 	assert.Nil(t, err)
 	nns.SetEndpoints(endpoints)
 
-	resInterfaces, resRoutes, resNeighs, err := generateVCNetworkStructures(context.Background(), nns)
+	resInterfaces, resRoutes, resNeighs, err := generateVCNetworkStructures(context.Background(), nns.Endpoints())
 
 	//
 	// Build expected results:
@@ -106,10 +110,6 @@ func TestGenerateInterfacesAndRoutes(t *testing.T) {
 			Lladdr:      "6a:92:3a:59:70:aa",
 			ToIPAddress: &pbTypes.IPAddress{Address: "192.168.0.101", Family: utils.ConvertAddressFamily(netlink.FAMILY_V4)},
 		},
-	}
-
-	for _, r := range resRoutes {
-		fmt.Printf("resRoute: %+v\n", r)
 	}
 
 	assert.Nil(t, err, "unexpected failure when calling generateKataInterfacesAndRoutes")
@@ -326,4 +326,291 @@ func TestTxRateLimiter(t *testing.T) {
 	// Remove the veth created for testing.
 	err = netHandle.LinkDel(link)
 	assert.NoError(err)
+}
+
+func TestConvertDanDeviceToNetworkInfo(t *testing.T) {
+
+	jsonData, err := os.ReadFile("testdata/dan-config.json")
+	assert.NoError(t, err)
+	var config vctypes.DanConfig
+	err = json.Unmarshal([]byte(jsonData), &config)
+	assert.NoError(t, err)
+
+	ni, err := convertDanDeviceToNetworkInfo(&config.Devices[0])
+	assert.NoError(t, err)
+	assert.Equal(t, 1500, ni.Iface.MTU)
+
+	assert.Len(t, ni.Addrs, 1)
+	assert.Equal(t, "10.10.0.5/24", ni.Addrs[0].String())
+
+	dest, _ := netlink.ParseIPNet("10.10.0.0/16")
+	dest.IP = dest.IP.To4()
+	routes := []netlink.Route{
+		{Family: unix.AF_INET, Dst: nil, Gw: net.ParseIP("10.0.0.1"), Src: nil, Scope: 0},
+		{Family: unix.AF_INET, Dst: dest, Gw: net.ParseIP("10.0.0.1"), Src: nil, Scope: 0},
+	}
+	assert.Equal(t, routes, ni.Routes)
+
+	neighMac, _ := net.ParseMAC("0a:58:0a:0a:0a:0a")
+	neigh := netlink.Neigh{
+		HardwareAddr: neighMac,
+		IP:           net.ParseIP("10.10.10.10"),
+	}
+	assert.Len(t, ni.Neighbors, 1)
+	assert.Equal(t, neigh, ni.Neighbors[0])
+}
+
+func TestAddEndpoints_Dan(t *testing.T) {
+
+	network := &LinuxNetwork{
+		netNSPath:         "net-123",
+		eps:               []Endpoint{},
+		interworkingModel: NetXConnectDefaultModel,
+		netNSCreated:      true,
+		danConfigPath:     "testdata/dan-config.json",
+	}
+
+	ctx := context.TODO()
+	eps, err := network.AddEndpoints(ctx, nil, nil, true)
+	assert.NoError(t, err)
+	assert.Len(t, eps, 1)
+
+	ep := eps[0]
+	assert.Equal(t, ep.Name(), "eth0")
+	assert.Equal(t, ep.HardwareAddr(), "0a:58:0a:0a:00:05")
+	assert.Equal(t, ep.Type(), VfioEndpointType)
+	assert.Equal(t, ep.PciPath().String(), "")
+}
+
+func TestValidGuestNeighbor(t *testing.T) {
+	assert := assert.New(t)
+
+	// Setup gateway set with a known gateway IP
+	gatewaySet := map[string]struct{}{
+		"10.0.0.1": {},
+	}
+
+	neighborMAC, _ := net.ParseMAC("aa:bb:cc:dd:ee:ff")
+
+	tests := []struct {
+		name     string
+		neighbor netlink.Neigh
+		gateways map[string]struct{}
+		expected bool
+		desc     string
+	}{
+		{
+			name: "PermanentNeighborAlwaysValid",
+			neighbor: netlink.Neigh{
+				IP:           net.ParseIP("192.168.1.1"),
+				HardwareAddr: neighborMAC,
+				State:        netlink.NUD_PERMANENT,
+			},
+			gateways: gatewaySet,
+			expected: true,
+			desc:     "PERMANENT neighbors should always be included regardless of gateway status",
+		},
+		{
+			name: "NonPermanentGatewayReachable",
+			neighbor: netlink.Neigh{
+				IP:           net.ParseIP("10.0.0.1"),
+				HardwareAddr: neighborMAC,
+				State:        netlink.NUD_REACHABLE,
+			},
+			gateways: gatewaySet,
+			expected: true,
+			desc:     "Non-PERMANENT gateway neighbor in REACHABLE state should be included",
+		},
+		{
+			name: "NonPermanentGatewayNotReachable",
+			neighbor: netlink.Neigh{
+				IP:           net.ParseIP("10.0.0.1"),
+				HardwareAddr: neighborMAC,
+				State:        netlink.NUD_STALE,
+			},
+			gateways: gatewaySet,
+			expected: false,
+			desc:     "Non-PERMANENT gateway neighbor in STALE state should be filtered out",
+		},
+		{
+			name: "NonPermanentNonGateway",
+			neighbor: netlink.Neigh{
+				IP:           net.ParseIP("192.168.1.1"),
+				HardwareAddr: neighborMAC,
+				State:        netlink.NUD_REACHABLE,
+			},
+			gateways: gatewaySet,
+			expected: false,
+			desc:     "Non-PERMANENT non-gateway neighbor should be filtered out even if REACHABLE",
+		},
+		{
+			name: "MissingHardwareAddr",
+			neighbor: netlink.Neigh{
+				IP:    net.ParseIP("10.0.0.1"),
+				State: netlink.NUD_REACHABLE,
+			},
+			gateways: gatewaySet,
+			expected: false,
+			desc:     "Any neighbor without a MAC address should be filtered out",
+		},
+		{
+			name: "PermanentNeighborWithoutMAC",
+			neighbor: netlink.Neigh{
+				IP:    net.ParseIP("10.0.0.1"),
+				State: netlink.NUD_PERMANENT,
+			},
+			gateways: gatewaySet,
+			expected: false,
+			desc:     "Even PERMANENT neighbors need a MAC address",
+		},
+		{
+			name: "OtherTransientStateAsGateway",
+			neighbor: netlink.Neigh{
+				IP:           net.ParseIP("10.0.0.1"),
+				HardwareAddr: neighborMAC,
+				State:        netlink.NUD_DELAY,
+			},
+			gateways: gatewaySet,
+			expected: false,
+			desc:     "Transient states like DELAY should be filtered even for gateways",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			result := validGuestNeighbor(tc.neighbor, tc.gateways)
+			assert.Equal(tc.expected, result, tc.desc)
+		})
+	}
+}
+
+func TestGatewaySetFromRoutes(t *testing.T) {
+	assert := assert.New(t)
+
+	gwIPv4 := net.ParseIP("10.0.0.1")
+	gwIPv6 := net.ParseIP("fe80::1")
+	nonGwIP := net.ParseIP("192.168.1.1")
+
+	tests := []struct {
+		name             string
+		routes           []netlink.Route
+		expectedGateways map[string]struct{}
+		desc             string
+	}{
+		{
+			name: "DefaultRouteIPv4",
+			routes: []netlink.Route{
+				{
+					Dst: nil, // nil destination means default route
+					Gw:  gwIPv4,
+				},
+			},
+			expectedGateways: map[string]struct{}{
+				"10.0.0.1": {},
+			},
+			desc: "IPv4 default route (nil destination) should add gateway to set",
+		},
+		{
+			name: "DefaultRouteIPv6",
+			routes: []netlink.Route{
+				{
+					Dst: nil,
+					Gw:  gwIPv6,
+				},
+			},
+			expectedGateways: map[string]struct{}{
+				"fe80::1": {},
+			},
+			desc: "IPv6 default route (nil destination) should add gateway to set",
+		},
+		{
+			name: "ExplicitDefaultRouteIPv4",
+			routes: []netlink.Route{
+				{
+					Dst: &net.IPNet{
+						IP:   net.IPv4(0, 0, 0, 0),
+						Mask: net.CIDRMask(0, 32),
+					},
+					Gw: gwIPv4,
+				},
+			},
+			expectedGateways: map[string]struct{}{
+				"10.0.0.1": {},
+			},
+			desc: "Explicit IPv4 default route (0.0.0.0/0) should add gateway to set",
+		},
+		{
+			name: "ExplicitDefaultRouteIPv6",
+			routes: []netlink.Route{
+				{
+					Dst: &net.IPNet{
+						IP:   net.ParseIP("::"),
+						Mask: net.CIDRMask(0, 128),
+					},
+					Gw: gwIPv6,
+				},
+			},
+			expectedGateways: map[string]struct{}{
+				"fe80::1": {},
+			},
+			desc: "Explicit IPv6 default route (::/0) should add gateway to set",
+		},
+		{
+			name: "NonDefaultRouteFiltered",
+			routes: []netlink.Route{
+				{
+					Dst: &net.IPNet{
+						IP:   net.IPv4(172, 16, 0, 0),
+						Mask: net.CIDRMask(16, 32),
+					},
+					Gw: nonGwIP,
+				},
+			},
+			expectedGateways: map[string]struct{}{},
+			desc:             "Non-default routes should not add gateway to set",
+		},
+		{
+			name: "RouteWithoutGateway",
+			routes: []netlink.Route{
+				{
+					Dst: nil,
+					Gw:  nil,
+				},
+			},
+			expectedGateways: map[string]struct{}{},
+			desc:             "Routes without a gateway should be skipped",
+		},
+		{
+			name: "MultipleDefaultRoutes",
+			routes: []netlink.Route{
+				{
+					Dst: nil,
+					Gw:  gwIPv4,
+				},
+				{
+					Dst: nil,
+					Gw:  gwIPv6,
+				},
+				{
+					Dst: &net.IPNet{
+						IP:   net.IPv4(172, 16, 0, 0),
+						Mask: net.CIDRMask(16, 32),
+					},
+					Gw: nonGwIP,
+				},
+			},
+			expectedGateways: map[string]struct{}{
+				"10.0.0.1": {},
+				"fe80::1":  {},
+			},
+			desc: "Multiple default routes should populate the set; non-default routes should be ignored",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			result := gatewaySetFromRoutes(tc.routes)
+			assert.Equal(tc.expectedGateways, result, tc.desc)
+		})
+	}
 }

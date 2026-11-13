@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"testing"
@@ -17,6 +18,8 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 )
+
+const denylistModuleConf = "/etc/modprobe.d/denylist-kata-kernel-modules.conf"
 
 func setupCheckHostIsVMContainerCapable(assert *assert.Assertions, cpuInfoFile string, cpuData []testCPUData, moduleData []testModuleData) {
 	createModules(assert, cpuInfoFile, moduleData)
@@ -52,18 +55,17 @@ func TestCCCheckCLIFunction(t *testing.T) {
 	var moduleData []testModuleData
 
 	cpuType = getCPUtype()
-	if cpuType == cpuTypeIntel {
+	moduleData = []testModuleData{}
+
+	switch cpuType {
+	case cpuTypeIntel:
 		cpuData = []testCPUData{
 			{archGenuineIntel, "lm vmx sse4_1", false},
 		}
-
-		moduleData = []testModuleData{}
-	} else if cpuType == cpuTypeAMD {
+	case cpuTypeAMD:
 		cpuData = []testCPUData{
 			{archAuthenticAMD, "lm svm sse4_1", false},
 		}
-
-		moduleData = []testModuleData{}
 	}
 
 	genericCheckCLIFunction(t, cpuData, moduleData)
@@ -271,8 +273,10 @@ func TestCheckHostIsVMContainerCapable(t *testing.T) {
 
 	var cpuData []testCPUData
 	var moduleData []testModuleData
+	cpuType = getCPUtype()
 
-	if cpuType == cpuTypeIntel {
+	switch cpuType {
+	case cpuTypeIntel:
 		cpuData = []testCPUData{
 			{"", "", true},
 			{"Intel", "", true},
@@ -288,7 +292,7 @@ func TestCheckHostIsVMContainerCapable(t *testing.T) {
 			{filepath.Join(sysModuleDir, "kvm_intel/parameters/nested"), "Y", false},
 			{filepath.Join(sysModuleDir, "kvm_intel/parameters/unrestricted_guest"), "Y", false},
 		}
-	} else if cpuType == cpuTypeAMD {
+	case cpuTypeAMD:
 		cpuData = []testCPUData{
 			{"", "", true},
 			{"AMD", "", true},
@@ -321,6 +325,39 @@ func TestCheckHostIsVMContainerCapable(t *testing.T) {
 
 	err = hostIsVMContainerCapable(details)
 	assert.Nil(err)
+
+	// Remove required kernel modules and add them to denylist
+	denylistFile, err := os.Create(denylistModuleConf)
+	assert.Nil(err)
+	succeedToRemoveOneModule := false
+	for mod := range archRequiredKernelModules {
+		cmd := exec.Command(modProbeCmd, "-r", mod)
+		if output, err := cmd.CombinedOutput(); err == nil {
+			succeedToRemoveOneModule = true
+		} else {
+			kataLog.WithField("output", string(output)).Warn("failed to remove module")
+		}
+		// Write the following into the denylist file
+		// blacklist <mod>
+		// install <mod> /bin/false
+		_, err = fmt.Fprintf(denylistFile, "blacklist %s\ninstall %s /bin/false\n", mod, mod)
+		assert.Nil(err)
+	}
+	denylistFile.Close()
+	assert.True(succeedToRemoveOneModule)
+
+	defer func() {
+		os.Remove(denylistModuleConf)
+		// reload removed modules
+		for mod := range archRequiredKernelModules {
+			cmd := exec.Command(modProbeCmd, mod)
+			if output, err := cmd.CombinedOutput(); err == nil {
+				kataLog.WithField("output", string(output)).Info("module loaded")
+			} else {
+				kataLog.WithField("output", string(output)).Warn("failed to load module")
+			}
+		}
+	}()
 
 	// remove the modules to force a failure
 	err = os.RemoveAll(sysModuleDir)
@@ -468,9 +505,10 @@ func TestSetCPUtype(t *testing.T) {
 	assert.NotEmpty(archRequiredKernelModules)
 
 	cpuType = getCPUtype()
-	if cpuType == cpuTypeIntel {
+	switch cpuType {
+	case cpuTypeIntel:
 		assert.Equal(archRequiredCPUFlags["vmx"], "Virtualization support")
-	} else if cpuType == cpuTypeAMD {
+	case cpuTypeAMD:
 		assert.Equal(archRequiredCPUFlags["svm"], "Virtualization support")
 	}
 

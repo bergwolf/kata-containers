@@ -8,8 +8,9 @@ kind: Pod
 metadata:
   name: besteffort-test
 spec:
-  terminationGracePeriodSeconds: 0
   runtimeClassName: kata
+  securityContext:
+    supplementalGroups: [10]
   containers:
   - name: qos-besteffort
     image: quay.io/prometheus/busybox:latest

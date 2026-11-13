@@ -181,15 +181,72 @@ func TestQemuArchBaseCPUTopology(t *testing.T) {
 	qemuArchBase := newQemuArchBase()
 	vcpus := uint32(2)
 
+	t.Run("NonConfidentialGuest", func(t *testing.T) {
+		expectedSMP := govmmQemu.SMP{
+			CPUs:    vcpus,
+			Sockets: defaultMaxVCPUs,
+			Cores:   defaultCores,
+			Threads: defaultThreads,
+			MaxCPUs: defaultMaxVCPUs,
+		}
+
+		smp := qemuArchBase.cpuTopology(vcpus, defaultMaxVCPUs, 0, false)
+		assert.Equal(expectedSMP, smp)
+	})
+
+	t.Run("ConfidentialGuest", func(t *testing.T) {
+		// When confidential guest is enabled, MaxCPUs and Sockets are both 0 so
+		// govmmQemu omits them from -smp. QEMU then sets maxcpus=cpus (no hotplug)
+		// and infers sockets from cpus / (cores * threads).
+		expectedSMP := govmmQemu.SMP{
+			CPUs:    vcpus,
+			Sockets: 0,
+			Cores:   defaultCores,
+			Threads: defaultThreads,
+			MaxCPUs: 0,
+		}
+
+		smp := qemuArchBase.cpuTopology(vcpus, defaultMaxVCPUs, 0, true)
+		assert.Equal(expectedSMP, smp)
+	})
+}
+
+func TestQemuArchBaseCPUTopologyNUMA(t *testing.T) {
+	assert := assert.New(t)
+	qemuArchBase := newQemuArchBase()
+	vcpus := uint32(2)
+	maxvcpus := uint32(8)
+	numNUMA := uint32(2)
+
 	expectedSMP := govmmQemu.SMP{
 		CPUs:    vcpus,
-		Sockets: defaultMaxVCPUs,
-		Cores:   defaultCores,
+		Sockets: numNUMA,
+		Cores:   maxvcpus / numNUMA,
 		Threads: defaultThreads,
-		MaxCPUs: defaultMaxVCPUs,
+		MaxCPUs: maxvcpus,
 	}
 
-	smp := qemuArchBase.cpuTopology(vcpus, defaultMaxVCPUs)
+	smp := qemuArchBase.cpuTopology(vcpus, maxvcpus, numNUMA, false)
+	assert.Equal(expectedSMP, smp)
+}
+
+func TestQemuArchBaseCPUTopologyNUMAUneven(t *testing.T) {
+	assert := assert.New(t)
+	qemuArchBase := newQemuArchBase()
+	vcpus := uint32(2)
+	maxvcpus := uint32(5)
+	numNUMA := uint32(2)
+
+	coresPerSocket := (maxvcpus + numNUMA - 1) / numNUMA
+	expectedSMP := govmmQemu.SMP{
+		CPUs:    vcpus,
+		Sockets: numNUMA,
+		Cores:   coresPerSocket,
+		Threads: defaultThreads,
+		MaxCPUs: numNUMA * coresPerSocket * defaultThreads,
+	}
+
+	smp := qemuArchBase.cpuTopology(vcpus, maxvcpus, numNUMA, false)
 	assert.Equal(expectedSMP, smp)
 }
 
@@ -332,6 +389,38 @@ func TestQemuArchBaseAppendImage(t *testing.T) {
 	assert.Equal(expectedOut, devices)
 }
 
+func TestQemuArchBaseAppendNvdimmImage(t *testing.T) {
+	var devices []govmmQemu.Device
+	assert := assert.New(t)
+	qemuArchBase := newQemuArchBase()
+
+	image, err := os.CreateTemp("", "img")
+	assert.NoError(err)
+	defer image.Close()
+	defer os.Remove(image.Name())
+
+	imageStat, err := image.Stat()
+	assert.NoError(err)
+
+	devices, err = qemuArchBase.appendNvdimmImage(devices, image.Name())
+	assert.NoError(err)
+	assert.Len(devices, 1)
+
+	expectedOut := []govmmQemu.Device{
+		govmmQemu.Object{
+			Driver:   govmmQemu.NVDIMM,
+			Type:     govmmQemu.MemoryBackendFile,
+			DeviceID: "nv0",
+			ID:       "mem0",
+			MemPath:  image.Name(),
+			Size:     (uint64)(imageStat.Size()),
+			ReadOnly: true,
+		},
+	}
+
+	assert.Equal(expectedOut, devices)
+}
+
 func TestQemuArchBaseAppendBridges(t *testing.T) {
 	var devices []govmmQemu.Device
 	assert := assert.New(t)
@@ -435,6 +524,21 @@ func TestQemuArchBaseAppendBlockDevice(t *testing.T) {
 	}
 
 	testQemuArchBaseAppend(t, drive, expectedOut)
+}
+
+func TestGenericBlockDeviceDiscardUnmap(t *testing.T) {
+	assert := assert.New(t)
+
+	drive := config.BlockDrive{
+		File:         "/root",
+		Format:       "raw",
+		ID:           "blockDevTest",
+		DiscardUnmap: true,
+	}
+
+	blockDevice, err := genericBlockDevice(drive, false)
+	assert.NoError(err)
+	assert.True(blockDevice.DiscardUnmap)
 }
 
 func TestQemuArchBaseAppendVhostUserDevice(t *testing.T) {

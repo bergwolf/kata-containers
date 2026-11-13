@@ -16,13 +16,15 @@ the installation has been successful.
 This installation guide has only been verified under a Minikube Linux installation, using the
 [`kvm2`](https://minikube.sigs.k8s.io/docs/drivers/kvm2/) driver.
 
-> **Notes:**
-> - This installation guide may not work for macOS installations of Minikube, due to the lack of
-nested virtualization support on that platform.
-> - This installation guide has not been tested on a Windows installation.
-> - Kata under Minikube does not currently support Kata Firecracker (`kata-fc`).
->   Although the `kata-fc` binary will be installed as part of these instructions,
->   via `kata-deploy`, pods cannot be launched with `kata-fc`, and will fail to start.
+!!! note "Platform support"
+    - This installation guide may not work for macOS installations of Minikube, due to the lack of
+      nested virtualization support on that platform.
+    - This installation guide has not been tested on a Windows installation.
+    - Kata under Minikube does not currently support Kata Firecracker (`kata-fc`).
+      These instructions do not install it — `kata-deploy` only enables the
+      Firecracker shim when you ask for it with
+      [`try-kata-fc.values.yaml`](../helm-configuration.md#try-kata-fcvaluesyaml) —
+      and pods launched with `kata-fc` would fail to start here in any case.
 
 Before commencing installation, it is strongly recommended you read the
 [Minikube installation guide](https://kubernetes.io/docs/tasks/tools/install-minikube/).
@@ -98,53 +100,13 @@ a number larger than `0` if you have either of the `vmx` or `svm` nested virtual
 available:
 
 ```sh
-$ minikube ssh "egrep -c 'vmx|svm' /proc/cpuinfo"
+$ minikube ssh "grep -c -E 'vmx|svm' /proc/cpuinfo"
 ```
 
 ## Installing Kata Containers
 
-You can now install the Kata Containers runtime components. You will need a local copy of some Kata
-Containers components to help with this, and then use `kubectl` on the host (that Minikube has already
-configured for you) to deploy them:
-
-```sh
-$ git clone https://github.com/kata-containers/kata-containers.git
-$ cd kata-containers/tools/packaging/kata-deploy
-$ kubectl apply -f kata-rbac/base/kata-rbac.yaml
-$ kubectl apply -f kata-deploy/base/kata-deploy.yaml
-```
-
-This installs the Kata Containers components into `/opt/kata` inside the Minikube node. It can take
-a few minutes for the operation to complete. You can check the installation has worked by checking
-the status of the `kata-deploy` pod, which will be executing
-[this script](../../tools/packaging/kata-deploy/scripts/kata-deploy.sh),
-and will be executing a `sleep infinity` once it has successfully completed its work.
-You can accomplish this by running the following:
-
-```sh
-$ podname=$(kubectl -n kube-system get pods -o=name | fgrep kata-deploy | sed 's?pod/??')
-$ kubectl -n kube-system exec ${podname} -- ps -ef | fgrep infinity
-```
-
-> *NOTE:* This check only works for single node clusters, which is the default for Minikube.
-> For multi-node clusters, the check would need to be adapted to check `kata-deploy` had
-> completed on all nodes.
-
-## Enabling Kata Containers
-
-Now you have installed the Kata Containers components in the Minikube node. Next, you need to configure
-Kubernetes `RuntimeClass` to know when to use Kata Containers to run a pod.
-
-### Register the runtime
-
-Now register the `kata qemu` runtime with that class. This should result in no errors:
-
-```sh
-$ cd kata-containers/tools/packaging/kata-deploy/runtimeclasses
-$ kubectl apply -f kata-runtimeClasses.yaml
-```
-
-The Kata Containers installation process should be complete and enabled in the Minikube cluster.
+You can now install the Kata Containers runtime components
+[following the official instructions](../../tools/packaging/kata-deploy/helm-chart).
 
 ## Testing Kata Containers
 
@@ -197,7 +159,7 @@ $ minikube ssh -- uname -a
 And then compare that against the kernel that is running inside the container:
 
 ```sh
-$ podname=$(kubectl get pods -o=name | fgrep php-apache-kata-qemu | sed 's?pod/??')
+$ podname=$(kubectl get pods -o=name | grep -F php-apache-kata-qemu | sed 's?pod/??')
 $ kubectl exec ${podname} -- uname -a
 ```
 

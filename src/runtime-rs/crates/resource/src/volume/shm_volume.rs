@@ -4,85 +4,31 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use std::path::Path;
+use std::path::PathBuf;
 
+use super::Volume;
 use anyhow::Result;
 use async_trait::async_trait;
 use hypervisor::device::device_manager::DeviceManager;
+use kata_sys_util::mount::{get_mount_path, get_mount_type};
+use kata_types::mount::{kata_guest_sandbox_dir, KATA_EPHEMERAL_VOLUME_TYPE, SHM_DEVICE, SHM_DIR};
+use oci_spec::runtime as oci;
 use tokio::sync::RwLock;
-
-use super::Volume;
-use crate::share_fs::DEFAULT_KATA_GUEST_SANDBOX_DIR;
-
-pub const SHM_DIR: &str = "shm";
-// DEFAULT_SHM_SIZE is the default shm size to be used in case host
-// IPC is used.
-pub const DEFAULT_SHM_SIZE: u64 = 65536 * 1024;
-
-// KATA_EPHEMERAL_DEV_TYPE creates a tmpfs backed volume for sharing files between containers.
-pub const KATA_EPHEMERAL_DEV_TYPE: &str = "ephemeral";
 
 #[derive(Debug)]
 pub(crate) struct ShmVolume {
     mount: oci::Mount,
-    storage: Option<agent::Storage>,
 }
 
 impl ShmVolume {
-    pub(crate) fn new(m: &oci::Mount, shm_size: u64) -> Result<Self> {
-        let (storage, mount) = if shm_size > 0 {
-            // storage
-            let mount_path = Path::new(DEFAULT_KATA_GUEST_SANDBOX_DIR).join(SHM_DIR);
-            let mount_path = mount_path.to_str().unwrap();
-            let option = format!("size={}", shm_size);
+    pub(crate) fn new(m: &oci::Mount) -> Result<Self> {
+        let mut mount = oci::Mount::default();
+        mount.set_destination(m.destination().clone());
+        mount.set_typ(Some("bind".to_string()));
+        mount.set_source(Some(PathBuf::from(kata_guest_sandbox_dir()).join(SHM_DIR)));
+        mount.set_options(Some(vec!["rbind".to_string()]));
 
-            let options = vec![
-                String::from("noexec"),
-                String::from("nosuid"),
-                String::from("nodev"),
-                String::from("mode=1777"),
-                option,
-            ];
-
-            let storage = agent::Storage {
-                driver: String::from(KATA_EPHEMERAL_DEV_TYPE),
-                driver_options: Vec::new(),
-                source: String::from("shm"),
-                fs_type: String::from("tmpfs"),
-                fs_group: None,
-                options,
-                mount_point: mount_path.to_string(),
-            };
-
-            // mount
-            let mount = oci::Mount {
-                r#type: "bind".to_string(),
-                destination: m.destination.clone(),
-                source: mount_path.to_string(),
-                options: vec!["rbind".to_string()],
-            };
-
-            (Some(storage), mount)
-        } else {
-            let mount = oci::Mount {
-                r#type: "tmpfs".to_string(),
-                destination: m.destination.clone(),
-                source: "shm".to_string(),
-                options: [
-                    "noexec",
-                    "nosuid",
-                    "nodev",
-                    "mode=1777",
-                    &format!("size={}", DEFAULT_SHM_SIZE),
-                ]
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
-            };
-            (None, mount)
-        };
-
-        Ok(Self { storage, mount })
+        Ok(Self { mount })
     }
 }
 
@@ -93,17 +39,12 @@ impl Volume for ShmVolume {
     }
 
     fn get_storage(&self) -> Result<Vec<agent::Storage>> {
-        let s = if let Some(s) = self.storage.as_ref() {
-            vec![s.clone()]
-        } else {
-            vec![]
-        };
-        Ok(s)
+        Ok(vec![])
     }
 
     async fn cleanup(&self, _device_manager: &RwLock<DeviceManager>) -> Result<()> {
-        // TODO: Clean up ShmVolume
-        warn!(sl!(), "Cleaning up ShmVolume is still unimplemented.");
+        // No cleanup is required for ShmVolume because it is a mount in guest which
+        // does not require explicit unmounting or deletion in host side.
         Ok(())
     }
 
@@ -112,6 +53,27 @@ impl Volume for ShmVolume {
     }
 }
 
-pub(crate) fn is_shim_volume(m: &oci::Mount) -> bool {
-    m.destination == "/dev/shm" && m.r#type != KATA_EPHEMERAL_DEV_TYPE
+pub(crate) fn is_shm_volume(m: &oci::Mount) -> bool {
+    get_mount_path(&Some(m.destination().clone())).as_str() == SHM_DEVICE
+        && get_mount_type(m).as_str() != KATA_EPHEMERAL_VOLUME_TYPE
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kata_types::mount::DEFAULT_KATA_GUEST_SANDBOX_DIR;
+
+    #[test]
+    fn test_shm_volume_uses_guest_sandbox_path() {
+        let mut mount = oci::Mount::default();
+        mount.set_destination(PathBuf::from(SHM_DEVICE));
+
+        let volume = ShmVolume::new(&mount).unwrap();
+        let mounts = volume.get_volume_mount().unwrap();
+
+        assert_eq!(
+            mounts[0].source(),
+            &Some(PathBuf::from(DEFAULT_KATA_GUEST_SANDBOX_DIR).join(SHM_DIR))
+        );
+    }
 }

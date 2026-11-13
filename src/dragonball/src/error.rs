@@ -11,9 +11,16 @@
 
 #[cfg(target_arch = "aarch64")]
 use dbs_arch::pmu::PmuError;
+#[cfg(target_arch = "x86_64")]
+use dbs_boot::tdshim::TdvfError;
 #[cfg(feature = "dbs-virtio-devices")]
-use dbs_virtio_devices::Error as VirtIoError;
+use dbs_virtio_devices::Error as VirtioError;
 
+#[cfg(target_arch = "x86_64")]
+use tdx::launch::Error as TdxError;
+
+#[cfg(feature = "host-device")]
+use crate::device_manager::vfio_dev_mgr::VfioDeviceError;
 use crate::{address_space_manager, device_manager, resource_manager, vcpu, vm};
 
 /// Shorthand result type for internal VMM commands.
@@ -75,6 +82,15 @@ pub enum Error {
     /// Cannot open the VM file descriptor.
     #[error(transparent)]
     Vm(vm::VmError),
+
+    /// Fail to create device manager system
+    #[error("failed to create device manager system: {0}")]
+    DeviceMgrError(#[source] device_manager::DeviceMgrError),
+
+    #[cfg(target_arch = "x86_64")]
+    /// TDX related error
+    #[error("TDX error: {0}")]
+    TdxError(TdxError),
 }
 
 /// Errors associated with starting the instance.
@@ -95,6 +111,10 @@ pub enum StartMicroVmError {
     /// The start command was issued more than once.
     #[error("the virtual machine is already running")]
     MicroVMAlreadyRunning,
+
+    /// Failed to restore the virtual machine from a snapshot.
+    #[error("cannot restore the virtual machine from snapshot: {0}")]
+    RestoreMicroVm(String),
 
     /// Cannot start the VM because the kernel was not configured.
     #[error("cannot start the virtual machine without kernel configuration")]
@@ -149,7 +169,7 @@ pub enum StartMicroVmError {
     #[cfg(feature = "virtio-vsock")]
     /// Failed to create the vsock device.
     #[error("cannot create virtio-vsock device: {0}")]
-    CreateVsockDevice(#[source] VirtIoError),
+    CreateVsockDevice(#[source] VirtioError),
 
     #[cfg(feature = "virtio-vsock")]
     /// Cannot initialize a MMIO Vsock Device or add a device to the MMIO Bus.
@@ -174,17 +194,21 @@ pub enum StartMicroVmError {
     #[error("failure while connecting the upcall client: {0}")]
     UpcallConnectError(#[source] dbs_upcall::UpcallClientError),
 
-    #[cfg(feature = "virtio-blk")]
+    #[cfg(any(feature = "virtio-blk", feature = "vhost-user-blk"))]
     /// Virtio-blk errors.
     #[error("virtio-blk errors: {0}")]
     BlockDeviceError(#[source] device_manager::blk_dev_mgr::BlockDeviceError),
 
-    #[cfg(feature = "virtio-net")]
-    /// Virtio-net errors.
-    #[error("virtio-net errors: {0}")]
-    VirtioNetDeviceError(#[source] device_manager::virtio_net_dev_mgr::VirtioNetDeviceError),
+    #[cfg(any(
+        feature = "virtio-net",
+        feature = "vhost-net",
+        feature = "vhost-user-net"
+    ))]
+    /// Network device errors.
+    #[error("network device errors: {0}")]
+    NetworkDeviceError(#[source] device_manager::net_dev_mgr::NetworkDeviceError),
 
-    #[cfg(feature = "virtio-fs")]
+    #[cfg(any(feature = "virtio-fs", feature = "vhost-user-fs"))]
     /// Virtio-fs errors.
     #[error("virtio-fs errors: {0}")]
     FsDeviceError(#[source] device_manager::fs_dev_mgr::FsDeviceError),
@@ -193,6 +217,64 @@ pub enum StartMicroVmError {
     /// Virtio-balloon errors.
     #[error("virtio-balloon errors: {0}")]
     BalloonDeviceError(#[source] device_manager::balloon_dev_mgr::BalloonDeviceError),
+
+    #[cfg(feature = "virtio-rng")]
+    /// Virtio-rng errors.
+    #[error("virtio-rng errors: {0}")]
+    RngDeviceError(#[source] device_manager::rng_dev_mgr::RngDeviceError),
+    #[cfg(feature = "host-device")]
+    /// Failed to create VFIO device
+    #[error("cannot create VFIO device {0:?}")]
+    CreateVfioDevice(#[source] VfioDeviceError),
+    #[cfg(feature = "host-device")]
+    /// Failed to register DMA memory address range.
+    #[error("failure while registering DMA address range: {0:?}")]
+    RegisterDMAAddress(#[source] VfioDeviceError),
+
+    /// Cannot build seccomp filters.
+    #[error("failure while configuring seccomp filters: {0}")]
+    SeccompFilters(#[source] seccompiler::Error),
+
+    #[cfg(target_arch = "x86_64")]
+    /// Cannot enable split irqchip
+    #[error("Failed to enable split irqchip: {0}")]
+    EnableSplitIrqchip(#[source] vmm_sys_util::errno::Error),
+
+    /// Missing firmware file
+    #[error("Cannot start microvm due to missing firmware file")]
+    MissingFirmwareFile,
+
+    #[cfg(target_arch = "x86_64")]
+    /// TDVF errors
+    #[error("TDVF error: {0}")]
+    TdvfError(#[source] TdvfError),
+
+    #[cfg(target_arch = "x86_64")]
+    /// Missing tdshim section
+    #[error("Missing tdshim section: {0}")]
+    MissingTdshimSection(&'static str),
+
+    /// Guest address space not initialized
+    #[error("Guest address space not initialized")]
+    GuestMemoryNotInitialized,
+
+    /// Initrd is not supported
+    #[error("Initrd is not supported")]
+    InitrdNotSupported,
+
+    #[cfg(target_arch = "x86_64")]
+    /// TDX related error
+    #[error("Tdx error: {0}")]
+    TdxError(TdxError),
+
+    /// Guest memory error
+    #[error("Guest memory error: {0}")]
+    GuestMemoryError(#[source] vm_memory::guest_memory::Error),
+
+    #[cfg(target_arch = "x86_64")]
+    /// Cannot enable hypercall map gpa range
+    #[error("Failed to enable hypercall map gpa range: {0}")]
+    EnableHcMapGpaRange(#[source] vmm_sys_util::errno::Error),
 }
 
 /// Errors associated with starting the instance.
@@ -236,5 +318,5 @@ pub enum EpollError {
     #[cfg(feature = "dbs-virtio-devices")]
     /// Errors from virtio devices.
     #[error("failed to manager Virtio device: {0}")]
-    VirtIoDevice(#[source] VirtIoError),
+    VirtioDevice(#[source] VirtioError),
 }

@@ -44,12 +44,11 @@ var DEFAULTRUNTIMECONFIGURATION = "@CONFIG_PATH@"
 // defaultRuntimeConfiguration.
 var DEFAULTSYSCONFRUNTIMECONFIGURATION = "@SYSCONFIG@"
 var defaultHypervisorPath = "/usr/bin/qemu-system-x86_64"
-var defaultHypervisorCtlPath = "/usr/bin/acrnctl"
 var defaultJailerPath = "/usr/bin/jailer"
 var defaultImagePath = "/usr/share/kata-containers/kata-containers.img"
 var defaultKernelPath = "/usr/share/kata-containers/vmlinuz.container"
 var defaultInitrdPath = "/usr/share/kata-containers/kata-containers-initrd.img"
-var defaultRootfsType = "ext4"
+var defaultRootfsType = @DEFROOTFSTYPE@
 var defaultFirmwarePath = ""
 var defaultFirmwareVolumePath = ""
 var defaultMachineAccelerators = ""
@@ -63,6 +62,7 @@ const defaultVCPUCount uint32 = 1
 const defaultMaxVCPUCount uint32 = 0
 const defaultMemSize uint32 = 2048 // MiB
 const defaultMemSlots uint32 = 10
+const defaultHypervisorLoglevel uint32 = 1
 const defaultMemOffset uint64 = 0 // MiB
 const defaultVirtioMem bool = false
 const defaultBridgesCount uint32 = 1
@@ -74,11 +74,12 @@ const defaultBlockDeviceCacheSet bool = false
 const defaultBlockDeviceCacheDirect bool = false
 const defaultBlockDeviceCacheNoflush bool = false
 const defaultEnableIOThreads bool = false
+const defaultIndepIOThreads uint32 = 0
 const defaultEnableMemPrealloc bool = false
+const defaultEnableReclaimGuestFreedMemory bool = false
 const defaultEnableHugePages bool = false
 const defaultEnableIOMMU bool = false
 const defaultEnableIOMMUPlatform bool = false
-const defaultFileBackedMemRootDir string = ""
 const defaultEnableDebug bool = false
 const defaultExtraMonitorSocket govmmQemu.MonitorProtocol = ""
 const defaultDisableNestingChecks bool = false
@@ -99,6 +100,7 @@ const defaultDisableSeccomp = false
 const defaultDisableGuestSeLinux = true
 const defaultVfioMode = "guest-kernel"
 const defaultLegacySerial = false
+const defaultMeasurementAlgo = "sha512"
 
 var defaultSGXEPCSize = int64(0)
 
@@ -110,3 +112,9 @@ var defaultRuntimeConfiguration = "@CONFIG_PATH@"
 
 const defaultHotPlugVFIO = config.NoPort
 const defaultColdPlugVFIO = config.NoPort
+
+const defaultPCIeRootPort = 0
+const defaultPCIeSwitchPort = 0
+
+const defaultRemoteHypervisorSocket = "/run/peerpod/hypervisor.sock"
+const defaultRemoteHypervisorTimeout = 600

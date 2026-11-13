@@ -14,19 +14,23 @@ use common::{
     error::Error,
     types::{
         ContainerConfig, ContainerID, ContainerProcess, ExecProcessRequest, KillRequest,
-        ProcessExitStatus, ProcessStateInfo, ProcessType, ResizePTYRequest, ShutdownRequest,
-        StatsInfo, UpdateRequest, PID,
+        ProcessExitStatus, ProcessStateInfo, ProcessStatus, ProcessType, ResizePTYRequest,
+        ShutdownRequest, StatsInfo, UpdateRequest, PID,
     },
     ContainerManager,
 };
 use hypervisor::Hypervisor;
 use oci::Process as OCIProcess;
-use resource::network::NetnsGuard;
+use oci_spec::runtime as oci;
 use resource::ResourceManager;
-use tokio::sync::RwLock;
+use runtime_spec as spec;
+use tokio::sync::{OnceCell, RwLock};
 use tracing::instrument;
 
-use kata_sys_util::hooks::HookStates;
+use kata_sys_util::{hooks::HookStates, netns::NetnsGuard};
+
+use crate::container_manager::is_termination_signal;
+use crate::oom::CrioOomNotifier;
 
 use super::{logger_with_process, Container};
 
@@ -37,6 +41,8 @@ pub struct VirtContainerManager {
     resource_manager: Arc<ResourceManager>,
     agent: Arc<dyn Agent>,
     hypervisor: Arc<dyn Hypervisor>,
+    vmm_master_tid: OnceCell<u32>,
+    oom_notifier: Arc<CrioOomNotifier>,
 }
 
 impl std::fmt::Debug for VirtContainerManager {
@@ -48,6 +54,13 @@ impl std::fmt::Debug for VirtContainerManager {
     }
 }
 
+fn from_hooks(hooks: &Option<Vec<oci::Hook>>) -> &[oci::Hook] {
+    match hooks {
+        Some(hooks_vec) => hooks_vec.as_slice(),
+        None => &[],
+    }
+}
+
 impl VirtContainerManager {
     pub fn new(
         sid: &str,
@@ -55,6 +68,7 @@ impl VirtContainerManager {
         agent: Arc<dyn Agent>,
         hypervisor: Arc<dyn Hypervisor>,
         resource_manager: Arc<ResourceManager>,
+        oom_notifier: Arc<CrioOomNotifier>,
     ) -> Self {
         Self {
             sid: sid.to_string(),
@@ -63,7 +77,16 @@ impl VirtContainerManager {
             resource_manager,
             agent,
             hypervisor,
+            vmm_master_tid: OnceCell::new(),
+            oom_notifier,
         }
+    }
+
+    async fn get_vmm_master_tid(&self) -> Result<u32> {
+        self.vmm_master_tid
+            .get_or_try_init(|| self.hypervisor.get_vmm_master_tid())
+            .await
+            .copied()
     }
 }
 
@@ -71,44 +94,62 @@ impl VirtContainerManager {
 impl ContainerManager for VirtContainerManager {
     #[instrument]
     async fn create_container(&self, config: ContainerConfig, spec: oci::Spec) -> Result<PID> {
-        let container = Container::new(
-            self.pid,
+        let vmm_master_tid = self.get_vmm_master_tid().await?;
+
+        let mut container = Container::new(
+            vmm_master_tid,
             config.clone(),
             spec.clone(),
             self.agent.clone(),
             self.resource_manager.clone(),
+            self.hypervisor.get_passfd_listener_addr().await.ok(),
         )
+        .await
         .context("new container")?;
 
         // CreateContainer Hooks:
         // * should be run in vmm namespace (hook path in runtime namespace)
         // * should be run after the vm is started, before container is created, and after CreateRuntime Hooks
         // * spec details: https://github.com/opencontainers/runtime-spec/blob/c1662686cff159595277b79322d0272f5182941b/config.md#createcontainer-hooks
-        let vmm_master_tid = self.hypervisor.get_vmm_master_tid().await?;
         let vmm_ns_path = self.hypervisor.get_ns_path().await?;
         let vmm_netns_path = format!("{}/{}", vmm_ns_path, "net");
-        let state = oci::State {
-            version: spec.version.clone(),
+        let state = spec::State {
+            version: spec.version().clone(),
             id: config.container_id.clone(),
-            status: oci::ContainerState::Creating,
+            status: spec::ContainerState::Creating,
             pid: vmm_master_tid as i32,
             bundle: config.bundle.clone(),
-            annotations: spec.annotations.clone(),
+            annotations: spec.annotations().clone().unwrap_or_default(),
         };
 
         // new scope, CreateContainer hooks in which will execute in a new network namespace
         {
             let _netns_guard = NetnsGuard::new(&vmm_netns_path).context("vmm netns guard")?;
-            if let Some(hooks) = spec.hooks.as_ref() {
+            if let Some(hooks) = spec.hooks().as_ref() {
                 let mut create_container_hook_states = HookStates::new();
-                create_container_hook_states.execute_hooks(&hooks.create_container, Some(state))?;
+                create_container_hook_states
+                    .execute_hooks(from_hooks(hooks.create_container()), Some(state))?;
             }
         }
 
+        self.oom_notifier
+            .track(&config.container_id, &config.bundle, &spec)
+            .await;
+
         let mut containers = self.containers.write().await;
-        container.create(spec).await.context("create")?;
+        if let Err(e) = container.create(spec).await {
+            if let Err(inner_e) = container.cleanup().await {
+                warn!(sl!(), "failed to cleanup container {:?}", inner_e);
+            }
+            self.oom_notifier.forget(&config.container_id).await;
+
+            return Err(e);
+        }
+
         containers.insert(container.container_id.to_string(), container);
-        Ok(PID { pid: self.pid })
+        Ok(PID {
+            pid: vmm_master_tid,
+        })
     }
 
     #[instrument]
@@ -129,27 +170,48 @@ impl ContainerManager for VirtContainerManager {
         match process.process_type {
             ProcessType::Container => {
                 let mut containers = self.containers.write().await;
-                let c = containers
+                let mut c = containers
                     .remove(container_id)
                     .ok_or_else(|| Error::ContainerNotFound(container_id.to_string()))?;
+                // Returning an error here blocks containerd from processing the exit
+                // and reaching sandbox teardown, so report the cleanup failure and continue.
+                if let Err(e) = c.finish_cleanup().await {
+                    error!(
+                        sl!(),
+                        "failed to finish cleanup of container {}: {:?}", container_id, e
+                    );
+                }
+
+                // A task that never started has no exit-driven cleanup to release its mounts.
+                let status = c.state_process(process).await.context("state process")?;
+                if status.status == ProcessStatus::Created {
+                    if let Err(e) = c.cleanup().await {
+                        warn!(
+                            logger_with_process(process),
+                            "failed to clean up container deleted before start: {:?}", e
+                        );
+                    }
+                }
 
                 // Poststop Hooks:
                 // * should be run in runtime namespace
                 // * should be run after the container is deleted but before delete operation returns
                 // * spec details: https://github.com/opencontainers/runtime-spec/blob/c1662686cff159595277b79322d0272f5182941b/config.md#poststop
                 let c_spec = c.spec().await;
-                let vmm_master_tid = self.hypervisor.get_vmm_master_tid().await?;
-                let state = oci::State {
-                    version: c_spec.version.clone(),
+
+                let vmm_pid = self.get_vmm_master_tid().await?;
+                let state = spec::State {
+                    version: c_spec.version().clone(),
                     id: c.container_id.to_string(),
-                    status: oci::ContainerState::Stopped,
-                    pid: vmm_master_tid as i32,
+                    status: spec::ContainerState::Stopped,
+                    pid: vmm_pid as i32,
                     bundle: c.config().await.bundle,
-                    annotations: c_spec.annotations.clone(),
+                    annotations: c_spec.annotations().clone().unwrap_or_default(),
                 };
-                if let Some(hooks) = c_spec.hooks.as_ref() {
+                if let Some(hooks) = c_spec.hooks().as_ref() {
                     let mut poststop_hook_states = HookStates::new();
-                    poststop_hook_states.execute_hooks(&hooks.poststop, Some(state))?;
+                    poststop_hook_states
+                        .execute_hooks(from_hooks(hooks.poststop()), Some(state))?;
                 }
 
                 c.state_process(process).await.context("state process")
@@ -173,8 +235,16 @@ impl ContainerManager for VirtContainerManager {
         if req.spec_type_url.is_empty() {
             return Err(anyhow!("invalid type url"));
         }
-        let oci_process: OCIProcess =
+        let mut oci_process: OCIProcess =
             serde_json::from_slice(&req.spec_value).context("serde from slice")?;
+
+        oci_process.set_apparmor_profile(None);
+        oci_process.set_capabilities(None);
+
+        // CRI-O derives an exec's process from the container's, so a container
+        // declaring tty: true asks for a terminal the exec never wanted. Only
+        // req.terminal says how the streams are copied, so it decides here too.
+        oci_process.set_terminal(Some(req.terminal));
 
         let containers = self.containers.read().await;
         let container_id = &req.process.container_id.container_id;
@@ -190,28 +260,73 @@ impl ContainerManager for VirtContainerManager {
             oci_process,
         )
         .await
-        .context("exec")?;
-        Ok(())
+        .context("container exec")
     }
 
     #[instrument]
     async fn kill_process(&self, req: &KillRequest) -> Result<()> {
         let containers = self.containers.read().await;
         let container_id = &req.process.container_id.container_id;
-        let c = containers
-            .get(container_id)
-            .ok_or_else(|| Error::ContainerNotFound(container_id.clone()))?;
-        c.kill_process(&req.process, req.signal, req.all)
+
+        // According to CRI specs, kubelet will call StopPodSandbox()
+        // at least once before calling RemovePodSandbox and this call
+        // is idempotent. It must not return an error if all relevant
+        // resources have already been reclaimed
+        let c = match containers.get(container_id) {
+            Some(c) => c,
+            None => {
+                // Container already removed - this is OK for SIGKILL/SIGTERM
+                if is_termination_signal(req.signal) {
+                    warn!(
+                        sl!(),
+                        "Signal {} ignored due to container not existing", req.signal;
+                        "container" => container_id,
+                        "signal" => req.signal
+                    );
+                    return Ok(());
+                }
+                return Err(Error::ContainerNotFound(container_id.clone()).into());
+            }
+        };
+
+        // According to CRI specs, kubelet will call StopPodSandbox()
+        // at least once before calling RemovePodSandbox, and this call
+        // is idempotent, and must not return an error if all relevant
+        // resources have already been reclaimed. And in that call it will
+        // send a SIGKILL signal first to try to stop the container, thus
+        // once the container has terminated, here should ignore this signal
+        // and return directly.
+        //
+        // When the VM/agent is dead (e.g., QEMU killed externally), the ttrpc
+        // connection will fail with AgentConnectionClosed error.
+        // Additionally, if the container's init process is already gone, the
+        // agent returns ProcessAlreadyTerminated error.
+        // For SIGKILL/SIGTERM, we should treat these as success since the
+        // container is effectively terminated.
+        c.kill_process(self.containers.clone(), &req.process, req.signal, req.all)
             .await
-            .map_err(|err| {
-                warn!(
-                    sl!(),
-                    "failed to signal process {:?} {:?}", &req.process, err
+            .or_else(|err| {
+                let is_term_signal = is_termination_signal(req.signal);
+
+                // Check for typed errors using downcast_ref
+                let is_expected_error = matches!(
+                    err.downcast_ref::<Error>(),
+                    Some(Error::AgentConnectionClosed) | Some(Error::ProcessAlreadyTerminated)
                 );
-                err
+
+                if is_term_signal && is_expected_error {
+                    warn!(
+                        sl!(),
+                        "Signal encounters expected error, VM/process already terminated";
+                        "container" => container_id,
+                        "process" => ?&req.process,
+                        "signal" => req.signal,
+                    );
+                    Ok(())
+                } else {
+                    Err(err)
+                }
             })
-            .ok();
-        Ok(())
     }
 
     #[instrument]
@@ -260,32 +375,52 @@ impl ContainerManager for VirtContainerManager {
         // * should be run after user-specific command is executed but before start operation returns
         // * spec details: https://github.com/opencontainers/runtime-spec/blob/c1662686cff159595277b79322d0272f5182941b/config.md#poststart
         let c_spec = c.spec().await;
-        let vmm_master_tid = self.hypervisor.get_vmm_master_tid().await?;
-        let state = oci::State {
-            version: c_spec.version.clone(),
+        let vmm_master_tid = self.get_vmm_master_tid().await?;
+        let state = spec::State {
+            version: c_spec.version().clone(),
             id: c.container_id.to_string(),
-            status: oci::ContainerState::Running,
+            status: spec::ContainerState::Running,
             pid: vmm_master_tid as i32,
             bundle: c.config().await.bundle,
-            annotations: c_spec.annotations.clone(),
+            annotations: c_spec.annotations().clone().unwrap_or_default(),
         };
-        if let Some(hooks) = c_spec.hooks.as_ref() {
+        if let Some(hooks) = c_spec.hooks().as_ref() {
             let mut poststart_hook_states = HookStates::new();
-            poststart_hook_states.execute_hooks(&hooks.poststart, Some(state))?;
+            poststart_hook_states.execute_hooks(from_hooks(hooks.poststart()), Some(state))?;
         }
 
-        Ok(PID { pid: self.pid })
+        Ok(PID {
+            pid: vmm_master_tid,
+        })
     }
 
     #[instrument]
     async fn state_process(&self, process: &ContainerProcess) -> Result<ProcessStateInfo> {
         let containers = self.containers.read().await;
         let container_id = &process.container_id.container_id;
-        let c = containers
-            .get(container_id)
-            .ok_or_else(|| Error::ContainerNotFound(container_id.clone()))?;
-        let state = c.state_process(process).await.context("state process")?;
-        Ok(state)
+
+        // When using Sandbox API, the sandbox container (container_id == sandbox_id)
+        // is not stored in the containers map. Return a synthetic state for it.
+        if let Some(c) = containers.get(container_id) {
+            c.state_process(process).await.context("state process")
+        } else if container_id == &self.sid {
+            let vmm_pid = self.get_vmm_master_tid().await?;
+            Ok(ProcessStateInfo {
+                container_id: self.sid.clone(),
+                exec_id: String::new(),
+                pid: PID { pid: vmm_pid },
+                bundle: String::new(),
+                stdin: None,
+                stdout: None,
+                stderr: None,
+                terminal: false,
+                status: ProcessStatus::Running,
+                exit_status: 0,
+                exited_at: None,
+            })
+        } else {
+            Err(Error::ContainerNotFound(container_id.clone()).into())
+        }
     }
 
     #[instrument]
@@ -346,17 +481,19 @@ impl ContainerManager for VirtContainerManager {
 
     #[instrument]
     async fn pid(&self) -> Result<PID> {
-        Ok(PID { pid: self.pid })
+        let vmm_pid = self.get_vmm_master_tid().await?;
+        Ok(PID { pid: vmm_pid })
     }
 
     #[instrument]
     async fn connect_container(&self, _id: &ContainerID) -> Result<PID> {
-        Ok(PID { pid: self.pid })
+        let vmm_pid = self.get_vmm_master_tid().await?;
+        Ok(PID { pid: vmm_pid })
     }
 
     #[instrument]
     async fn need_shutdown_sandbox(&self, req: &ShutdownRequest) -> bool {
-        req.is_now || self.containers.read().await.is_empty() || self.sid == req.container_id
+        req.is_now || self.sid == req.container_id
     }
 
     #[instrument]

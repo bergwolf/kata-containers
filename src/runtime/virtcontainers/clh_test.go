@@ -56,7 +56,7 @@ func newClhConfig() (HypervisorConfig, error) {
 		ImagePath:                     testClhImagePath,
 		RootfsType:                    string(EXT4),
 		HypervisorPath:                testClhPath,
-		NumVCPUs:                      defaultVCPUs,
+		NumVCPUsF:                     defaultVCPUs,
 		BlockDeviceDriver:             config.VirtioBlock,
 		MemorySize:                    defaultMemSzMiB,
 		DefaultBridges:                defaultBridges,
@@ -69,11 +69,15 @@ func newClhConfig() (HypervisorConfig, error) {
 		NetRateLimiterOpsMaxRate:      int64(0),
 		NetRateLimiterOpsOneTimeBurst: int64(0),
 		HotPlugVFIO:                   config.NoPort,
+		DisableImageNvdimm:            true,
 	}, nil
 }
 
 type clhClientMock struct {
-	vmInfo chclient.VmInfo
+	vmInfo          chclient.VmInfo
+	resizeRequest   *chclient.VmResize
+	restoreRequest  *chclient.RestoreConfig
+	snapshotRequest *chclient.VmSnapshotConfig
 }
 
 func (c *clhClientMock) VmmPingGet(ctx context.Context) (chclient.VmmPingResponse, *http.Response, error) {
@@ -101,6 +105,7 @@ func (c *clhClientMock) BootVM(ctx context.Context) (*http.Response, error) {
 
 //nolint:golint
 func (c *clhClientMock) VmResizePut(ctx context.Context, vmResize chclient.VmResize) (*http.Response, error) {
+	c.resizeRequest = &vmResize
 	return nil, nil
 }
 
@@ -115,8 +120,37 @@ func (c *clhClientMock) VmAddDiskPut(ctx context.Context, diskConfig chclient.Di
 }
 
 //nolint:golint
+func (c *clhClientMock) VmPausePut(ctx context.Context) (*http.Response, error) {
+	c.vmInfo.State = clhStatePaused
+	return nil, nil
+}
+
+//nolint:golint
+func (c *clhClientMock) VmSnapshotPut(ctx context.Context, vmSnapshotConfig chclient.VmSnapshotConfig) (*http.Response, error) {
+	c.snapshotRequest = &vmSnapshotConfig
+	return nil, nil
+}
+
+//nolint:golint
 func (c *clhClientMock) VmRemoveDevicePut(ctx context.Context, vmRemoveDevice chclient.VmRemoveDevice) (*http.Response, error) {
 	return nil, nil
+}
+
+func (c *clhClientMock) VmRestorePut(ctx context.Context, restoreConfig chclient.RestoreConfig) (*http.Response, error) {
+	c.restoreRequest = &restoreConfig
+	// restoreVM() verifies Paused after restore.
+	c.vmInfo.State = clhStatePaused
+	return nil, nil
+}
+
+func (c *clhClientMock) ResumeVM(ctx context.Context) (*http.Response, error) {
+	c.vmInfo.State = clhStateRunning
+	return nil, nil
+}
+
+func TestClhIommuType(t *testing.T) {
+	assert.Equal(t, chclient.IOMMUTYPE_OFF, clhIommuType(false))
+	assert.Equal(t, chclient.IOMMUTYPE_VIRTIO, clhIommuType(true))
 }
 
 func TestCloudHypervisorAddVSock(t *testing.T) {
@@ -147,7 +181,7 @@ func TestCloudHypervisorAddNetCheckNetConfigListValues(t *testing.T) {
 
 	e := &VethEndpoint{}
 	e.NetPair.TAPIface.HardAddr = macTest
-	e.NetPair.TapInterface.VMFds = vmFds
+	e.NetPair.VMFds = vmFds
 
 	err = clh.addNet(e)
 	assert.Nil(err)
@@ -182,7 +216,7 @@ func TestCloudHypervisorAddNetCheckEnpointTypes(t *testing.T) {
 
 	validVeth := &VethEndpoint{}
 	validVeth.NetPair.TAPIface.HardAddr = macTest
-	validVeth.NetPair.TapInterface.VMFds = vmFds
+	validVeth.NetPair.VMFds = vmFds
 
 	type args struct {
 		e Endpoint
@@ -223,7 +257,7 @@ func TestCloudHypervisorNetRateLimiter(t *testing.T) {
 	vmFds = append(vmFds, file)
 
 	validVeth := &VethEndpoint{}
-	validVeth.NetPair.TapInterface.VMFds = vmFds
+	validVeth.NetPair.VMFds = vmFds
 
 	type args struct {
 		bwMaxRate       int64
@@ -397,7 +431,7 @@ func TestCloudHypervisorBootVM(t *testing.T) {
 	clh.APIClient = &clhClientMock{}
 
 	savedVmAddNetPutRequestFunc := vmAddNetPutRequest
-	vmAddNetPutRequest = func(clh *cloudHypervisor) error { return nil }
+	vmAddNetPutRequest = func(clh *cloudHypervisor) ([]chclient.PciDeviceInfo, error) { return nil, nil }
 	defer func() {
 		vmAddNetPutRequest = savedVmAddNetPutRequestFunc
 	}()
@@ -430,7 +464,8 @@ func TestCloudHypervisorCleanupVM(t *testing.T) {
 	assert.NoError(err, "persist.GetDriver() unexpected error")
 
 	dir := filepath.Join(store.RunVMStoragePath(), clh.id)
-	os.MkdirAll(dir, os.ModePerm)
+	err = os.MkdirAll(dir, os.ModePerm)
+	assert.NoError(err, "failed to create dir %s", dir)
 
 	err = clh.cleanupVM(false)
 	assert.NoError(err, "persist.GetDriver() unexpected error")
@@ -482,19 +517,25 @@ func TestClhCreateVM(t *testing.T) {
 	assert.NoError(err)
 	config5.SharedFS = config.VirtioFSNydus
 
+	config6, err := newClhConfig()
+	assert.NoError(err)
+	config6.DisableNestedVirtualization = true
+
 	type testData struct {
 		config      HypervisorConfig
 		expectError bool
 		configMatch bool
+		wantNested  bool
 	}
 
 	data := []testData{
-		{config0, false, true},
-		{config1, false, true},
-		{config2, false, true},
-		{config3, true, false},
-		{config4, false, true},
-		{config5, false, true},
+		{config0, false, true, true},
+		{config1, false, true, true},
+		{config2, false, true, true},
+		{config3, true, false, false},
+		{config4, false, true, true},
+		{config5, false, true, true},
+		{config6, false, true, false},
 	}
 
 	for i, d := range data {
@@ -509,9 +550,86 @@ func TestClhCreateVM(t *testing.T) {
 
 		assert.NoError(err, msg)
 
+		assert.Equal(d.wantNested, clh.vmconfig.Cpus.GetNested(), msg)
+
 		if d.configMatch {
 			assert.Exactly(d.config, clh.config, msg)
 		}
+	}
+}
+
+func TestClhRestoreVM(t *testing.T) {
+	assert := assert.New(t)
+
+	store, err := persist.GetDriver()
+	assert.NoError(err)
+
+	clhConfig, err := newClhConfig()
+	assert.NoError(err)
+	clhConfig.VMStorePath = store.RunVMStoragePath()
+	clhConfig.RunStorePath = store.RunStoragePath()
+
+	mockClient := &clhClientMock{}
+	clh := &cloudHypervisor{
+		config:    clhConfig,
+		APIClient: mockClient,
+	}
+
+	// First call restoreVM without the VM snapshot files (state.json, config.json) present.
+	err = clh.restoreVM(context.Background())
+	// An error is expected because restoreVM expects the VM snapshot files to be present.
+	assert.Error(err)
+	assert.Contains(err.Error(), filepath.Join(clhConfig.VMStorePath, "state.json"))
+
+	// Now create the VM snapshot files and call restoreVM again.
+	err = os.MkdirAll(clhConfig.VMStorePath, os.ModePerm)
+	assert.NoError(err, "failed to create dir %s", clhConfig.VMStorePath)
+	stateFile := filepath.Join(clhConfig.VMStorePath, "state.json")
+	configFile := filepath.Join(clhConfig.VMStorePath, "config.json")
+	err = os.WriteFile(stateFile, []byte("{}"), 0o600)
+	assert.NoError(err)
+	err = os.WriteFile(configFile, []byte("{}"), 0o600)
+	assert.NoError(err)
+
+	// Call restoreVM again, this time it should succeed.
+	err = clh.restoreVM(context.Background())
+	assert.NoError(err)
+
+	if assert.NotNil(mockClient.restoreRequest) {
+		expectedSourceURL := "file://" + clhConfig.VMStorePath
+		assert.Equal(expectedSourceURL, mockClient.restoreRequest.GetSourceUrl())
+	}
+
+	info, err := clh.vmInfo()
+	assert.NoError(err)
+	assert.Equal(clhStatePaused, info.State)
+}
+
+func TestClhSaveVM(t *testing.T) {
+	assert := assert.New(t)
+
+	store, err := persist.GetDriver()
+	assert.NoError(err)
+
+	clhConfig, err := newClhConfig()
+	assert.NoError(err)
+	// For testing, assume the memory path is located within the VM store path.
+	clhConfig.MemoryPath = filepath.Join(store.RunVMStoragePath(), "memory")
+	clhConfig.VMStorePath = store.RunVMStoragePath()
+	clhConfig.RunStorePath = store.RunStoragePath()
+
+	mockClient := &clhClientMock{}
+	clh := &cloudHypervisor{
+		config:    clhConfig,
+		APIClient: mockClient,
+	}
+
+	err = clh.SaveVM()
+	assert.NoError(err)
+
+	if assert.NotNil(mockClient.snapshotRequest) {
+		expectedDestinationURL := "file://" + filepath.Dir(clhConfig.MemoryPath)
+		assert.Equal(expectedDestinationURL, mockClient.snapshotRequest.GetDestinationUrl())
 	}
 }
 
@@ -526,7 +644,7 @@ func TestCloudHypervisorStartSandbox(t *testing.T) {
 	assert.NoError(err)
 
 	savedVmAddNetPutRequestFunc := vmAddNetPutRequest
-	vmAddNetPutRequest = func(clh *cloudHypervisor) error { return nil }
+	vmAddNetPutRequest = func(clh *cloudHypervisor) ([]chclient.PciDeviceInfo, error) { return nil, nil }
 	defer func() {
 		vmAddNetPutRequest = savedVmAddNetPutRequestFunc
 	}()
@@ -580,6 +698,39 @@ func TestCloudHypervisorStartSandbox(t *testing.T) {
 
 	err = clh.Cleanup(context.Background())
 	assert.NoError(err)
+}
+
+func TestCloudHypervisorResizeVCPUs(t *testing.T) {
+	tests := []struct {
+		name      string
+		maxVCPUs  int32
+		requested uint32
+		expected  uint32
+	}{
+		{"below 256", 512, 255, 255},
+		{"at 256", 512, 256, 256},
+		{"above 256", 512, 257, 257},
+		{"below 512", 512, 511, 511},
+		{"at 512", 512, 512, 512},
+		{"above 512", 512, 513, 512},
+		{"configured maximum", 256, 257, 256},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert := assert.New(t)
+			mockClient := &clhClientMock{}
+			mockClient.vmInfo.Config.Cpus = chclient.NewCpusConfig(2, tt.maxVCPUs)
+			clh := cloudHypervisor{APIClient: mockClient}
+
+			current, resized, err := clh.ResizeVCPUs(context.Background(), tt.requested)
+			assert.NoError(err)
+			assert.Equal(uint32(2), current)
+			assert.Equal(tt.expected, resized)
+			if assert.NotNil(mockClient.resizeRequest) {
+				assert.Equal(int32(tt.expected), mockClient.resizeRequest.GetDesiredVcpus())
+			}
+		})
+	}
 }
 
 func TestCloudHypervisorResizeMemory(t *testing.T) {
@@ -679,6 +830,94 @@ func TestCloudHypervisorHotplugRemoveDevice(t *testing.T) {
 
 	_, err = clh.HotplugRemoveDevice(context.Background(), nil, NetDev)
 	assert.Error(err, "Hotplug remove pmem block device expected error")
+}
+
+func TestCloudHypervisorColdPlugVFIODevice(t *testing.T) {
+	assert := assert.New(t)
+
+	clhConfig, err := newClhConfig()
+	assert.NoError(err)
+
+	clh := &cloudHypervisor{}
+	clh.config = clhConfig
+	clh.devicesIds = make(map[string]string)
+	clh.vmconfig = *chclient.NewVmConfig(*chclient.NewPayloadConfig())
+
+	// Cold-plug a PCI VFIO device
+	dev := &config.VFIODev{
+		ID:       "gpu0",
+		SysfsDev: "/sys/bus/pci/devices/0000:41:00.0",
+		BDF:      "0000:41:00.0",
+		Type:     config.VFIOPCIDeviceNormalType,
+	}
+	err = clh.coldPlugVFIODevice(dev)
+	assert.NoError(err, "Cold-plug PCI VFIO device expected no error")
+
+	// Verify the device was added to vmconfig.Devices
+	assert.NotNil(clh.vmconfig.Devices)
+	assert.Len(*clh.vmconfig.Devices, 1)
+	assert.Equal("/sys/bus/pci/devices/0000:41:00.0", (*clh.vmconfig.Devices)[0].GetPath())
+	assert.Equal("gpu0", clh.devicesIds["gpu0"])
+
+	// Cold-plug a second device
+	dev2 := &config.VFIODev{
+		ID:       "gpu1",
+		SysfsDev: "/sys/bus/pci/devices/0000:42:00.0",
+		BDF:      "0000:42:00.0",
+		Type:     config.VFIOPCIDeviceNormalType,
+	}
+	err = clh.coldPlugVFIODevice(dev2)
+	assert.NoError(err, "Cold-plug second VFIO device expected no error")
+	assert.Len(*clh.vmconfig.Devices, 2)
+
+	// AP mediated device should fail
+	apDev := &config.VFIODev{
+		ID:   "ap0",
+		Type: config.VFIOAPDeviceMediatedType,
+	}
+	err = clh.coldPlugVFIODevice(apDev)
+	assert.Error(err, "Cold-plug AP mediated device expected error")
+
+	// Error type (0) should fail
+	errDev := &config.VFIODev{
+		ID:       "bad0",
+		SysfsDev: "/sys/bus/pci/devices/0000:43:00.0",
+		Type:     config.VFIODeviceErrorType,
+	}
+	err = clh.coldPlugVFIODevice(errDev)
+	assert.Error(err, "Cold-plug error-type device expected error")
+
+	// Empty SysfsDev should fail
+	emptySysfsDev := &config.VFIODev{
+		ID:   "bad1",
+		Type: config.VFIOPCIDeviceNormalType,
+	}
+	err = clh.coldPlugVFIODevice(emptySysfsDev)
+	assert.Error(err, "Cold-plug with empty SysfsDev expected error")
+}
+
+func TestCloudHypervisorAddDeviceVFIO(t *testing.T) {
+	assert := assert.New(t)
+
+	clhConfig, err := newClhConfig()
+	assert.NoError(err)
+
+	clh := &cloudHypervisor{}
+	clh.config = clhConfig
+	clh.devicesIds = make(map[string]string)
+	clh.vmconfig = *chclient.NewVmConfig(*chclient.NewPayloadConfig())
+
+	// AddDevice with VFIODev type should cold-plug
+	dev := config.VFIODev{
+		ID:       "nic0",
+		SysfsDev: "/sys/bus/pci/devices/0000:05:00.0",
+		BDF:      "0000:05:00.0",
+		Type:     config.VFIOPCIDeviceNormalType,
+	}
+	err = clh.AddDevice(context.Background(), dev, VfioDev)
+	assert.NoError(err, "AddDevice VFIO expected no error")
+	assert.NotNil(clh.vmconfig.Devices)
+	assert.Len(*clh.vmconfig.Devices, 1)
 }
 
 func TestClhGenerateSocket(t *testing.T) {

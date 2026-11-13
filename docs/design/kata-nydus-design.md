@@ -8,7 +8,7 @@ The following benchmarking result shows the performance improvement compared wit
 
 ## Proposal - Bring `lazyload` ability to Kata Containers
 
-`Nydusd` is a fuse/`virtiofs` daemon which is provided by `nydus` project and it supports `PassthroughFS` and [RAFS](https://github.com/dragonflyoss/image-service/blob/master/docs/nydus-design.md) (Registry Acceleration File System) natively, so in Kata Containers, we can use `nydusd` in place of `virtiofsd` and mount `nydus` image to guest in the meanwhile.
+`Nydusd` is a fuse/`virtiofs` daemon which is provided by `nydus` project and it supports `PassthroughFS` and [`rafs`](https://github.com/dragonflyoss/image-service/blob/master/docs/nydus-design.md) (Registry Acceleration File System) natively, so in Kata Containers, we can use `nydusd` in place of `virtiofsd` and mount `nydus` image to guest in the meanwhile.
 
 The process of creating/starting Kata Containers with `virtiofsd`,
 
@@ -60,7 +60,7 @@ So in guest, container rootfs=overlay(`lowerdir=rafs`, `upperdir=snapshotdir/fs`
 
 > how to transfer the `rafs` info from `nydus-snapshotter` to the Kata Containers Containerd v2 shim?
 
-By default, when creating `OCI` image container, `nydus-snapshotter` will return [`struct` Mount slice](https://github.com/containerd/containerd/blob/main/mount/mount.go#L21) below to containerd and containerd use them to mount rootfs
+By default, when creating `OCI` image container, `nydus-snapshotter` will return [`struct` Mount slice](https://github.com/containerd/containerd/blob/main/core/mount/mount.go#L30) below to containerd and containerd use them to mount rootfs
 
 ```
 [
@@ -72,7 +72,7 @@ By default, when creating `OCI` image container, `nydus-snapshotter` will return
 ]
 ```
 
-Then, we can append `rafs` info into `Options`, but if do this, containerd will mount failed, as containerd can not identify `rafs` info. Here, we can refer to [containerd mount helper](https://github.com/containerd/containerd/blob/main/mount/mount_linux.go#L42) and provide a binary called `nydus-overlayfs`. The `Mount` slice which `nydus-snapshotter` returned becomes
+Then, we can append `rafs` info into `Options`, but if do this, containerd will mount failed, as containerd can not identify `rafs` info. Here, we can refer to [containerd mount helper](https://github.com/containerd/containerd/blob/main/core/mount/mount_linux.go#L81) and provide a binary called `nydus-overlayfs`. The `Mount` slice which `nydus-snapshotter` returned becomes
 
 ```
 [

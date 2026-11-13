@@ -7,6 +7,7 @@ package virtcontainers
 
 import (
 	"fmt"
+	"runtime"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -89,6 +90,42 @@ func TestHypervisorConfigValidTemplateConfig(t *testing.T) {
 	testHypervisorConfigValid(t, hypervisorConfig, false)
 }
 
+func TestHypervisorConfigCPULimits(t *testing.T) {
+	clhLimit := defaultMaxVCPUs
+	if runtime.GOARCH == "amd64" && !pathExists("/dev/mshv") {
+		clhLimit = 512
+	}
+	for _, tc := range []struct {
+		hypervisorType HypervisorType
+		limit          uint32
+	}{
+		{ClhHypervisor, clhLimit},
+		{QemuHypervisor, defaultMaxVCPUs},
+	} {
+		t.Run(string(tc.hypervisorType), func(t *testing.T) {
+			for _, cpus := range []struct{ requested, expected uint32 }{
+				{0, tc.limit},
+				{tc.limit - 1, tc.limit - 1},
+				{tc.limit, tc.limit},
+				{tc.limit + 1, tc.limit},
+			} {
+				conf := VMConfig{
+					HypervisorType: tc.hypervisorType,
+					HypervisorConfig: HypervisorConfig{
+						KernelPath:      "kernel",
+						ImagePath:       "image",
+						DefaultMaxVCPUs: cpus.requested,
+					},
+				}
+				if err := conf.Valid(); err != nil {
+					t.Fatal(err)
+				}
+				assert.Equal(t, cpus.expected, conf.HypervisorConfig.DefaultMaxVCPUs, "requested %d vCPUs", cpus.requested)
+			}
+		})
+	}
+}
+
 func TestHypervisorConfigDefaults(t *testing.T) {
 	assert := assert.New(t)
 	hypervisorConfig := &HypervisorConfig{
@@ -103,7 +140,7 @@ func TestHypervisorConfigDefaults(t *testing.T) {
 		KernelPath:          fmt.Sprintf("%s/%s", testDir, testKernel),
 		ImagePath:           fmt.Sprintf("%s/%s", testDir, testImage),
 		HypervisorPath:      "",
-		NumVCPUs:            defaultVCPUs,
+		NumVCPUsF:           defaultVCPUs,
 		MemorySize:          defaultMemSzMiB,
 		DefaultBridges:      defaultBridges,
 		BlockDeviceDriver:   defaultBlockDriver,

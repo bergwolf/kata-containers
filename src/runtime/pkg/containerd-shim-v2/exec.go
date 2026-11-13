@@ -13,10 +13,10 @@ import (
 
 	"github.com/containerd/containerd/api/types/task"
 	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/typeurl"
-	googleProtobuf "github.com/gogo/protobuf/types"
+	"github.com/containerd/typeurl/v2"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	anypb "google.golang.org/protobuf/types/known/anypb"
 )
 
 type exec struct {
@@ -69,12 +69,12 @@ func getEnvs(envs []string) []types.EnvVar {
 	return vcEnvs
 }
 
-func newExec(c *container, stdin, stdout, stderr string, terminal bool, jspec *googleProtobuf.Any) (*exec, error) {
+func newExec(c *container, stdin, stdout, stderr string, terminal bool, jspec *anypb.Any) (*exec, error) {
 	var height uint32
 	var width uint32
 
 	if jspec == nil {
-		return nil, errdefs.ToGRPCf(errdefs.ErrInvalidArgument, "googleProtobuf.Any points to nil")
+		return nil, errdefs.ToGRPCf(errdefs.ErrInvalidArgument, "anypb.Any points to nil")
 	}
 
 	// process exec request
@@ -126,13 +126,16 @@ func newExec(c *container, stdin, stdout, stderr string, terminal bool, jspec *g
 		exitIOch:    make(chan struct{}),
 		stdinCloser: make(chan struct{}),
 		exitCh:      make(chan uint32, 1),
-		status:      task.StatusCreated,
+		status:      task.Status_CREATED,
 	}
 
 	return exec, nil
 }
 
 func (c *container) getExec(id string) (*exec, error) {
+	c.execsMu.RLock()
+	defer c.execsMu.RUnlock()
+
 	if c.execs == nil {
 		return nil, errdefs.ToGRPCf(errdefs.ErrNotFound, "exec does not exist %s", id)
 	}
@@ -144,4 +147,18 @@ func (c *container) getExec(id string) (*exec, error) {
 	}
 
 	return exec, nil
+}
+
+func (c *container) setExec(id string, e *exec) {
+	c.execsMu.Lock()
+	defer c.execsMu.Unlock()
+
+	c.execs[id] = e
+}
+
+func (c *container) deleteExec(id string) {
+	c.execsMu.Lock()
+	defer c.execsMu.Unlock()
+
+	delete(c.execs, id)
 }

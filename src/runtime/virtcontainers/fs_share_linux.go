@@ -9,12 +9,14 @@ package virtcontainers
 
 import (
 	"context"
+	b64 "encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"sync"
 	"syscall"
 
@@ -26,19 +28,69 @@ import (
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/katautils/katatrace"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/agent/protocols/grpc"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/annotations"
+	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/utils"
 )
+
+// Splitting Regex pattern:
+// Use regex for strict matching instead of strings.Contains
+// match for kubernetes.io~configmap, kubernetes.io~secret, kubernetes.io~projected, kubernetes.io~downward-api
+// as recommended in review comments for PR #7211
+
+// Default K8S root directory
+var defaultKubernetesRootDir = "/var/lib/kubelet"
+
+// Example directory structure for the volume mounts.
+// /var/lib/kubelet/pods/f51ae853-557e-4ce1-b60b-a1101b555612/volumes/kubernetes.io~configmap
+// /var/lib/kubelet/pods/f51ae853-557e-4ce1-b60b-a1101b555612/volumes/kubernetes.io~secret
+// /var/lib/kubelet/pods/f51ae853-557e-4ce1-b60b-a1101b555612/volumes/kubernetes.io~projected
+// /var/lib/kubelet/pods/f51ae853-557e-4ce1-b60b-a1101b555612/volumes/kubernetes.io~downward-api
+var configVolRegexString = "/pods/[a-fA-F0-9\\-]{36}/volumes/kubernetes\\.io~(configmap|secret|projected|downward-api)"
+
+// Regex for the temp directory with timestamp that is used to handle the updates by K8s
+// Examples
+// /var/lib/kubelet/pods/e33907eb-54c7-4113-a3dc-447f247084cc/volumes/kubernetes.io~secret/foosecret/..2023_07_27_07_13_00.1257228
+// /var/lib/kubelet/pods/e33907eb-54c7-4113-a3dc-447f247084cc/volumes/kubernetes.io~downward-api/fooinfo/..2023_07_27_07_13_00.3704578339
+// The timestamp is of the format 2023_07_27_07_13_00.3704578339 or 2023_07_27_07_13_00.1257228
+var timestampDirRegexString = ".*[0-9]{4}_[0-9]{2}_[0-9]{2}_[0-9]{2}_[0-9]{2}_[0-9]{2}.[0-9]+$"
 
 func unmountNoFollow(path string) error {
 	return syscall.Unmount(path, syscall.MNT_DETACH|UmountNoFollow)
 }
 
+// resolveRootDirWithBase returns the resolved (followed symlink) kubelet root path.
+// If base is non-empty it is used as the root; otherwise defaultKubernetesRootDir is used.
+func resolveRootDirWithBase(base string) string {
+	if base == "" {
+		base = defaultKubernetesRootDir
+	}
+	rootDir, err := os.Readlink(base)
+	if err != nil {
+		return base
+	}
+	if !filepath.IsAbs(rootDir) {
+		rootDir, err = filepath.Abs(filepath.Join(filepath.Dir(base), rootDir))
+		if err != nil {
+			return base
+		}
+	}
+	return rootDir
+}
+
 type FilesystemShare struct {
 	sandbox *Sandbox
 	watcher *fsnotify.Watcher
-	// The same volume mount can be shared by multiple containers in the same sandbox (pod)
-	srcDstMap            map[string][]string
-	srcDstMapLock        sync.Mutex
+	// Regex to match directory structure for k8's volume mounts.
+	configVolRegex *regexp.Regexp
+	// Regex to match only the timestamped directory inside the k8's volume mount
+	timestampDirRegex *regexp.Regexp
+	// srcDstMap tracks file-level source to destination mappings for configmap/secret watching
+	srcDstMap     map[string][]string
+	srcDstMapLock sync.Mutex
+	// srcGuestMap caches volume source path to guest path, enabling multiple containers
+	// in the same pod to share the same volume mount
+	srcGuestMap          map[string]string
+	srcGuestMapLock      sync.Mutex
 	eventLoopStarted     bool
 	eventLoopStartedLock sync.Mutex
 	watcherDoneChannel   chan bool
@@ -46,18 +98,30 @@ type FilesystemShare struct {
 	prepared bool
 }
 
-func NewFilesystemShare(s *Sandbox) (FilesystemSharer, error) {
+func NewFilesystemShare(s *Sandbox) (*FilesystemShare, error) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return nil, fmt.Errorf("Creating watcher returned error %w", err)
 	}
+
+	baseRoot := ""
+	if s.config != nil {
+		baseRoot = s.config.KubeletRootDir
+	}
+	kubernetesRootDir := resolveRootDirWithBase(baseRoot)
+	quotedRoot := regexp.QuoteMeta(kubernetesRootDir)
+	configVolRegex := regexp.MustCompile("^" + quotedRoot + configVolRegexString)
+	timestampDirRegex := regexp.MustCompile("^" + quotedRoot + configVolRegexString + timestampDirRegexString)
 
 	return &FilesystemShare{
 		prepared:           false,
 		sandbox:            s,
 		watcherDoneChannel: make(chan bool),
 		srcDstMap:          make(map[string][]string),
+		srcGuestMap:        make(map[string]string),
 		watcher:            watcher,
+		configVolRegex:     configVolRegex,
+		timestampDirRegex:  timestampDirRegex,
 	}, nil
 }
 
@@ -243,19 +307,42 @@ func (f *FilesystemShare) Cleanup(ctx context.Context) error {
 	return nil
 }
 
+func shareFileName(containerID, source, destination, randHex string, isSandboxScoped bool) string {
+	if isSandboxScoped {
+		return fmt.Sprintf("sandbox-%s-%s", randHex, filepath.Base(filepath.Clean(source)))
+	}
+	return fmt.Sprintf("%s-%s-%s", containerID, randHex, filepath.Base(destination))
+}
+
 func (f *FilesystemShare) ShareFile(ctx context.Context, c *Container, m *Mount) (*SharedFile, error) {
 	randBytes, err := utils.GenerateRandomBytes(8)
 	if err != nil {
 		return nil, err
 	}
 
-	filename := fmt.Sprintf("%s-%s-%s", c.id, hex.EncodeToString(randBytes), filepath.Base(m.Destination))
-	guestPath := filepath.Join(kataGuestSharedDir(), filename)
+	randHex := hex.EncodeToString(randBytes)
+	caps := f.sandbox.hypervisor.Capabilities(ctx)
+	mustCopyEmptyDir := !caps.IsFsSharingSupported() && IsDiskEmptyDir(m.Source)
+
+	filename := shareFileName(c.id, m.Source, m.Destination, randHex, mustCopyEmptyDir)
+	var guestPath string
 
 	// copy file to container's rootfs if filesystem sharing is not supported, otherwise
 	// bind mount it in the shared directory.
-	caps := f.sandbox.hypervisor.Capabilities(ctx)
 	if !caps.IsFsSharingSupported() {
+		// CopyFile writes into the guest filesystem and the agent confines its
+		// destinations to this fixed directory. Unlike filesystem-sharing paths,
+		// this guest path must not be adjusted when rootless mode is enabled.
+		guestPath = filepath.Join(defaultKataGuestSharedDir, filename)
+
+		if mustCopyEmptyDir {
+			f.srcGuestMapLock.Lock()
+			defer f.srcGuestMapLock.Unlock()
+			if guestPath, ok := f.srcGuestMap[m.Source]; ok {
+				return &SharedFile{guestPath: guestPath}, nil
+			}
+		}
+
 		f.Logger().Debug("filesystem sharing is not supported, files will be copied")
 
 		var ignored bool
@@ -272,7 +359,8 @@ func (f *FilesystemShare) ShareFile(ctx context.Context, c *Container, m *Mount)
 				return err
 			}
 
-			if !(info.Mode().IsRegular() || info.Mode().IsDir() || (info.Mode()&os.ModeSymlink) == os.ModeSymlink) {
+			mode := info.Mode()
+			if !mode.IsRegular() && !mode.IsDir() && mode&os.ModeSymlink != os.ModeSymlink {
 				f.Logger().WithField("ignored-file", srcPath).Debug("Ignoring file as FS sharing not supported")
 				if srcPath == srcRoot {
 					// Ignore the mount if this is not a regular file (excludes socket, device, ...) as it cannot be handled by
@@ -293,27 +381,14 @@ func (f *FilesystemShare) ShareFile(ctx context.Context, c *Container, m *Mount)
 				return err
 			}
 
-			// Add fsNotify watcher for volume mounts
-			// Use regex for strict matching instead of strings.Contains
-			// match for kubernetes.io~configmap, kubernetes.io~secret, kubernetes.io~projected, kubernetes.io~downward-api
-			// as recommended in review comments for PR #7211
-
-			// Example directory structure for the volume mounts.
-			// /var/lib/kubelet/pods/f51ae853-557e-4ce1-b60b-a1101b555612/volumes/kubernetes.io~configmap
-			// /var/lib/kubelet/pods/f51ae853-557e-4ce1-b60b-a1101b555612/volumes/kubernetes.io~secret
-			// /var/lib/kubelet/pods/f51ae853-557e-4ce1-b60b-a1101b555612/volumes/kubernetes.io~projected
-			// /var/lib/kubelet/pods/f51ae853-557e-4ce1-b60b-a1101b555612/volumes/kubernetes.io~downward-api
-
-			// More relaxed regex for the pod UID
-			// `^/var/lib/kubelet/pods/[a-fA-F0-9\-]+/volumes/kubernetes\.io~(configmap|secret|projected|downward-api)`
-
-			//TODO: Move this to a global variable and compile only once.
-			regex := regexp.MustCompile(`^/var/lib/kubelet/pods/[a-fA-F0-9\-]{36}/volumes/kubernetes\.io~(configmap|secret|projected|downward-api)`)
-			if regex.MatchString(srcPath) {
+			if f.configVolRegex.MatchString(srcPath) {
 				// fsNotify doesn't add watcher recursively.
 				// So we need to add the watcher for directories under kubernetes.io~configmap, kubernetes.io~secret,
 				// kubernetes.io~downward-api and kubernetes.io~projected
-				if info.Mode().IsDir() {
+
+				// Add watcher only to the timestamped directory containing secrets to prevent
+				// multiple events received from also watching the parent directory.
+				if info.Mode().IsDir() && f.timestampDirRegex.MatchString(srcPath) {
 					// The cm dir is of the form /var/lib/kubelet/pods/<uid>/volumes/kubernetes.io~configmap/foo/{..data, key1, key2,...}
 					// The secret dir is of the form /var/lib/kubelet/pods/<uid>/volumes/kubernetes.io~secret/foo/{..data, key1, key2,...}
 					// The projected dir is of the form /var/lib/kubelet/pods/<uid>/volumes/kubernetes.io~projected/foo/{..data, key1, key2,...}
@@ -325,7 +400,7 @@ func (f *FilesystemShare) ShareFile(ctx context.Context, c *Container, m *Mount)
 						return err
 					}
 				} else {
-					f.Logger().Infof("ShareFile: srcPath(%s) is not a directory", srcPath)
+					f.Logger().Infof("ShareFile: srcPath(%s) is not a timestamped directory", srcPath)
 				}
 				// Add the source and destination to the global map which will be used by the event loop
 				// to copy the modified content to the destination
@@ -335,7 +410,6 @@ func (f *FilesystemShare) ShareFile(ctx context.Context, c *Container, m *Mount)
 				defer f.srcDstMapLock.Unlock()
 				f.srcDstMap[srcPath] = append(f.srcDstMap[srcPath], dstPath)
 			}
-
 			return nil
 		}
 
@@ -347,7 +421,17 @@ func (f *FilesystemShare) ShareFile(ctx context.Context, c *Container, m *Mount)
 			return nil, nil
 		}
 
+		if mustCopyEmptyDir {
+			// Cache the host emptyDir guestPath so other containers in the pod
+			// share the same copied writable directory.
+			f.srcGuestMap[m.Source] = guestPath
+		}
 	} else {
+		// Filesystem sharing must use this mount path. It is the standard guest
+		// shared directory normally and the required rootless-adjusted path when
+		// rootless mode is enabled.
+		guestPath = filepath.Join(kataGuestSharedDir(), filename)
+
 		// These mounts are created in the shared dir
 		mountDest := filepath.Join(getMountPath(f.sandbox.ID()), filename)
 		if !m.ReadOnly {
@@ -403,6 +487,9 @@ func (f *FilesystemShare) UnshareFile(ctx context.Context, c *Container, m *Moun
 		}
 	}
 
+	// Not deleting from f.srcGuestMap since this function is not
+	// called for mounts without HostPath.
+
 	return nil
 }
 
@@ -455,28 +542,178 @@ func (f *FilesystemShare) shareRootFilesystemWithNydus(ctx context.Context, c *C
 	f.Logger().Infof("Nydus rootfs info: %#v\n", rootfs)
 
 	return &SharedFile{
-		storage:   rootfs,
-		guestPath: rootfsGuestPath,
+		containerStorages: []*grpc.Storage{rootfs},
+		guestPath:         rootfsGuestPath,
 	}, nil
+}
+
+// handleVirtualVolume processes all `io.katacontainers.volume=` messages in rootFs.Options,
+// creating storage, and then aggregates all storages  into an array.
+func handleVirtualVolume(c *Container) ([]*grpc.Storage, string, error) {
+	var volumes []*grpc.Storage
+	var volumeType string
+
+	for _, o := range c.rootFs.Options {
+		if strings.HasPrefix(o, VirtualVolumePrefix) {
+			virtVolume, err := types.ParseKataVirtualVolume(strings.TrimPrefix(o, VirtualVolumePrefix))
+			if err != nil {
+				return nil, "", err
+			}
+
+			volumeType = virtVolume.VolumeType
+			var vol *grpc.Storage
+			if volumeType == types.KataVirtualVolumeImageGuestPullType {
+				vol, err = handleVirtualVolumeStorageObject(c, "", virtVolume)
+				if err != nil {
+					return nil, "", err
+				}
+			}
+
+			if vol != nil {
+				volumes = append(volumes, vol)
+			}
+		}
+	}
+
+	return volumes, volumeType, nil
+}
+
+func (f *FilesystemShare) shareRootFilesystemWithVirtualVolume(ctx context.Context, c *Container) (*SharedFile, error) {
+	guestPath := filepath.Join("/run/kata-containers/", c.id, c.rootfsSuffix)
+	rootFsStorages, _, err := handleVirtualVolume(c)
+	if err != nil {
+		return nil, err
+	}
+
+	return &SharedFile{
+		containerStorages: rootFsStorages,
+		guestPath:         guestPath,
+	}, nil
+}
+
+func (f *FilesystemShare) shareRootFilesystemWithErofs(ctx context.Context, c *Container) (*SharedFile, error) {
+	guestPath := filepath.Join("/run/kata-containers/", c.id, c.rootfsSuffix)
+	var rootFsStorages []*grpc.Storage
+	var rwStor *grpc.Storage
+
+	for i, d := range c.devices {
+		// ref: https://github.com/containerd/containerd/blob/v2.2.0/plugins/snapshots/erofs/erofs.go#L166
+		if filepath.Base(d.ContainerPath) == "layer.erofs" {
+			device := c.sandbox.devManager.GetDeviceByID(d.ID)
+			if device == nil {
+				return nil, fmt.Errorf("failed to find device by id %q", d.ID)
+			}
+			vol, err := handleBlockVolume(c, device)
+			if err != nil {
+				return nil, err
+			}
+			filename := b64.URLEncoding.EncodeToString([]byte(vol.Source))
+			vol.Fstype = "erofs"
+			vol.Options = append(vol.Options, "ro")
+			vol.MountPoint = filepath.Join(defaultKataGuestVirtualVolumedir, filename)
+			c.devices[i].ContainerPath = vol.MountPoint
+			rootFsStorages = append(rootFsStorages, vol)
+			// ref: https://github.com/containerd/containerd/blob/v2.2.0/plugins/snapshots/erofs/erofs.go#L161
+		} else if filepath.Base(d.ContainerPath) == "rwlayer.img" {
+			device := c.sandbox.devManager.GetDeviceByID(d.ID)
+			if device == nil {
+				return nil, fmt.Errorf("failed to find device by id %q", d.ID)
+			}
+			vol, err := handleBlockVolume(c, device)
+			if err != nil {
+				return nil, err
+			}
+			filename := b64.URLEncoding.EncodeToString([]byte(vol.Source))
+			vol.Fstype = "ext4"
+			vol.MountPoint = filepath.Join(defaultKataGuestVirtualVolumedir, filename)
+			c.devices[i].ContainerPath = vol.MountPoint
+			rwStor = vol
+		}
+	}
+
+	overlayDirDriverOption := "io.katacontainers.volume.overlayfs.create_directory"
+	var rootfsUpperDir, rootfsWorkDir string
+	if rwStor != nil {
+		rootfsUpperDir = filepath.Join(rwStor.MountPoint, "upper")
+		rootfsWorkDir = filepath.Join(rwStor.MountPoint, "work")
+	} else {
+		rootfsUpperDir = filepath.Join("/run/kata-containers/", c.id, "fs")
+		rootfsWorkDir = filepath.Join("/run/kata-containers/", c.id, "work")
+	}
+	rootfs := &grpc.Storage{}
+	rootfs.MountPoint = guestPath
+	rootfs.Source = typeOverlayFS
+	rootfs.Fstype = typeOverlayFS
+	rootfs.Driver = kataOverlayDevType
+	rootfs.DriverOptions = append(rootfs.DriverOptions, fmt.Sprintf("%s=%s", overlayDirDriverOption, rootfsUpperDir))
+	rootfs.DriverOptions = append(rootfs.DriverOptions, fmt.Sprintf("%s=%s", overlayDirDriverOption, rootfsWorkDir))
+	rootfs.Options = []string{}
+	for _, v := range rootFsStorages {
+		if len(rootfs.Options) == 0 {
+			rootfs.Options = append(rootfs.Options, fmt.Sprintf("%s=%s", lowerDir, v.MountPoint))
+		} else {
+			rootfs.Options[0] = (rootfs.Options[0] + fmt.Sprintf(":%s", v.MountPoint))
+		}
+	}
+	rootfs.Options = append(rootfs.Options, fmt.Sprintf("%s=%s", upperDir, rootfsUpperDir))
+	rootfs.Options = append(rootfs.Options, fmt.Sprintf("%s=%s", workDir, rootfsWorkDir))
+
+	if rwStor != nil {
+		rootFsStorages = append(rootFsStorages, rwStor)
+	}
+	rootFsStorages = append(rootFsStorages, rootfs)
+
+	return &SharedFile{
+		containerStorages: rootFsStorages,
+		guestPath:         guestPath,
+	}, nil
+}
+
+func forceGuestPull(c *Container) (*SharedFile, error) {
+	sf := &SharedFile{
+		guestPath: filepath.Join("/run/kata-containers/", c.id, c.rootfsSuffix),
+	}
+	guestPullVolume := &types.KataVirtualVolume{
+		VolumeType: types.KataVirtualVolumeImageGuestPullType,
+	}
+	vol, err := handleVirtualVolumeStorageObject(c, "", guestPullVolume)
+	if err != nil {
+		return nil, fmt.Errorf("forcing guest pull virtual volume: %w", err)
+	}
+	sf.containerStorages = append(sf.containerStorages, vol)
+	return sf, nil
 }
 
 // func (c *Container) shareRootfs(ctx context.Context) (*grpc.Storage, string, error) {
 func (f *FilesystemShare) ShareRootFilesystem(ctx context.Context, c *Container) (*SharedFile, error) {
-	if c.rootFs.Type == NydusRootFSType {
+	if f.sandbox.IsGuestPullForced() {
+		return forceGuestPull(c)
+	}
+
+	if HasOptionPrefix(c.rootFs.Options, VirtualVolumePrefix) {
+		return f.shareRootFilesystemWithVirtualVolume(ctx, c)
+	}
+
+	if IsNydusRootFSType(c.rootFs.Type) {
 		return f.shareRootFilesystemWithNydus(ctx, c)
 	}
+
+	if IsErofsRootFS(c.rootFs) {
+		return f.shareRootFilesystemWithErofs(ctx, c)
+	}
+
 	rootfsGuestPath := filepath.Join(kataGuestSharedDir(), c.id, c.rootfsSuffix)
 
 	if HasOptionPrefix(c.rootFs.Options, annotations.FileSystemLayer) {
 		path := filepath.Join("/run/kata-containers", c.id, "rootfs")
 		return &SharedFile{
-			storage: &grpc.Storage{
+			containerStorages: []*grpc.Storage{{
 				MountPoint: path,
 				Source:     "none",
 				Fstype:     c.rootFs.Type,
 				Driver:     kataOverlayDevType,
 				Options:    c.rootFs.Options,
-			},
+			}},
 			guestPath: path,
 		}, nil
 	}
@@ -501,21 +738,17 @@ func (f *FilesystemShare) ShareRootFilesystem(ctx context.Context, c *Container)
 			f.Logger().Error("malformed block drive")
 			return nil, fmt.Errorf("malformed block drive")
 		}
-		switch {
-		case f.sandbox.config.HypervisorConfig.BlockDeviceDriver == config.VirtioMmio:
+		switch f.sandbox.config.HypervisorConfig.BlockDeviceDriver {
+		case config.VirtioMmio:
 			rootfsStorage.Driver = kataMmioBlkDevType
 			rootfsStorage.Source = blockDrive.VirtPath
-		case f.sandbox.config.HypervisorConfig.BlockDeviceDriver == config.VirtioBlockCCW:
+		case config.VirtioBlockCCW:
 			rootfsStorage.Driver = kataBlkCCWDevType
 			rootfsStorage.Source = blockDrive.DevNo
-		case f.sandbox.config.HypervisorConfig.BlockDeviceDriver == config.VirtioBlock:
+		case config.VirtioBlock:
 			rootfsStorage.Driver = kataBlkDevType
-			if f.sandbox.config.HypervisorType == AcrnHypervisor {
-				rootfsStorage.Source = blockDrive.VirtPath
-			} else {
-				rootfsStorage.Source = blockDrive.PCIPath.String()
-			}
-		case f.sandbox.config.HypervisorConfig.BlockDeviceDriver == config.VirtioSCSI:
+			rootfsStorage.Source = blockDrive.PCIPath.String()
+		case config.VirtioSCSI:
 			rootfsStorage.Driver = kataSCSIDevType
 			rootfsStorage.Source = blockDrive.SCSIAddr
 		default:
@@ -541,8 +774,8 @@ func (f *FilesystemShare) ShareRootFilesystem(ctx context.Context, c *Container)
 		}
 
 		return &SharedFile{
-			storage:   rootfsStorage,
-			guestPath: rootfsGuestPath,
+			containerStorages: []*grpc.Storage{rootfsStorage},
+			guestPath:         rootfsGuestPath,
 		}, nil
 	}
 
@@ -556,13 +789,13 @@ func (f *FilesystemShare) ShareRootFilesystem(ctx context.Context, c *Container)
 	}
 
 	return &SharedFile{
-		storage:   nil,
-		guestPath: rootfsGuestPath,
+		containerStorages: nil,
+		guestPath:         rootfsGuestPath,
 	}, nil
 }
 
 func (f *FilesystemShare) UnshareRootFilesystem(ctx context.Context, c *Container) error {
-	if c.rootFs.Type == NydusRootFSType {
+	if IsNydusRootFSType(c.rootFs.Type) {
 		if err2 := nydusContainerCleanup(ctx, getMountPath(c.sandbox.id), c); err2 != nil {
 			f.Logger().WithError(err2).Error("rollback failed nydusContainerCleanup")
 		}
@@ -637,14 +870,6 @@ func (f *FilesystemShare) StartFileEventWatcher(ctx context.Context) error {
 	f.eventLoopStarted = true
 	f.eventLoopStartedLock.Unlock()
 
-	// Regex for the temp directory with timestamp that is used to handle the updates by K8s
-	// Examples
-	// /var/lib/kubelet/pods/e33907eb-54c7-4113-a3dc-447f247084cc/volumes/kubernetes.io~secret/foosecret/..2023_07_27_07_13_00.1257228
-	// /var/lib/kubelet/pods/e33907eb-54c7-4113-a3dc-447f247084cc/volumes/kubernetes.io~downward-api/fooinfo/..2023_07_27_07_13_00.3704578339
-	// The timestamp is of the format 2023_07_27_07_13_00.3704578339 or 2023_07_27_07_13_00.1257228
-
-	var re = regexp.MustCompile(`(?m)\s*[0-9]{4}_[0-9]{2}_[0-9]{2}_[0-9]{2}_[0-9]{2}_[0-9]{2}.[0-9]*$`)
-
 	f.Logger().Debugf("StartFileEventWatcher: srcDstMap dump %v", f.srcDstMap)
 
 	for {
@@ -701,7 +926,7 @@ func (f *FilesystemShare) StartFileEventWatcher(ctx context.Context) error {
 
 				source := event.Name
 				f.Logger().Infof("StartFileEventWatcher: source for the event: %s", source)
-				if re.FindString(source) != "" {
+				if f.timestampDirRegex.FindString(source) != "" {
 					// This block will be entered when the timestamped directory is removed.
 					// This also indicates that foo/..data contains the updated info
 
@@ -720,7 +945,7 @@ func (f *FilesystemShare) StartFileEventWatcher(ctx context.Context) error {
 						f.Logger().Infof("StartFileEventWatcher: Copy file from src (%s) to dst (%s)", dataDir, destination)
 						// We explicitly ignore any errors here. Copy will continue for other files
 						// Errors are logged in the copyFilesFromDataDir method
-						_ = f.copyFilesFromDataDir(dataDir, destination)
+						_ = f.copyUpdatedFiles(dataDir, destination, source)
 					}
 					f.srcDstMapLock.Unlock()
 				}
@@ -740,71 +965,103 @@ func (f *FilesystemShare) StartFileEventWatcher(ctx context.Context) error {
 	}
 }
 
-func (f *FilesystemShare) copyFilesFromDataDir(src, dst string) error {
+func (f *FilesystemShare) copyUpdatedFiles(src, dst, oldtsDir string) error {
+	f.Logger().Infof("copyUpdatedFiles: Copy src:%s to dst:%s from old src:%s", src, dst, oldtsDir)
 
-	// The src is a symlink and is of the following form:
-	// /var/lib/kubelet/pods/<uid>/volumes/<k8s-special-dir>/foo/..data
-	// eg, for configmap, src = /var/lib/kubelet/pods/b44e3261-7cf0-48d3-83b4-6094bba95dc8/volumes/kubernetes.io~configmap/foo/..data
-	// The dst is of the following form:
-	// /run/kata-containers/shared/containers/<cid>-<volume>/..data
-	// eg. dst = /run/kata-containers/shared/containers/e70739a6cc38daf15de916b4d22aad035d42bc977024f2c8cae6b0b607251d44-39407b03e4b448f1-config-volume/..data
-
+	// 1. Read the symlink and get the actual data directory
 	// Get the symlink target
 	// eg. srcdir = ..2023_02_09_06_40_51.2326009790
-	srcdir, err := os.Readlink(src)
+	srcnewtsdir, err := os.Readlink(src)
 	if err != nil {
-		f.Logger().Infof("copyFilesFromDataDir: Reading data symlink returned error (%v)", err)
+		f.Logger().WithError(err).Errorf("copyUpdatedFiles: Reading data symlink %s returned error", src)
 		return err
 	}
 
-	// Get the base directory path of src
-	volumeDir := filepath.Dir(src)
-	// eg. volumeDir = /var/lib/kubelet/pods/b44e3261-7cf0-48d3-83b4-6094bba95dc8/volumes/kubernetes.io~configmap/foo
+	// 2. Construct the path to new timestamped directory in host
+	srcBasePath := filepath.Dir(src)
+	srcNewTsPath := filepath.Join(srcBasePath, srcnewtsdir)
 
-	dataDir := filepath.Join(volumeDir, srcdir)
-	// eg. dataDir = /var/lib/kubelet/pods/b44e3261-7cf0-48d3-83b4-6094bba95dc8/volumes/kubernetes.io~configmap/foo/..2023_02_09_06_40_51.2326009790
+	// 3. Construct the path to copy new timestamped directory in guest
+	dstBasePath := filepath.Dir(dst)
+	dstNewTsPath := filepath.Join(dstBasePath, srcnewtsdir)
 
-	f.Logger().Infof("copyFilesFromDataDir: full path to data symlink (%s)", dataDir)
+	// 4. Create a hashmap to add newly added secrets (not present in the old ts directory)
+	// for creating user visible symlinks
+	newSecrets := make(map[string]string)
 
-	// Using WalkDir is more efficient than Walk
-	err = filepath.WalkDir(dataDir,
-		func(path string, d fs.DirEntry, err error) error {
-			if err != nil {
-				f.Logger().Infof("copyFilesFromDataDir: Error in file walk %v", err)
-				return err
+	f.Logger().Infof("copyUpdatedFiles: new src dir: %s && new dst dir:%s", srcNewTsPath, dstNewTsPath)
+
+	// 5. Copy all the files from the new timestamped directory to the guest
+	walk := func(srcPath string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		dstPath := dstNewTsPath
+		if !info.Mode().IsDir() {
+			// Construct the path for the files to be copied to.
+			dstPath = filepath.Join(dstPath, filepath.Base(srcPath))
+
+			// Determine if this secret was present in the old timestamped directory.
+			// If not, add it to the newSecrets map to create user visible symlinks.
+			oldSecret := filepath.Join(oldtsDir, filepath.Base(srcPath))
+			if _, ok := f.srcDstMap[oldSecret]; !ok {
+				// these are symlinks to '..data' inside the k8's volume
+				symlinkSrc := filepath.Join(filepath.Dir(srcNewTsPath), filepath.Base(srcPath))
+				symlinkDst := filepath.Join(filepath.Dir(dstNewTsPath), filepath.Base(srcPath))
+				newSecrets[symlinkSrc] = symlinkDst
 			}
+		}
 
-			// eg. path = /var/lib/kubelet/pods/b44e3261-7cf0-48d3-83b4-6094bba95dc8/volumes/kubernetes.io~configmap/foo/..2023_02_09_06_40_51.2326009790/{key1, key2, ...}
-			f.Logger().Infof("copyFilesFromDataDir: path (%s)", path)
-			if !d.IsDir() {
-				// Using filePath.Rel to handle these cases
-				// /var/lib/kubelet/pods/2481b69e-9ac8-475a-9e11-88af1daca60e/volumes/kubernetes.io~projected/all-in-one/..2023_02_13_12_35_49.1380323032/config-dir1/config.file1
-				// /var/lib/kubelet/pods/2481b69e-9ac8-475a-9e11-88af1daca60e/volumes/kubernetes.io~projected/all-in-one/..2023_02_13_12_35_49.1380323032/config.file2
-				rel, err := filepath.Rel(dataDir, path)
-				if err != nil {
-					f.Logger().Infof("copyFilesFromDataDir: Unable to get relative path")
-					return err
-				}
-				f.Logger().Debugf("copyFilesFromDataDir: dataDir(%s), path(%s), rel(%s)", dataDir, path, rel)
-				// Form the destination path in the guest
-				dstFile := filepath.Join(dst, rel)
-				f.Logger().Infof("copyFilesFromDataDir: Copying file %s to dst %s", path, dstFile)
-				err = f.sandbox.agent.copyFile(context.Background(), path, dstFile)
-				if err != nil {
-					f.Logger().Infof("copyFilesFromDataDir: Error in copying file %v", err)
-					return err
-				}
-				f.Logger().Infof("copyFilesFromDataDir: Successfully copied file (%s)", path)
-			}
-			return nil
-		})
+		err = f.sandbox.agent.copyFile(context.Background(), srcPath, dstPath)
+		if err != nil {
+			f.Logger().WithError(err).Error("Failed to copy file")
+			return err
+		}
 
-	if err != nil {
-		f.Logger().Infof("copyFilesFromDataDir: Error in filepath.WalkDir (%v)", err)
+		// Create a new entry in the globalMap to be used in the event loop
+		f.Logger().Infof("copyUpdatedFiles: Adding srcPath(%s) dstPath(%s) to srcDstMap", srcPath, dstPath)
+		f.srcDstMap[srcPath] = append(f.srcDstMap[srcPath], dstPath)
+		return nil
+	}
+
+	if err := filepath.WalkDir(srcNewTsPath, walk); err != nil {
+		f.Logger().WithError(err).Error("copyUpdatedFiles: failed to copy files.")
 		return err
 	}
 
-	f.Logger().Infof("copyFilesFromDataDir: Done")
+	// 6. Add watcher to the new timestamped directory in host
+	err = f.watchDir(srcNewTsPath)
+	if err != nil {
+		f.Logger().WithError(err).Error("copyUpdatedFiles: Failed to add watcher on new ts source.")
+		return err
+	}
+
+	// 7. Update the '..data' symlink to fix user visible files
+	srcDataPath := filepath.Join(filepath.Dir(srcNewTsPath), "..data")
+	dstDataPath := filepath.Join(filepath.Dir(dstNewTsPath), "..data")
+	err = f.sandbox.agent.copyFile(context.Background(), srcDataPath, dstDataPath)
+	if err != nil {
+		f.Logger().WithError(err).Errorf("copyUpdatedFiles: Failed to update data symlink")
+		return err
+	}
+
+	// 8. Create user visible symlinks for any newly created secrets
+	// For existing secrets, the update to '..data' symlink above will fix the user visible files.
+	// TODO: For deleted secrets, the existing symlink will point to non-existing entity after
+	// update to '..data' symlink. Since there is NO DELETE-API in agent, the symlinks will exist
+	for k, v := range newSecrets {
+		err = f.sandbox.agent.copyFile(context.Background(), k, v)
+		if err != nil {
+			f.Logger().WithError(err).Error("copyUpdatedFiles: Failed to copy newly created secret")
+			return err
+		}
+	}
+
 	return nil
 }
 

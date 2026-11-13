@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 #
 # Copyright (c) 2017-2019 Intel Corporation
+# Copyright 2026 Google LLC
 #
 # SPDX-License-Identifier: Apache-2.0
 
-[ -z "${DEBUG}" ] || set -x
+[[ -z "${DEBUG}" ]] || set -x
 
 set -o errexit
 # set -o nounset
@@ -12,24 +13,18 @@ set -o pipefail
 
 DOCKER_RUNTIME=${DOCKER_RUNTIME:-runc}
 MEASURED_ROOTFS=${MEASURED_ROOTFS:-no}
+IMAGE_SIZE_ALIGNMENT_MB=${IMAGE_SIZE_ALIGNMENT_MB:-128}
 
-#For cross build
-CROSS_BUILD=${CROSS_BUILD:-false}
-BUILDX=""
-PLATFORM=""
-TARGET_ARCH=${TARGET_ARCH:-$(uname -m)}
 ARCH=${ARCH:-$(uname -m)}
-[ "${TARGET_ARCH}" == "aarch64" ] && TARGET_ARCH=arm64
-TARGET_OS=${TARGET_OS:-linux}
-[ "${CROSS_BUILD}" == "true" ] && BUILDX=buildx && PLATFORM="--platform=${TARGET_OS}/${TARGET_ARCH}"
+BUILD_VARIANT=${BUILD_VARIANT:-}
 
 readonly script_name="${0##*/}"
-readonly script_dir=$(dirname "$(readlink -f "$0")")
+script_dir=$(dirname "$(readlink -f "$0")")
+readonly script_dir
 readonly lib_file="${script_dir}/../scripts/lib.sh"
 
 readonly ext4_format="ext4"
 readonly xfs_format="xfs"
-readonly erofs_format="erofs"
 
 # ext4: percentage of the filesystem which may only be allocated by privileged processes.
 readonly reserved_blocks_percentage=3
@@ -50,39 +45,13 @@ readonly dax_header_sz=2
 # [2] - https://nvdimm.wiki.kernel.org/2mib_fs_dax
 readonly dax_alignment=2
 
-# The list of systemd units and files that are not needed in Kata Containers
-readonly -a systemd_units=(
-	"systemd-coredump@"
-	"systemd-journald"
-	"systemd-journald-dev-log"
-	"systemd-journal-flush"
-	"systemd-random-seed"
-	"systemd-timesyncd"
-	"systemd-tmpfiles-setup"
-	"systemd-udevd"
-	"systemd-udevd-control"
-	"systemd-udevd-kernel"
-	"systemd-udev-trigger"
-	"systemd-update-utmp"
-)
-
-readonly -a systemd_files=(
-	"systemd-bless-boot-generator"
-	"systemd-fstab-generator"
-	"systemd-getty-generator"
-	"systemd-gpt-auto-generator"
-	"systemd-tmpfiles-cleanup.timer"
-)
-
 # Set a default value
 AGENT_INIT=${AGENT_INIT:-no}
 SELINUX=${SELINUX:-no}
 SELINUXFS="/sys/fs/selinux"
 
-# Align image to 128M
-readonly mem_boundary_mb=128
-
 # shellcheck source=../scripts/lib.sh
+# shellcheck disable=SC1091
 source "${lib_file}"
 
 usage() {
@@ -98,11 +67,16 @@ Options:
 	-f Filesystem type to use, only ext4, xfs and erofs are supported. ENV: FS_TYPE
 
 Extra environment variables:
+	BUILD_VARIANT:  "substrate" builds a read-only ext4 image in userspace for
+	                virtio-pmem, without the legacy NVDIMM metadata header.
 	AGENT_BIN:      Use it to change the expected agent binary name
 	AGENT_INIT:     Use kata agent as init process
 	BLOCK_SIZE:     Use to specify the size of blocks in bytes. DEFAULT: 4096
 	IMAGE_REGISTRY: Hostname for the image registry used to pull down the rootfs build image.
 	NSDAX_BIN:      Use to specify path to pre-compiled 'nsdax' tool.
+	SKIP_DAX_HEADER: If set to "yes", skip the DAX/NVDIMM header. Use for
+	                virtio-blk-pci images that never use NVDIMM.
+	                DEFAULT: "no"
 	USE_DOCKER:     If set will build image in a Docker Container (requries docker)
 	                DEFAULT: not set
 	USE_PODMAN:     If set and USE_DOCKER not set, will build image in a Podman Container (requries podman)
@@ -157,26 +131,27 @@ build_with_container() {
 	image_name=$(basename "${image}")
 
 	engine_build_args=""
-	if [ -n "${IMAGE_REGISTRY}" ]; then
+	if [[ -n "${IMAGE_REGISTRY}" ]]; then
 		engine_build_args+=" --build-arg IMAGE_REGISTRY=${IMAGE_REGISTRY}"
 	fi
-	if [ -n "${USE_PODMAN}" ]; then
+	if [[ -n "${USE_PODMAN}" ]]; then
 		engine_build_args+=" --runtime ${DOCKER_RUNTIME}"
 	fi
 
-	"${container_engine}" ${BUILDX} build ${PLATFORM}  \
+	# shellcheck disable=SC2154,SC2086,SC2248
+	"${container_engine}" build \
 		   ${engine_build_args} \
 		   --build-arg http_proxy="${http_proxy}" \
 		   --build-arg https_proxy="${https_proxy}" \
 		   -t "${container_image_name}" "${script_dir}"
 
 	readonly mke2fs_conf="/etc/mke2fs.conf"
-	if [ -f "${mke2fs_conf}" ]; then
+	if [[ -f "${mke2fs_conf}" ]]; then
 		shared_files+="-v ${mke2fs_conf}:${mke2fs_conf}:ro "
 	fi
 
-	if [ "${SELINUX}" == "yes" ]; then
-		if mountpoint $SELINUXFS > /dev/null; then
+	if [[ "${SELINUX}" == "yes" ]]; then
+		if mountpoint "${SELINUXFS}" > /dev/null; then
 			selinuxfs="-v ${SELINUXFS}:${SELINUXFS}"
 		else
 			die "Make sure that SELinux is enabled on the host"
@@ -186,6 +161,7 @@ build_with_container() {
 	#Make sure we use a compatible runtime to build rootfs
 	# In case Clear Containers Runtime is installed we dont want to hit issue:
 	#https://github.com/clearcontainers/runtime/issues/828
+	# shellcheck disable=SC2086,SC2154
 	"${container_engine}" run  \
 		   --rm \
 		   --runtime "${DOCKER_RUNTIME}"  \
@@ -196,11 +172,16 @@ build_with_container() {
 		   --env BLOCK_SIZE="${block_size}" \
 		   --env ROOT_FREE_SPACE="${root_free_space}" \
 		   --env NSDAX_BIN="${nsdax_bin}" \
+		   --env SKIP_DAX_HEADER="${SKIP_DAX_HEADER}" \
 		   --env MEASURED_ROOTFS="${MEASURED_ROOTFS}" \
+		   --env SKIP_ROOTFS_CHECK="${SKIP_ROOTFS_CHECK:-no}" \
 		   --env SELINUX="${SELINUX}" \
 		   --env DEBUG="${DEBUG}" \
 		   --env ARCH="${ARCH}" \
-		   --env TARGET_ARCH="${TARGET_ARCH}" \
+		   --env USER="$(id -u)" \
+		   --env GROUP="$(id -g)" \
+		   --env IMAGE_SIZE_ALIGNMENT_MB="${IMAGE_SIZE_ALIGNMENT_MB}" \
+		   --env BUILD_VARIANT="${BUILD_VARIANT}" \
 		   -v /dev:/dev \
 		   -v "${script_dir}":"/osbuilder" \
 		   -v "${script_dir}/../scripts":"/scripts" \
@@ -208,19 +189,19 @@ build_with_container() {
 		   -v "${image_dir}":"/image" \
 		   ${selinuxfs} \
 		   ${shared_files} \
-		   ${container_image_name} \
+		   "${container_image_name}" \
 		   bash "/osbuilder/${script_name}" -o "/image/${image_name}" /rootfs
 }
 
 check_rootfs() {
 	local rootfs="${1}"
 
-	[ -d "${rootfs}" ] || die "${rootfs} is not a directory"
+	[[ -d "${rootfs}" ]] || die "${rootfs} is not a directory"
 
 	# The kata rootfs image expect init and kata-agent to be installed
 	init_path="/sbin/init"
 	init="${rootfs}${init_path}"
-	if [ ! -x "${init}" ] && [ ! -L "${init}" ]; then
+	if [[ ! -x "${init}" ]] && [[ ! -L "${init}" ]]; then
 		error "${init_path} is not installed in ${rootfs}"
 		return 1
 	fi
@@ -232,14 +213,21 @@ check_rootfs() {
 	# check agent or systemd
 	case "${AGENT_INIT}" in
 		"no")
-			for systemd_path in $candidate_systemd_paths; do
+			# Check if we have alternative init systems installed
+			# For now check if we have NVRC
+			if readlink "${rootfs}/sbin/init" | grep -q "NVRC"; then
+				OK "init is NVRC"
+				return 0
+			fi
+
+			for systemd_path in ${candidate_systemd_paths}; do
 				systemd="${rootfs}${systemd_path}"
-				if [ -x "${systemd}" ] || [ -L "${systemd}" ]; then
+				if [[ -x "${systemd}" ]] || [[ -L "${systemd}" ]]; then
 					found="yes"
 					break
 				fi
 			done
-			if [ ! $found ]; then
+			if [[ ! "${found}" ]]; then
 				error "None of ${candidate_systemd_paths} is installed in ${rootfs}"
 				return 1
 			fi
@@ -249,14 +237,14 @@ check_rootfs() {
 		"yes")
 			agent_path="/sbin/init"
 			agent="${rootfs}${agent_path}"
-			if  [ ! -x "${agent}" ]; then
+			if  [[ ! -x "${agent}" ]]; then
 				error "${agent_path} is not installed in ${rootfs}. Use AGENT_BIN env variable to change the expected agent binary name"
 				return 1
 			fi
 			# checksum must be different to system
-			for systemd_path in $candidate_systemd_paths; do
+			for systemd_path in ${candidate_systemd_paths}; do
 				systemd="${rootfs}${systemd_path}"
-				if [ -f "${systemd}" ] && cmp -s "${systemd}" "${agent}"; then
+				if [[ -f "${systemd}" ]] && cmp -s "${systemd}" "${agent}"; then
 					error "The agent is not the init process. ${agent_path} is systemd"
 					return 1
 				fi
@@ -279,13 +267,19 @@ calculate_required_disk_size() {
 	local fs_type="$2"
 	local block_size="$3"
 
-	readonly rootfs_size_mb=$(du -B 1M -s "${rootfs}" | awk '{print $1}')
-	readonly image="$(mktemp)"
-	readonly mount_dir="$(mktemp -d)"
+	local rootfs_size_mb
+	rootfs_size_mb=$(du -B 1M -s "${rootfs}" | awk '{print $1}')
+	readonly rootfs_size_mb
+	local image
+	image="$(mktemp)"
+	readonly image
+	local mount_dir
+	mount_dir="$(mktemp -d)"
+	readonly mount_dir
 	readonly max_tries=20
 	readonly increment=10
 
-	for i in $(seq 1 $max_tries); do
+	for i in $(seq 1 "${max_tries}"); do
 		local img_size="$((rootfs_size_mb + (i * increment)))"
 		create_disk "${image}" "${img_size}" "${fs_type}" "${rootfs_start}" > /dev/null 2>&1
 		if ! device="$(setup_loop_device "${image}")"; then
@@ -300,7 +294,7 @@ calculate_required_disk_size() {
 		umount "${mount_dir}"
 		losetup -d "${device}"
 
-		if [ "${avail}" -gt "${rootfs_size_mb}" ]; then
+		if [[ "${avail}" -gt "${rootfs_size_mb}" ]]; then
 			rmdir "${mount_dir}"
 			rm -f "${image}"
 			echo "${img_size}"
@@ -321,19 +315,22 @@ calculate_img_size() {
 	local fs_type="$3"
 	local block_size="$4"
 
-	# rootfs start + DAX header size + rootfs end
-	local reserved_size_mb=$((rootfs_start + dax_header_sz + rootfs_end))
+	local dax_overhead=0
+	if [[ "${SKIP_DAX_HEADER:-no}" != "yes" ]]; then
+		dax_overhead="${dax_header_sz}"
+	fi
+	local reserved_size_mb=$((rootfs_start + dax_overhead + rootfs_end))
 
 	disk_size="$(calculate_required_disk_size "${rootfs}" "${fs_type}" "${block_size}")"
 
 	img_size="$((disk_size + reserved_size_mb))"
-	if [ -n "${root_free_space_mb}" ]; then
+	if [[ -n "${root_free_space_mb}" ]]; then
 		img_size="$((img_size + root_free_space_mb))"
 	fi
 
-	remaining="$((img_size % mem_boundary_mb))"
-	if [ "${remaining}" != "0" ]; then
-		img_size=$((img_size + mem_boundary_mb - remaining))
+	remaining="$((img_size % IMAGE_SIZE_ALIGNMENT_MB))"
+	if [[ "${remaining}" != "0" ]]; then
+		img_size=$((img_size + IMAGE_SIZE_ALIGNMENT_MB - remaining))
 	fi
 
 	echo "${img_size}"
@@ -350,7 +347,7 @@ setup_loop_device() {
 	partprobe -s "${device}" > /dev/null
 	# Poll for the block device p1
 	for _ in $(seq 1 5); do
-		if [ -b "${device}p1" ]; then
+		if [[ -b "${device}p1" ]]; then
 			echo "${device}"
 			return 0
 		fi
@@ -406,15 +403,20 @@ create_disk() {
 	# The partition is the rootfs content
 	info "Creating partitions"
 
-	if [ "${MEASURED_ROOTFS}" == "yes" ]; then
+	if [[ "${rootfs_end}" == "-1" ]]; then
+		rootfs_end_unit="s"
+	else
+		rootfs_end_unit="MiB"
+	fi
+	if [[ "${MEASURED_ROOTFS}" == "yes" ]]; then
 		info "Creating partitions with hash device"
 		# The hash data will take less than one percent disk space to store
-		hash_start=$(echo $img_size | awk '{print $1 * 0.99}' |cut -d $(locale decimal_point) -f 1)
-		partition_param="mkpart primary ${fs_type} ${part_start}M ${hash_start}M "
-		partition_param+="mkpart primary ${fs_type} ${hash_start}M ${rootfs_end}M "
+		hash_start=$(echo "${img_size}" | awk '{print $1 * 0.99}' |cut -d "$(locale decimal_point)" -f 1)
+		partition_param="mkpart primary ${fs_type} ${part_start}MiB ${hash_start}MiB "
+		partition_param+="mkpart primary ${fs_type} ${hash_start}MiB ${rootfs_end}${rootfs_end_unit} "
 		partition_param+="set 1 boot on"
 	else
-		partition_param="mkpart primary ${fs_type} ${part_start}M ${rootfs_end}M"
+		partition_param="mkpart primary ${fs_type} ${part_start}MiB ${rootfs_end}${rootfs_end_unit}"
 	fi
 
 	parted -s -a optimal "${image}" -- \
@@ -428,18 +430,18 @@ setup_selinux() {
 		local mount_dir="$1"
 		local agent_bin="$2"
 
-		if [ "${SELINUX}" == "yes" ]; then
-			if [ "${AGENT_INIT}" == "yes" ]; then
+		if [[ "${SELINUX}" == "yes" ]]; then
+			if [[ "${AGENT_INIT}" == "yes" ]]; then
 				die "Guest SELinux with the agent init is not supported yet"
 			fi
 
 			info "Labeling rootfs for SELinux"
 			selinuxfs_path="${mount_dir}${SELINUXFS}"
-			mkdir -p "$selinuxfs_path"
-			if mountpoint $SELINUXFS > /dev/null && \
+			mkdir -p "${selinuxfs_path}"
+			if mountpoint "${SELINUXFS}" > /dev/null && \
 				chroot "${mount_dir}" command -v restorecon > /dev/null; then
-				mount -t selinuxfs selinuxfs "$selinuxfs_path"
-				chroot "${mount_dir}" restorecon -RF -e ${SELINUXFS} /
+				mount -t selinuxfs selinuxfs "${selinuxfs_path}"
+				chroot "${mount_dir}" restorecon -RF -e "${SELINUXFS}" /
 				umount "${selinuxfs_path}"
 			else
 				die "Could not label the rootfs. Make sure that SELinux is enabled on the host \
@@ -450,22 +452,203 @@ setup_selinux() {
 
 setup_systemd() {
 		local mount_dir="$1"
-
-		info "Removing unneeded systemd services and sockets"
-		for u in "${systemd_units[@]}"; do
-			find "${mount_dir}" -type f \( \
-				 -name "${u}.service" -o \
-				 -name "${u}.socket" \) \
-				 -exec rm -f {} \;
-		done
-
-		info "Removing unneeded systemd files"
-		for u in "${systemd_files[@]}"; do
-			find "${mount_dir}" -type f -name "${u}" -exec rm -f {} \;
-		done
-
+		local fs_type="${2:-}"
+		# Extension content images (e.g. the gpu extension) carry no /etc and are not
+		# bootable systemd rootfses, so there is nothing to set up here.
+		if [[ ! -d "${mount_dir}/etc" ]]; then
+			info "No /etc in rootfs; skipping systemd machine-id setup"
+			return 0
+		fi
 		info "Creating empty machine-id to allow systemd to bind-mount it"
 		touch "${mount_dir}/etc/machine-id"
+
+		# systemd needs writable state even when the image cannot be remounted
+		# read-write. Set this up when packing the image so -f erofs works with
+		# rootfs directories built without knowing the final filesystem type.
+		# Agent-as-init and extension images do not boot the systemd target.
+		if [[ "${fs_type}" != "erofs" || "${AGENT_INIT}" == "yes" ||
+			! -f "${mount_dir}/usr/lib/systemd/system/kata-containers.target" ||
+			"${BUILD_VARIANT}" == nvidia* ]]; then
+			return 0
+		fi
+
+		mkdir -p "${mount_dir}/var/lib/systemd" \
+			"${mount_dir}/etc/systemd/system/local-fs.target.wants"
+		cat > "${mount_dir}/etc/systemd/system/var-lib-systemd.mount" <<'EOF'
+[Unit]
+Description=Volatile systemd state for the read-only guest rootfs
+Before=systemd-random-seed.service
+
+[Mount]
+What=tmpfs
+Where=/var/lib/systemd
+Type=tmpfs
+Options=mode=0755,nodev,nosuid
+EOF
+		ln -sf ../var-lib-systemd.mount \
+			"${mount_dir}/etc/systemd/system/local-fs.target.wants/var-lib-systemd.mount"
+}
+
+# Parse veritysetup output and format as kernel parameters.
+# $1: veritysetup format output text
+# $2: image path (for error messages)
+build_kernel_verity_params() {
+	local -r output="$1"
+	local -r image="$2"
+	local root_hash
+	local salt
+	local data_blocks
+	local data_block_size
+	local hash_block_size
+
+	read_verity_field() {
+		local -r label="$1"
+		local value
+
+		value=$(printf '%s\n' "${output}" | sed -n "s/^${label}:[[:space:]]*//p")
+		value="${value// \[*/}"
+		[[ -n "${value}" ]] || die "Missing '${label}' in verity output for ${image}"
+
+		echo "${value}"
+	}
+
+	root_hash=$(read_verity_field "Root hash")
+	salt=$(read_verity_field "Salt")
+	data_blocks=$(read_verity_field "Data blocks")
+	data_block_size=$(read_verity_field "Data block size")
+	hash_block_size=$(read_verity_field "Hash block size")
+
+	printf 'root_hash=%s,salt=%s,data_blocks=%s,data_block_size=%s,hash_block_size=%s' \
+		"${root_hash}" \
+		"${salt}" \
+		"${data_blocks}" \
+		"${data_block_size}" \
+		"${hash_block_size}"
+}
+
+# Write the verity parameters the kernel needs, as printed by veritysetup, to
+# the root hash file of the image.
+# $1: output of veritysetup format
+# $2: image path
+write_root_hash_file() {
+	local -r verity_output="$1"
+	local -r image="$2"
+	local -r image_dir=$(dirname "${image}")
+
+	local kernel_verity_params
+	kernel_verity_params="$(build_kernel_verity_params "${verity_output}" "${image}")"
+
+	printf '%s\n' "${kernel_verity_params}" > "${image_dir}"/root_hash_"${BUILD_VARIANT}".txt
+	OK "Root hash file created for variant: ${BUILD_VARIANT}"
+}
+
+# Run veritysetup on an image's rootfs (p1) and hash (p2) partitions,
+# then write the resulting verity parameters to a file.
+# $1: loop device (e.g. /dev/loop0)
+# $2: image path
+setup_verity() {
+	local -r device="$1"
+	local -r image="$2"
+
+	if [[ "${MEASURED_ROOTFS}" != "yes" ]]; then
+		return 0
+	fi
+
+	# veritysetup creates a regular file where it finds no hash device.
+	[[ -b "${device}p2" ]] || die "No hash partition ${device}p2 for ${image}"
+
+	info "veritysetup format rootfs device: ${device}p1, hash device: ${device}p2"
+	local verity_output
+	verity_output=$(veritysetup format --no-superblock "${device}p1" "${device}p2" 2>&1)
+
+	write_root_hash_file "${verity_output}" "${image}"
+}
+
+# Print the start and the size, in bytes, of a partition of an image file.
+# $1: image path
+# $2: partition number
+partition_extent() {
+	local -r image="$1"
+	local -r number="$2"
+
+	parted -s -m "${image}" unit B print | awk -F: -v number="${number}" \
+		'$1 == number { gsub("B", "", $2); gsub("B", "", $4); print $2, $4 }'
+}
+
+# Copy a file to a partition of an image file, and check that it got there.
+#
+# The image file is written to directly. A partition node of a loop device,
+# such as /dev/loop0p1, goes away for a moment whenever the partition table is
+# read again, which udev does on its own, and a dd that opens it right then
+# creates a regular file in /dev and fills that instead of the image.
+# $1: file to copy
+# $2: image path
+# $3: partition number
+write_partition() {
+	local -r source="$1"
+	local -r image="$2"
+	local -r number="$3"
+	local start size source_size
+
+	read -r start size <<< "$(partition_extent "${image}" "${number}")"
+	[[ -n "${start}" && -n "${size}" ]] || die "No partition ${number} in ${image}"
+
+	source_size="$(stat -c "%s" "${source}")"
+	(( source_size <= size )) \
+		|| die "${source} (${source_size} bytes) does not fit partition ${number} of ${image} (${size} bytes)"
+
+	dd if="${source}" of="${image}" bs=1M oflag=seek_bytes seek="${start}" conv=notrunc,fsync status=none
+
+	cmp -s -n "${source_size}" -i "0:${start}" "${source}" "${image}" \
+		|| die "Partition ${number} of ${image} does not hold the content of ${source}"
+}
+
+# Run veritysetup on the erofs filesystem of an image, store the hash tree in
+# the hash partition (p2) and write the resulting verity parameters to a file.
+# $1: erofs filesystem image, already copied to the rootfs partition (p1)
+# $2: image path
+setup_erofs_verity() {
+	local -r fsimage="$1"
+	local -r image="$2"
+
+	if [[ "${MEASURED_ROOTFS}" != "yes" ]]; then
+		return 0
+	fi
+
+	local _start data_size
+	read -r _start data_size <<< "$(partition_extent "${image}" 1)"
+	[[ -n "${data_size}" ]] || die "No rootfs partition in ${image}"
+
+	# The guest maps the whole partition, so hash all of it: the rest of the
+	# partition is zeroes, as create_disk left it.
+	truncate -s "${data_size}" "${fsimage}"
+
+	info "veritysetup format rootfs: ${fsimage}"
+	local hash_image
+	hash_image="$(mktemp)"
+	local verity_output
+	verity_output=$(veritysetup format --no-superblock "${fsimage}" "${hash_image}" 2>&1)
+
+	write_partition "${hash_image}" "${image}" 2
+	rm -f "${hash_image}"
+
+	write_root_hash_file "${verity_output}" "${image}"
+}
+
+# Fail unless an image file has an erofs superblock where its rootfs starts.
+# $1: image path
+# $2: start of the rootfs partition, in MiB
+check_erofs_superblock() {
+	local -r image="$1"
+	local -r start_mb="$2"
+	# The superblock is 1024 bytes into the filesystem and starts with the
+	# little-endian magic number 0xE0F5E1E2.
+	local -r offset=$((start_mb * 1024 * 1024 + 1024))
+	local magic
+
+	magic="$(od -An -tx1 -j "${offset}" -N 4 "${image}" | tr -d ' \n')"
+	[[ "${magic}" == "e2e1f5e0" ]] \
+		|| die "No erofs filesystem at ${start_mb}MiB of ${image}: found '${magic}'"
 }
 
 create_rootfs_image() {
@@ -487,7 +670,8 @@ create_rootfs_image() {
 	fi
 
 	info "Mounting root partition"
-	local mount_dir=$(mktemp -p "${TMPDIR:-/tmp}" -d osbuilder-mount-dir.XXXX)
+	local mount_dir
+	mount_dir=$(mktemp -p "${TMPDIR:-/tmp}" -d osbuilder-mount-dir.XXXX)
 	mount "${device}p1" "${mount_dir}"
 	OK "root partition mounted"
 
@@ -501,21 +685,17 @@ create_rootfs_image() {
 	OK "rootfs copied"
 
 	info "Setup systemd"
-	setup_systemd "${mount_dir}"
+	setup_systemd "${mount_dir}" "${fs_type}"
 
 	info "Unmounting root partition"
 	umount "${mount_dir}"
 	OK "Root partition unmounted"
 
-	if [ "${fs_type}" = "${ext4_format}" ]; then
+	if [[ "${fs_type}" = "${ext4_format}" ]]; then
 		fsck.ext4 -D -y "${device}p1"
 	fi
 
-	if [ "${MEASURED_ROOTFS}" == "yes" ] && [ -b "${device}p2" ]; then
-		info "veritysetup format rootfs device: ${device}p1, hash device: ${device}p2"
-		local image_dir=$(dirname "${image}")
-		veritysetup format "${device}p1" "${device}p2" > "${image_dir}"/root_hash.txt 2>&1
-	fi
+	setup_verity "${device}" "${image}"
 
 	losetup -d "${device}"
 	rm -rf "${mount_dir}"
@@ -527,18 +707,21 @@ create_erofs_rootfs_image() {
 	local block_size="$3"
 	local agent_bin="$4"
 
-	if [ "$block_size" -ne 4096 ]; then
+	if [[ "${block_size}" -ne 4096 ]]; then
 		die "Invalid block size for erofs"
 	fi
 
-	if ! device="$(setup_loop_device "${image}")"; then
-		die "Could not setup loop device"
-	fi
-
-	local mount_dir=$(mktemp -p "${TMPDIR:-/tmp}" -d osbuilder-mount-dir.XXXX)
+	local mount_dir
+	mount_dir=$(mktemp -p "${TMPDIR:-/tmp}" -d osbuilder-mount-dir.XXXX)
 
 	info "Copying content from rootfs to root partition"
-	cp -a "${rootfs}"/* "${mount_dir}"
+	# Preserve the root directory's permissions too: mktemp creates a 0700
+	# directory, which would prevent unprivileged services from traversing /.
+	cp -a "${rootfs}/." "${mount_dir}/"
+
+	# Include the generated systemd files when applying SELinux labels.
+	info "Setup systemd"
+	setup_systemd "${mount_dir}" erofs
 
 	info "Setup SELinux"
 	setup_selinux "${mount_dir}" "${agent_bin}"
@@ -546,22 +729,27 @@ create_erofs_rootfs_image() {
 	sync
 	OK "rootfs copied"
 
-	info "Setup systemd"
-	setup_systemd "${mount_dir}"
-
-	readonly fsimage="$(mktemp)"
-	mkfs.erofs -Enoinline_data "${fsimage}" "${mount_dir}"
-	local img_size="$(stat -c"%s" "${fsimage}")"
+	local -r fsimage="$(mktemp)"
+	mkfs.erofs -zlz4hc -Enoinline_data "${fsimage}" "${mount_dir}"
+	local -r img_size="$(stat -c"%s" "${fsimage}")"
 	local img_size_mb="$(((("${img_size}" + 1048576) / 1048576) + 1 + "${rootfs_start}"))"
+
+	if [[ "${MEASURED_ROOTFS}" == "yes" ]]; then
+		# create_disk places the hash partition at 99% of the disk,
+		# so p1 only gets 99% of img_size_mb. Scale up so the erofs
+		# data still fits: img_size_mb / 0.99 ≈ img_size_mb * 100 / 99 + 1
+		img_size_mb=$(( (img_size_mb * 100 / 99) + 1 ))
+	fi
 
 	create_disk "${image}" "${img_size_mb}" "ext4" "${rootfs_start}"
 
-	dd if="${fsimage}" of="${device}p1"
+	write_partition "${fsimage}" "${image}" 1
+	setup_erofs_verity "${fsimage}" "${image}"
 
-	losetup -d "${device}"
+	rm -f "${fsimage}"
 	rm -rf "${mount_dir}"
 
-	return "${img_size_mb}"
+	erofs_img_size_mb="${img_size_mb}"
 }
 
 set_dax_header() {
@@ -576,16 +764,23 @@ set_dax_header() {
 	local dax_image="${image}.dax"
 	rm -f "${dax_image}" "${header_image}"
 
-	create_disk "${header_image}" "${img_size}" "${fs_type}" "${rootfs_offset}"
+	# parted doesn't recognize erofs as a partition type, use ext4 as the
+	# partition label -- it's just metadata and doesn't affect the contents.
+	local parted_fs_type="${fs_type}"
+	if [[ "${fs_type}" == "erofs" ]]; then
+		parted_fs_type="ext4"
+	fi
+	create_disk "${header_image}" "${img_size}" "${parted_fs_type}" "${rootfs_offset}"
 
 	dax_header_bytes=$((dax_header_sz * 1024 * 1024))
 	dax_alignment_bytes=$((dax_alignment * 1024 * 1024))
 	info "Set DAX metadata"
 	# Set metadata header
 	# Issue: https://github.com/kata-containers/osbuilder/issues/240
-	if [ -z "${nsdax_bin}" ] ; then
+	if [[ -z "${nsdax_bin}" ]] ; then
 		nsdax_bin="${script_dir}/nsdax"
 		gcc -O2 "${script_dir}/nsdax.gpl.c" -o "${nsdax_bin}"
+		# shellcheck disable=SC2064
 		trap "rm ${nsdax_bin}" EXIT
 	fi
 	"${nsdax_bin}" "${header_image}" "${dax_header_bytes}" "${dax_alignment_bytes}"
@@ -603,10 +798,52 @@ set_dax_header() {
 	rm -f "${dax_image}" "${header_image}"
 }
 
-main() {
-	[ "$(id -u)" -eq 0 ] || die "$0: must be run as root"
-	[ "$#" -eq 0 ] && usage && return 0
+# Populate a read-only ext4 filesystem without mounting it. The partition starts
+# at the DAX huge-page alignment used by virtio-pmem.
+create_readonly_ext4_image() (
+	local source_root="$1" image="$2"
+	local work tree part tree_kib inodes part_bytes raw_bytes image_bytes
+	local alignment_bytes=$((dax_alignment * 1024 * 1024))
+	local start_sector=$((alignment_bytes / 512))
+	work=$(mktemp -d)
+	trap 'rm -rf "${work}"' EXIT
+	tree="${work}/tree"
+	part="${work}/part.ext4"
+	export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-1700000000}"
+	cp -a "${source_root}" "${tree}"
+	# Avoid builder-dependent access times in the filesystem metadata.
+	find "${tree}" -exec touch -h -a -d "@${SOURCE_DATE_EPOCH}" {} +
 
+	tree_kib=$(find "${tree}" -printf '%y %s\n' |
+		awk '{ kib += ($1 == "f") ? int(($2 + 4095) / 4096) * 4 : 4 } END { print kib }')
+	inodes=$(( $(find "${tree}" | wc -l) + 256 ))
+	truncate -s "$((tree_kib + tree_kib / 4 + 16 * 1024))K" "${part}"
+	mkfs.ext4 -q -F -b 4096 -m 0 -N "${inodes}" -O ^has_journal \
+		-U 00000000-0000-4000-8000-000000000001 \
+		-E root_owner=0:0,hash_seed=00000000-0000-4000-8000-000000000002 \
+		-d "${tree}" "${part}"
+	e2fsck -fn "${part}"
+	resize2fs -M "${part}"
+	# Match Substrate's data=ordered mount option without a journal.
+	tune2fs -o journal_data_ordered "${part}"
+
+	part_bytes=$(stat -c %s "${part}")
+	raw_bytes=$((alignment_bytes + part_bytes))
+	image_bytes=$(( (raw_bytes + alignment_bytes - 1) / alignment_bytes * alignment_bytes ))
+	truncate -s 0 "${image}"
+	truncate -s "${image_bytes}" "${image}"
+	sfdisk --quiet "${image}" <<EOF
+label: dos
+label-id: 0x65a39876
+unit: sectors
+start=${start_sector}, size=$((part_bytes / 512)), type=83
+EOF
+	dd if="${part}" of="${image}" bs=512 seek="${start_sector}" conv=notrunc status=none
+	e2fsck -fn "${image}?offset=${alignment_bytes}"
+	info "Created read-only ext4 image: $((image_bytes / 1048576)) MiB"
+)
+
+main() {
 	# variables that can be overwritten by environment variables
 	local agent_bin="${AGENT_BIN:-kata-agent}"
 	local agent_init="${AGENT_INIT:-no}"
@@ -618,7 +855,7 @@ main() {
 
 	while getopts "ho:r:f:" opt
 	do
-		case "$opt" in
+		case "${opt}" in
 			h)	usage; return 0;;
 			o)	image="${OPTARG}" ;;
 			r)	root_free_space="${OPTARG}" ;;
@@ -629,19 +866,19 @@ main() {
 
 	shift $(( OPTIND - 1 ))
 	rootfs="$(readlink -f "$1")"
-	if [ -z "${rootfs}" ]; then
+	if [[ -z "${rootfs}" ]]; then
 		usage
 		exit 0
 	fi
 
 	local container_engine
-	if [ -n "${USE_DOCKER}" ]; then
+	if [[ -n "${USE_DOCKER}" ]]; then
 		container_engine="docker"
-	elif [ -n "${USE_PODMAN}" ]; then
+	elif [[ -n "${USE_PODMAN}" ]]; then
 		container_engine="podman"
 	fi
 
-	if [ -n "$container_engine" ]; then
+	if [[ -n "${container_engine}" ]]; then
 		build_with_container "${rootfs}" \
 			"${image}" "${fs_type}" "${block_size}" \
 			"${root_free_space}" "${agent_bin}" \
@@ -650,29 +887,56 @@ main() {
 		exit $?
 	fi
 
-	if ! check_rootfs "${rootfs}" ; then
-		die "Invalid rootfs"
+	if [[ "${SKIP_ROOTFS_CHECK:-no}" != "yes" ]]; then
+		if ! check_rootfs "${rootfs}" ; then
+			die "Invalid rootfs"
+		fi
 	fi
 
-	if [ "${fs_type}" == 'erofs' ]; then
+	if [[ "${BUILD_VARIANT}" == substrate ]]; then
+		[[ "${fs_type}" == ext4 && "${block_size}" == 4096 ]] \
+			|| die "Substrate requires ext4 with 4096-byte blocks"
+		[[ "${SELINUX}" == no && "${MEASURED_ROOTFS}" == no ]] \
+			|| die "Substrate does not support SELinux or measured rootfs images"
+		create_readonly_ext4_image "${rootfs}" "${image}"
+		return
+	fi
+
+	local skip_dax="${SKIP_DAX_HEADER:-no}"
+	local dax_overhead=0
+	if [[ "${skip_dax}" != "yes" ]]; then
+		dax_overhead="${dax_header_sz}"
+	fi
+
+	if [[ "${fs_type}" == 'erofs' ]]; then
 		# mkfs.erofs accepts an src root dir directory as an input
 		# rather than some device, so no need to guess the device dest size first.
 		create_erofs_rootfs_image "${rootfs}" "${image}" \
 						"${block_size}" "${agent_bin}"
-		rootfs_img_size=$?
-		img_size=$((rootfs_img_size + dax_header_sz))
+		rootfs_img_size="${erofs_img_size_mb}"
+		img_size=$((rootfs_img_size + dax_overhead))
 	else
 		img_size=$(calculate_img_size "${rootfs}" "${root_free_space}" \
 			"${fs_type}" "${block_size}")
 
 		# the first 2M are for the first MBR + NVDIMM metadata and were already
-		# consider in calculate_img_size
-		rootfs_img_size=$((img_size - dax_header_sz))
+		# considered in calculate_img_size
+		rootfs_img_size=$((img_size - dax_overhead))
 		create_rootfs_image "${rootfs}" "${image}" "${rootfs_img_size}" \
 						"${fs_type}" "${block_size}" "${agent_bin}"
 	fi
-	# insert at the beginning of the image the MBR + DAX header
-	set_dax_header "${image}" "${img_size}" "${fs_type}" "${nsdax_bin}"
+
+	if [[ "${skip_dax}" != "yes" ]]; then
+		# insert at the beginning of the image the MBR + DAX header
+		set_dax_header "${image}" "${img_size}" "${fs_type}" "${nsdax_bin}"
+	fi
+
+	if [[ "${fs_type}" == 'erofs' ]]; then
+		check_erofs_superblock "${image}" "$((dax_overhead + rootfs_start))"
+	fi
+
+	# shellcheck disable=SC2154
+	chown "${USER}:${GROUP}" "${image}"
 }
 
 main "$@"

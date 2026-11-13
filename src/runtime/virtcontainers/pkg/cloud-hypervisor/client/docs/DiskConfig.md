@@ -4,24 +4,32 @@
 
 Name | Type | Description | Notes
 ------------ | ------------- | ------------- | -------------
-**Path** | **string** |  | 
+**Path** | Pointer to **string** |  | [optional] 
 **Readonly** | Pointer to **bool** |  | [optional] [default to false]
 **Direct** | Pointer to **bool** |  | [optional] [default to false]
-**Iommu** | Pointer to **bool** |  | [optional] [default to false]
+**Iommu** | Pointer to [**IommuType**](IommuType.md) |  | [optional] [default to IOMMUTYPE_OFF]
 **NumQueues** | Pointer to **int32** |  | [optional] [default to 1]
 **QueueSize** | Pointer to **int32** |  | [optional] [default to 128]
 **VhostUser** | Pointer to **bool** |  | [optional] [default to false]
 **VhostSocket** | Pointer to **string** |  | [optional] 
 **RateLimiterConfig** | Pointer to [**RateLimiterConfig**](RateLimiterConfig.md) |  | [optional] 
 **PciSegment** | Pointer to **int32** |  | [optional] 
+**PciDeviceId** | Pointer to **int32** |  | [optional] 
 **Id** | Pointer to **string** |  | [optional] 
 **Serial** | Pointer to **string** |  | [optional] 
+**RateLimitGroup** | Pointer to **string** |  | [optional] 
+**QueueAffinity** | Pointer to [**[]VirtQueueAffinity**](VirtQueueAffinity.md) |  | [optional] 
+**BackingFiles** | Pointer to **bool** |  | [optional] [default to false]
+**Sparse** | Pointer to **bool** |  | [optional] [default to true]
+**ImageType** | Pointer to [**ImageType**](ImageType.md) |  | [optional] 
+**LockGranularity** | Pointer to [**LockGranularity**](LockGranularity.md) |  | [optional] [default to LOCKGRANULARITY_BYTE_RANGE]
+**GuestBlockSize** | Pointer to **int32** |  | [optional]
 
 ## Methods
 
 ### NewDiskConfig
 
-`func NewDiskConfig(path string, ) *DiskConfig`
+`func NewDiskConfig() *DiskConfig`
 
 NewDiskConfig instantiates a new DiskConfig object
 This constructor will assign default values to properties that have it defined,
@@ -55,6 +63,11 @@ and a boolean to check if the value has been set.
 
 SetPath sets Path field to given value.
 
+### HasPath
+
+`func (o *DiskConfig) HasPath() bool`
+
+HasPath returns a boolean if a field has been set.
 
 ### GetReadonly
 
@@ -108,20 +121,20 @@ HasDirect returns a boolean if a field has been set.
 
 ### GetIommu
 
-`func (o *DiskConfig) GetIommu() bool`
+`func (o *DiskConfig) GetIommu() IommuType`
 
 GetIommu returns the Iommu field if non-nil, zero value otherwise.
 
 ### GetIommuOk
 
-`func (o *DiskConfig) GetIommuOk() (*bool, bool)`
+`func (o *DiskConfig) GetIommuOk() (*IommuType, bool)`
 
 GetIommuOk returns a tuple with the Iommu field if it's non-nil, zero value otherwise
 and a boolean to check if the value has been set.
 
 ### SetIommu
 
-`func (o *DiskConfig) SetIommu(v bool)`
+`func (o *DiskConfig) SetIommu(v IommuType)`
 
 SetIommu sets Iommu field to given value.
 
@@ -281,6 +294,31 @@ SetPciSegment sets PciSegment field to given value.
 
 HasPciSegment returns a boolean if a field has been set.
 
+### GetPciDeviceId
+
+`func (o *DiskConfig) GetPciDeviceId() int32`
+
+GetPciDeviceId returns the PciDeviceId field if non-nil, zero value otherwise.
+
+### GetPciDeviceIdOk
+
+`func (o *DiskConfig) GetPciDeviceIdOk() (*int32, bool)`
+
+GetPciDeviceIdOk returns a tuple with the PciDeviceId field if it's non-nil, zero value otherwise
+and a boolean to check if the value has been set.
+
+### SetPciDeviceId
+
+`func (o *DiskConfig) SetPciDeviceId(v int32)`
+
+SetPciDeviceId sets PciDeviceId field to given value.
+
+### HasPciDeviceId
+
+`func (o *DiskConfig) HasPciDeviceId() bool`
+
+HasPciDeviceId returns a boolean if a field has been set.
+
 ### GetId
 
 `func (o *DiskConfig) GetId() string`
@@ -330,6 +368,181 @@ SetSerial sets Serial field to given value.
 `func (o *DiskConfig) HasSerial() bool`
 
 HasSerial returns a boolean if a field has been set.
+
+### GetRateLimitGroup
+
+`func (o *DiskConfig) GetRateLimitGroup() string`
+
+GetRateLimitGroup returns the RateLimitGroup field if non-nil, zero value otherwise.
+
+### GetRateLimitGroupOk
+
+`func (o *DiskConfig) GetRateLimitGroupOk() (*string, bool)`
+
+GetRateLimitGroupOk returns a tuple with the RateLimitGroup field if it's non-nil, zero value otherwise
+and a boolean to check if the value has been set.
+
+### SetRateLimitGroup
+
+`func (o *DiskConfig) SetRateLimitGroup(v string)`
+
+SetRateLimitGroup sets RateLimitGroup field to given value.
+
+### HasRateLimitGroup
+
+`func (o *DiskConfig) HasRateLimitGroup() bool`
+
+HasRateLimitGroup returns a boolean if a field has been set.
+
+### GetQueueAffinity
+
+`func (o *DiskConfig) GetQueueAffinity() []VirtQueueAffinity`
+
+GetQueueAffinity returns the QueueAffinity field if non-nil, zero value otherwise.
+
+### GetQueueAffinityOk
+
+`func (o *DiskConfig) GetQueueAffinityOk() (*[]VirtQueueAffinity, bool)`
+
+GetQueueAffinityOk returns a tuple with the QueueAffinity field if it's non-nil, zero value otherwise
+and a boolean to check if the value has been set.
+
+### SetQueueAffinity
+
+`func (o *DiskConfig) SetQueueAffinity(v []VirtQueueAffinity)`
+
+SetQueueAffinity sets QueueAffinity field to given value.
+
+### HasQueueAffinity
+
+`func (o *DiskConfig) HasQueueAffinity() bool`
+
+HasQueueAffinity returns a boolean if a field has been set.
+
+### GetBackingFiles
+
+`func (o *DiskConfig) GetBackingFiles() bool`
+
+GetBackingFiles returns the BackingFiles field if non-nil, zero value otherwise.
+
+### GetBackingFilesOk
+
+`func (o *DiskConfig) GetBackingFilesOk() (*bool, bool)`
+
+GetBackingFilesOk returns a tuple with the BackingFiles field if it's non-nil, zero value otherwise
+and a boolean to check if the value has been set.
+
+### SetBackingFiles
+
+`func (o *DiskConfig) SetBackingFiles(v bool)`
+
+SetBackingFiles sets BackingFiles field to given value.
+
+### HasBackingFiles
+
+`func (o *DiskConfig) HasBackingFiles() bool`
+
+HasBackingFiles returns a boolean if a field has been set.
+
+### GetSparse
+
+`func (o *DiskConfig) GetSparse() bool`
+
+GetSparse returns the Sparse field if non-nil, zero value otherwise.
+
+### GetSparseOk
+
+`func (o *DiskConfig) GetSparseOk() (*bool, bool)`
+
+GetSparseOk returns a tuple with the Sparse field if it's non-nil, zero value otherwise
+and a boolean to check if the value has been set.
+
+### SetSparse
+
+`func (o *DiskConfig) SetSparse(v bool)`
+
+SetSparse sets Sparse field to given value.
+
+### HasSparse
+
+`func (o *DiskConfig) HasSparse() bool`
+
+HasSparse returns a boolean if a field has been set.
+
+### GetImageType
+
+`func (o *DiskConfig) GetImageType() ImageType`
+
+GetImageType returns the ImageType field if non-nil, zero value otherwise.
+
+### GetImageTypeOk
+
+`func (o *DiskConfig) GetImageTypeOk() (*ImageType, bool)`
+
+GetImageTypeOk returns a tuple with the ImageType field if it's non-nil, zero value otherwise
+and a boolean to check if the value has been set.
+
+### SetImageType
+
+`func (o *DiskConfig) SetImageType(v ImageType)`
+
+SetImageType sets ImageType field to given value.
+
+### HasImageType
+
+`func (o *DiskConfig) HasImageType() bool`
+
+HasImageType returns a boolean if a field has been set.
+
+### GetLockGranularity
+
+`func (o *DiskConfig) GetLockGranularity() LockGranularity`
+
+GetLockGranularity returns the LockGranularity field if non-nil, zero value otherwise.
+
+### GetLockGranularityOk
+
+`func (o *DiskConfig) GetLockGranularityOk() (*LockGranularity, bool)`
+
+GetLockGranularityOk returns a tuple with the LockGranularity field if it's non-nil, zero value otherwise
+and a boolean to check if the value has been set.
+
+### SetLockGranularity
+
+`func (o *DiskConfig) SetLockGranularity(v LockGranularity)`
+
+SetLockGranularity sets LockGranularity field to given value.
+
+### HasLockGranularity
+
+`func (o *DiskConfig) HasLockGranularity() bool`
+
+HasLockGranularity returns a boolean if a field has been set.
+
+### GetGuestBlockSize
+
+`func (o *DiskConfig) GetGuestBlockSize() int32`
+
+GetGuestBlockSize returns the GuestBlockSize field if non-nil, zero value otherwise.
+
+### GetGuestBlockSizeOk
+
+`func (o *DiskConfig) GetGuestBlockSizeOk() (*int32, bool)`
+
+GetGuestBlockSizeOk returns a tuple with the GuestBlockSize field if it's non-nil, zero value otherwise
+and a boolean to check if the value has been set.
+
+### SetGuestBlockSize
+
+`func (o *DiskConfig) SetGuestBlockSize(v int32)`
+
+SetGuestBlockSize sets GuestBlockSize field to given value.
+
+### HasGuestBlockSize
+
+`func (o *DiskConfig) HasGuestBlockSize() bool`
+
+HasGuestBlockSize returns a boolean if a field has been set.
 
 
 [[Back to Model list]](../README.md#documentation-for-models) [[Back to API list]](../README.md#documentation-for-api-endpoints) [[Back to README]](../README.md)

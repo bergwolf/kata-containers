@@ -13,6 +13,11 @@ endif
 
 default: build
 
+# Provides PACKAGE_FLAGS, scoping cargo commands to the packages of
+# this component. Note utils.mk defines rules, so it has to be
+# included after the default rule.
+include ../../utils.mk
+
 build:
 	cargo build --all-features
 
@@ -23,13 +28,13 @@ check: clippy format
 
 clippy:
 	@echo "INFO: cargo clippy..."
-	cargo clippy --all-targets --all-features --release \
+	cargo clippy $(PACKAGE_FLAGS) --all-features --release \
 		-- \
 		-D warnings
 
 format:
 	@echo "INFO: cargo fmt..."
-	cargo fmt -- --check
+	cargo fmt $(PACKAGE_FLAGS) -- --check
 
 clean:
 	cargo clean
@@ -38,8 +43,8 @@ clean:
 # See the `test_logger_levels()` test for further information.
 test:
 	@echo "INFO: testing libraries for development build"
-	cargo test --all $(EXTRA_RUSTFEATURES) -- --nocapture $(EXTRA_TEST_FLAGS)
+	cargo test $(PACKAGE_FLAGS) $(EXTRA_RUSTFEATURES) -- --nocapture $(EXTRA_TEST_FLAGS)
 	@echo "INFO: testing libraries for release build"
-	cargo test --release --all $(EXTRA_RUSTFEATURES) -- --nocapture $(EXTRA_TEST_FLAGS)
+	cargo test --release $(PACKAGE_FLAGS) $(EXTRA_RUSTFEATURES) -- --nocapture $(EXTRA_TEST_FLAGS)
 
-.PHONY: install vendor
+.PHONY: install

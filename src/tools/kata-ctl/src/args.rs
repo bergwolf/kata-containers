@@ -3,15 +3,22 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use clap::{Args, Parser, Subcommand};
+use std::path::PathBuf;
+
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use thiserror::Error;
 
 #[derive(Parser, Debug)]
-#[clap(name = "kata-ctl", author, about = "Kata Containers control tool")]
+#[clap(
+    name = "kata-ctl",
+    author,
+    about = "Kata Containers control tool",
+    arg_required_else_help = true
+)]
 pub struct KataCtlCli {
     #[clap(subcommand)]
-    pub command: Commands,
+    pub command: Option<Commands>,
     #[clap(short, long, value_enum, value_parser = parse_log_level)]
     /// Sets the minimum log level required for log messages to be displayed. Default is 'info'.
     /// Valid values are: trace, debug, info, warning, error, critical
@@ -19,6 +26,10 @@ pub struct KataCtlCli {
     #[clap(short, long, action)]
     /// If enabled, log messages will be JSON formatted for easier machine parsing
     pub json_logging: bool,
+
+    /// If specified, display a list of config file locations.
+    #[clap(long, action)]
+    pub show_default_config_paths: bool,
 }
 
 fn parse_log_level(arg: &str) -> Result<slog::Level, String> {
@@ -38,17 +49,20 @@ pub enum Commands {
     /// Test if system can run Kata Containers
     Check(CheckArgument),
 
+    /// Copy files and directories between the host and a guest VM
+    Cp(CpArguments),
+
     /// Directly assign a volume to Kata Containers to manage
     DirectVolume(DirectVolumeCommand),
 
     /// Display settings
     Env(EnvArgument),
 
-    /// Enter into guest VM by debug console
+    /// Enter into guest VM by debug console, or run a single command there
     Exec(ExecArguments),
 
     /// Manage VM factory
-    Factory,
+    Factory(FactoryArgs),
 
     /// Manage guest VM iptables
     Iptables(IptablesCommand),
@@ -61,10 +75,13 @@ pub enum Commands {
 
     /// Display version details
     Version,
+
+    /// Parse Logs and output in various formats
+    LogParser(LogParser),
 }
 
 #[derive(Debug, Args, Error)]
-#[error("Argument is not valid")]
+#[error("Argument is not valid: {command:?}")]
 pub struct CheckArgument {
     #[clap(subcommand)]
     pub command: CheckSubCommand,
@@ -89,6 +106,24 @@ pub enum CheckSubCommand {
 
     /// List all available checks
     List,
+}
+
+#[derive(Parser, Debug)]
+pub struct FactoryArgs {
+    #[command(subcommand)]
+    pub command: FactorySubCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum FactorySubCommand {
+    /// Initialize a VM factory based on kata-runtime configuration
+    Init,
+
+    /// Destroy the VM factory
+    Destroy,
+
+    /// Query the status of VM factory
+    Status,
 }
 
 #[derive(Debug, Args)]
@@ -181,4 +216,84 @@ pub struct ExecArguments {
     #[clap(short = 'p', long = "kata-debug-port", default_value_t = 1026)]
     /// kata debug console vport same as configuration, default is 1026.
     pub vport: u32,
+    #[clap(last = true)]
+    /// Command to run in the guest, e.g. `kata-ctl exec <sandbox-id> -- ls -l /`.
+    /// Without one, a terminal is attached to the console shell instead. The
+    /// debug console carries a single stream, so the command's stderr arrives
+    /// interleaved on stdout; kata-ctl exits with the command's exit status.
+    pub command: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+#[clap(
+    after_help = "Copies travel over the agent debug console, so the sandbox has to have been \
+started with it enabled, and the guest needs the devkit extension for the \
+shell, tar and base64 a copy drives there. A kata-<shim>-devkit RuntimeClass \
+gives you both.
+
+EXAMPLES:
+    kata-ctl cp ./tool <sandbox-id>:/tmp/tool
+    kata-ctl cp <sandbox-id>:/var/log ./guest-logs"
+)]
+pub struct CpArguments {
+    /// Source: either a host path, or <sandbox-id>:<absolute-guest-path>.
+    pub src: String,
+    /// Destination: either a host path, or <sandbox-id>:<absolute-guest-path>.
+    /// An existing directory is copied into, anything else names the copy.
+    pub dst: String,
+    #[clap(short = 'p', long = "kata-debug-port", default_value_t = 1026)]
+    /// kata debug console vport same as configuration, default is 1026.
+    pub vport: u32,
+}
+
+#[derive(Args, Debug)]
+#[command(name="kata-log-parser", author="Gabriel Venberg", version, about, long_about = None)]
+pub struct LogParser {
+    pub input_file: Vec<PathBuf>,
+
+    #[arg(short, long)]
+    pub output_file: Option<PathBuf>,
+
+    #[arg(short, long, help = "check log files and only display output on error")]
+    pub check_only: bool,
+
+    #[arg(long, help = "error if any files are empty")]
+    pub error_if_file_empty: bool,
+
+    #[arg(long, help = "error if all logfiles are empty")]
+    pub error_if_no_records: bool,
+
+    #[arg(
+        long,
+        help = "do not make an error for lines with no pid, source, name, or level"
+    )]
+    pub ignore_missing_fields: bool,
+
+    #[arg(
+        short,
+        long,
+        help = "suppress warning messages that would otherwise go to stderr."
+    )]
+    pub quiet: bool,
+
+    #[arg(
+        short,
+        long,
+        help = "do not tolerate misformed agent messages (may be caused by non-Kata Containers log lines)"
+    )]
+    pub strict: bool,
+
+    #[arg(long, value_enum, default_value_t = LogOutputFormat::Json, help="set the output format")]
+    pub output_format: LogOutputFormat,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
+pub enum LogOutputFormat {
+    Csv,
+    Json,
+    Ron,
+    Text,
+    Toml,
+    Xml,
+    Yaml,
 }

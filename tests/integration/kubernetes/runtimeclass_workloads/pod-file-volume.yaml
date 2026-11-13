@@ -8,9 +8,11 @@ kind: Pod
 metadata:
   name: test-file-volume
 spec:
-  terminationGracePeriodSeconds: 0
   runtimeClassName: kata
+  securityContext:
+    supplementalGroups: [10]
   restartPolicy: Never
+  nodeName: NODE
   volumes:
   - name: shared-file
     hostPath:
@@ -18,7 +20,7 @@ spec:
       type: File
   containers:
   - name: busybox-file-volume-container
-    image: busybox
+    image: quay.io/prometheus/busybox:latest
     volumeMounts:
     - name: shared-file
       mountPath: MOUNT_PATH

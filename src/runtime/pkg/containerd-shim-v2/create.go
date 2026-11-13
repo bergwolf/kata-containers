@@ -11,19 +11,18 @@ package containerdshim
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"os/user"
-	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
 
-	"github.com/container-orchestrated-devices/container-device-interface/pkg/cdi"
+	taskAPI "github.com/containerd/containerd/api/runtime/task/v2"
 	containerd_types "github.com/containerd/containerd/api/types"
 	"github.com/containerd/containerd/mount"
-	taskAPI "github.com/containerd/containerd/runtime/v2/task"
-	"github.com/containerd/typeurl"
+	"github.com/containerd/typeurl/v2"
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/utils"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/annotations"
@@ -41,8 +40,8 @@ import (
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/katautils"
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/katautils/katatrace"
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/oci"
-	vc "github.com/kata-containers/kata-containers/src/runtime/virtcontainers"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/compatoci"
+	"tags.cncf.io/container-device-interface/pkg/cdi"
 )
 
 type startManagementServerFunc func(s *service, ctx context.Context, ociSpec *specs.Spec)
@@ -52,7 +51,9 @@ var defaultStartManagementServerFunc startManagementServerFunc = func(s *service
 	shimLog.Info("management server started")
 }
 
-func copyLayersToMounts(rootFs *vc.RootFs, spec *specs.Spec) error {
+var configureNonRootHypervisorFunc = configureNonRootHypervisor
+
+func copyLayersToMounts(rootFs *virtcontainers.RootFs, spec *specs.Spec) error {
 	for _, o := range rootFs.Options {
 		if !strings.HasPrefix(o, annotations.FileSystemLayer) {
 			continue
@@ -74,65 +75,8 @@ func copyLayersToMounts(rootFs *vc.RootFs, spec *specs.Spec) error {
 	return nil
 }
 
-// CDI (Container Device Interface), is a specification, for container- runtimes,
-// to support third-party devices.
-// It introduces an abstract notion of a device as a resource. Such devices are
-// uniquely specified by a fully-qualified name that is constructed from a
-// vendor ID, a device class, and a name that is unique per vendor ID-device
-// class pair.
-//
-// vendor.com/class=unique_name
-//
-// The combination of vendor ID and device class (vendor.com/class in the
-// above example) is referred to as the device kind.
-// CDI concerns itself only with enabling containers to be device aware.
-// Areas like resource management are explicitly left out of CDI (and are
-// expected to be handled by the orchestrator). Because of this focus, the CDI
-// specification is simple to implement and allows great flexibility for
-// runtimes and orchestrators.
-func withCDI(annotations map[string]string, cdiSpecDirs []string, spec *specs.Spec) (*specs.Spec, error) {
-	// Add devices from CDI annotations
-	_, devsFromAnnotations, err := cdi.ParseAnnotations(annotations)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse CDI device annotations: %w", err)
-	}
-
-	if len(devsFromAnnotations) == 0 {
-		// No devices found, skip device injection
-		return spec, nil
-	}
-
-	var registry cdi.Registry
-	if len(cdiSpecDirs) > 0 {
-		// We can override the directories where to search for CDI specs
-		// if needed, the default is /etc/cdi /var/run/cdi
-		registry = cdi.GetRegistry(cdi.WithSpecDirs(cdiSpecDirs...))
-	} else {
-		registry = cdi.GetRegistry()
-	}
-
-	if err = registry.Refresh(); err != nil {
-		// We don't consider registry refresh failure a fatal error.
-		// For instance, a dynamically generated invalid CDI Spec file for
-		// any particular vendor shouldn't prevent injection of devices of
-		// different vendors. CDI itself knows better and it will fail the
-		// injection if necessary.
-		return nil, fmt.Errorf("CDI registry refresh failed: %w", err)
-	}
-
-	if _, err := registry.InjectDevices(spec, devsFromAnnotations...); err != nil {
-		return nil, fmt.Errorf("CDI device injection failed: %w", err)
-	}
-
-	// One crucial thing to keep in mind is that CDI device injection
-	// might add OCI Spec environment variables, hooks, and mounts as
-	// well. Therefore it is important that none of the corresponding
-	// OCI Spec fields are reset up in the call stack once we return.
-	return spec, nil
-}
-
 func create(ctx context.Context, s *service, r *taskAPI.CreateTaskRequest) (*container, error) {
-	rootFs := vc.RootFs{}
+	rootFs := virtcontainers.RootFs{}
 	if len(r.Rootfs) == 1 {
 		m := r.Rootfs[0]
 		rootFs.Source = m.Source
@@ -159,28 +103,22 @@ func create(ctx context.Context, s *service, r *taskAPI.CreateTaskRequest) (*con
 	disableOutput := noNeedForOutput(detach, ociSpec.Process.Terminal)
 	rootfs := filepath.Join(r.Bundle, "rootfs")
 
-	runtimeConfig, err := loadRuntimeConfig(s, r, ociSpec.Annotations)
+	runtimeConfig, err := loadRuntimeConfig(s, r)
 	if err != nil {
 		return nil, err
 	}
 
 	switch containerType {
-	case vc.PodSandbox, vc.SingleContainer:
+	case virtcontainers.PodSandbox, virtcontainers.SingleContainer:
 		if s.sandbox != nil {
 			return nil, fmt.Errorf("cannot create another sandbox in sandbox: %s", s.sandbox.ID())
 		}
-		// We can provide additional directories where to search for
-		// CDI specs if needed. immutable OS's only have specific
-		// directories where applications can write too. For instance /opt/cdi
-		//
-		// _, err = withCDI(ociSpec.Annotations, []string{"/opt/cdi"}, ociSpec)
-		//
-		_, err = withCDI(ociSpec.Annotations, []string{}, ociSpec)
-		if err != nil {
-			return nil, fmt.Errorf("adding CDI devices failed")
-		}
 
 		s.config = runtimeConfig
+		err = coldPlugDevices(ctx, s, ociSpec)
+		if err != nil {
+			return nil, fmt.Errorf("device cold plug failed: %w", err)
+		}
 
 		// create tracer
 		// This is the earliest location we can create the tracer because we must wait
@@ -214,7 +152,7 @@ func create(ctx context.Context, s *service, r *taskAPI.CreateTaskRequest) (*con
 		//   2. If this is not a sandbox infrastructure container, but instead a standalone single container (analogous to "docker run..."),
 		//	then the container spec itself will contain appropriate sizing information for the entire sandbox (since it is
 		//	a single container.
-		if containerType == vc.PodSandbox {
+		if containerType == virtcontainers.PodSandbox {
 			s.config.SandboxCPUs, s.config.SandboxMemMB = oci.CalculateSandboxSizing(ociSpec)
 		} else {
 			s.config.SandboxCPUs, s.config.SandboxMemMB = oci.CalculateContainerSizing(ociSpec)
@@ -234,11 +172,25 @@ func create(ctx context.Context, s *service, r *taskAPI.CreateTaskRequest) (*con
 
 		katautils.HandleFactory(ctx, vci, s.config)
 		rootless.SetRootless(s.config.HypervisorConfig.Rootless)
+		var rollbackRootlessSetup func()
 		if rootless.IsRootless() {
-			if err := configureNonRootHypervisor(s.config, r.ID); err != nil {
+			rollbackRootlessSetup, err = configureNonRootHypervisorFunc(s.config, r.ID)
+			if err != nil {
 				return nil, err
 			}
+			defer func() {
+				if rollbackRootlessSetup != nil {
+					rollbackRootlessSetup()
+				}
+			}()
 		}
+
+		// config.WithCDI() has used the CDI annotations to inject
+		// host-side devices. As these annotations reference device kinds
+		// that don't exist in the guest (e.g., nvidia.com/pgpu), we
+		// remove them before creating the sandbox and the containers
+		// within it.
+		removeCDIAnnotations(ociSpec.Annotations)
 
 		// Pass service's context instead of local ctx to CreateSandbox(), since local
 		// ctx will be canceled after this rpc service call, but the sandbox will live
@@ -249,6 +201,7 @@ func create(ctx context.Context, s *service, r *taskAPI.CreateTaskRequest) (*con
 			return nil, err
 		}
 		s.sandbox = sandbox
+		rollbackRootlessSetup = nil
 		pid, err := s.sandbox.GetHypervisorPid()
 		if err != nil {
 			return nil, err
@@ -259,7 +212,7 @@ func create(ctx context.Context, s *service, r *taskAPI.CreateTaskRequest) (*con
 			defaultStartManagementServerFunc(s, ctx, ociSpec)
 		}
 
-	case vc.PodContainer:
+	case virtcontainers.PodContainer:
 		span, ctx := katatrace.Trace(s.ctx, shimLog, "create", shimTracingTags)
 		defer span.End()
 
@@ -278,6 +231,12 @@ func create(ctx context.Context, s *service, r *taskAPI.CreateTaskRequest) (*con
 				}
 			}
 		}()
+
+		// CDI annotations have been processed during PodSandbox creation
+		// and cold-plug. CDI annotations referencing device kinds that
+		// exist in the guest (e.g., nvidia.com/gpu) will be generated
+		// during device attachment.
+		removeCDIAnnotations(ociSpec.Annotations)
 
 		_, err = katautils.CreateContainer(ctx, s.sandbox, *ociSpec, rootFs, r.ID, bundlePath, disableOutput, runtimeConfig.DisableGuestEmptyDir)
 		if err != nil {
@@ -309,15 +268,14 @@ func loadSpec(r *taskAPI.CreateTaskRequest) (*specs.Spec, string, error) {
 }
 
 // Config override ordering(high to low):
-// 1. podsandbox annotation
-// 2. shimv2 create task option
-// 3. environment
-func loadRuntimeConfig(s *service, r *taskAPI.CreateTaskRequest, anno map[string]string) (*oci.RuntimeConfig, error) {
+// 1. shimv2 create task option
+// 2. environment
+func loadRuntimeConfig(s *service, r *taskAPI.CreateTaskRequest) (*oci.RuntimeConfig, error) {
 	if s.config != nil {
 		return s.config, nil
 	}
-	configPath := oci.GetSandboxConfigPath(anno)
-	if configPath == "" && r.Options != nil {
+	configPath := ""
+	if r.Options != nil {
 		v, err := typeurl.UnmarshalAny(r.Options)
 		if err != nil {
 			return nil, err
@@ -342,7 +300,14 @@ func loadRuntimeConfig(s *service, r *taskAPI.CreateTaskRequest, anno map[string
 
 	// Try to get the config file from the env KATA_CONF_FILE
 	if configPath == "" {
-		configPath = os.Getenv("KATA_CONF_FILE")
+		envConfigPath := os.Getenv("KATA_CONF_FILE")
+		if envConfigPath != "" {
+			if isShippedKataConfigPath(envConfigPath) {
+				configPath = envConfigPath
+			} else {
+				return nil, fmt.Errorf("invalid KATA_CONF_FILE %q: only shipped Kata configuration files are accepted", envConfigPath)
+			}
+		}
 	}
 
 	_, runtimeConfig, err := katautils.LoadConfiguration(configPath, false)
@@ -358,6 +323,26 @@ func loadRuntimeConfig(s *service, r *taskAPI.CreateTaskRequest, anno map[string
 	return &runtimeConfig, nil
 }
 
+func isShippedKataConfigPath(configPath string) bool {
+	resolvedConfigPath, err := katautils.ResolvePath(configPath)
+	if err != nil {
+		return false
+	}
+
+	for _, defaultConfigPath := range katautils.GetDefaultConfigFilePaths() {
+		resolvedDefaultPath, err := katautils.ResolvePath(defaultConfigPath)
+		if err != nil {
+			continue
+		}
+
+		if resolvedConfigPath == resolvedDefaultPath {
+			return true
+		}
+	}
+
+	return false
+}
+
 func checkAndMount(s *service, r *taskAPI.CreateTaskRequest) (bool, error) {
 	if len(r.Rootfs) == 1 {
 		m := r.Rootfs[0]
@@ -371,7 +356,11 @@ func checkAndMount(s *service, r *taskAPI.CreateTaskRequest) (bool, error) {
 			return false, nil
 		}
 
-		if m.Type == vc.NydusRootFSType {
+		if virtcontainers.IsErofsRootFS(virtcontainers.RootFs{Options: m.Options, Type: m.Type}) {
+			return false, nil
+		}
+
+		if virtcontainers.IsNydusRootFSType(m.Type) {
 			// if kata + nydus, do not mount
 			return false, nil
 		}
@@ -407,81 +396,116 @@ func doMount(mounts []*containerd_types.Mount, rootfs string) error {
 	return nil
 }
 
-func configureNonRootHypervisor(runtimeConfig *oci.RuntimeConfig, sandboxId string) error {
-	userName, err := utils.CreateVmmUser()
+func configureNonRootHypervisor(runtimeConfig *oci.RuntimeConfig, sandboxID string) (rollback func(), err error) {
+	userName, err := utils.CreateVmmUser(sandboxID)
 	if err != nil {
-		return err
+		return nil, err
+	}
+	var runtimeUID *uint32
+	rollback = func() {
+		if runtimeUID != nil {
+			if err := rootless.RemoveVmmUserRuntimeDir(*runtimeUID); err != nil {
+				shimLog.WithFields(logrus.Fields{
+					"path":       rootless.VmmUserRuntimeDir(*runtimeUID),
+					"sandbox_id": sandboxID,
+				}).WithError(err).Warn("failed to remove rootless runtime directory")
+			}
+		}
+
+		if err := utils.RemoveVmmUser(userName); err != nil {
+			shimLog.WithFields(logrus.Fields{
+				"user_name":  userName,
+				"sandbox_id": sandboxID,
+			}).WithError(err).Warn("failed to remove rootless VMM user")
+		}
 	}
 	defer func() {
 		if err != nil {
-			shimLog.WithFields(logrus.Fields{
-				"user_name":  userName,
-				"sandbox_id": sandboxId,
-			}).WithError(err).Warn("configure non root hypervisor failed, delete the user")
-			if err2 := utils.RemoveVmmUser(userName); err2 != nil {
-				shimLog.WithField("userName", userName).WithError(err).Warn("failed to remove user")
-			}
+			rollback()
 		}
 	}()
 
 	u, err := user.Lookup(userName)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	uid, err := strconv.Atoi(u.Uid)
+	parsedUID, err := strconv.ParseInt(u.Uid, 10, 64)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	gid, err := strconv.Atoi(u.Gid)
+	if parsedUID < 0 || parsedUID > math.MaxUint32 {
+		return nil, fmt.Errorf("rootless UID %q is outside the uint32 range", u.Uid)
+	}
+	if parsedUID > math.MaxInt {
+		return nil, fmt.Errorf("rootless UID %q exceeds the platform int range", u.Uid)
+	}
+	parsedGID, err := strconv.ParseInt(u.Gid, 10, 64)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	runtimeConfig.HypervisorConfig.Uid = uint32(uid)
+	if parsedGID < 0 || parsedGID > math.MaxUint32 {
+		return nil, fmt.Errorf("rootless GID %q is outside the uint32 range", u.Gid)
+	}
+	if parsedGID > math.MaxInt {
+		return nil, fmt.Errorf("rootless GID %q exceeds the platform int range", u.Gid)
+	}
+	runtimeUIDValue := uint32(parsedUID)
+	runtimeGIDValue := uint32(parsedGID)
+	chownUID := int(parsedUID)
+	chownGID := int(parsedGID)
+	runtimeConfig.HypervisorConfig.Uid = runtimeUIDValue
 	runtimeConfig.HypervisorConfig.User = userName
-	runtimeConfig.HypervisorConfig.Gid = uint32(gid)
+	runtimeConfig.HypervisorConfig.Gid = runtimeGIDValue
+	runtimeUID = &runtimeUIDValue
 	shimLog.WithFields(logrus.Fields{
 		"user_name":  userName,
-		"uid":        uid,
-		"gid":        gid,
-		"sandbox_id": sandboxId,
+		"uid":        runtimeUIDValue,
+		"gid":        runtimeGIDValue,
+		"sandbox_id": sandboxID,
 	}).Debug("successfully created a non root user for the hypervisor")
 
-	userTmpDir := path.Join("/run/user/", fmt.Sprint(uid))
+	userTmpDir := rootless.VmmUserRuntimeDir(runtimeConfig.HypervisorConfig.Uid)
 	_, err = os.Stat(userTmpDir)
 	// Clean up the directory created by the previous run
 	if !os.IsNotExist(err) {
 		if err = os.RemoveAll(userTmpDir); err != nil {
-			return err
+			return nil, err
 		}
 	}
 
-	if err = os.Mkdir(userTmpDir, vc.DirMode); err != nil {
-		return err
+	if err = os.Mkdir(userTmpDir, virtcontainers.DirMode); err != nil {
+		return nil, err
 	}
-	defer func() {
-		if err != nil {
-			if err = os.RemoveAll(userTmpDir); err != nil {
-				shimLog.WithField("userTmpDir", userTmpDir).WithError(err).Warn("failed to remove userTmpDir")
-			}
-		}
-	}()
-	if err = syscall.Chown(userTmpDir, uid, gid); err != nil {
-		return err
+	if err = syscall.Chown(userTmpDir, chownUID, chownGID); err != nil {
+		return nil, err
 	}
 
-	if err := os.Setenv("XDG_RUNTIME_DIR", userTmpDir); err != nil {
-		return err
+	if err = os.Setenv("XDG_RUNTIME_DIR", userTmpDir); err != nil {
+		return nil, err
 	}
 
 	info, err := os.Stat("/dev/kvm")
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if stat, ok := info.Sys().(*syscall.Stat_t); ok {
 		// Add the kvm group to the hypervisor supplemental group so that the hypervisor process can access /dev/kvm
 		runtimeConfig.HypervisorConfig.Groups = append(runtimeConfig.HypervisorConfig.Groups, stat.Gid)
-		return nil
+		return rollback, nil
 	}
-	return fmt.Errorf("failed to get the gid of /dev/kvm")
+	return nil, fmt.Errorf("failed to get the gid of /dev/kvm")
+}
+
+func removeCDIAnnotations(annotations map[string]string) {
+	if annotations == nil {
+		return
+	}
+
+	for key := range annotations {
+		if strings.HasPrefix(key, cdi.AnnotationPrefix) {
+			shimLog.Debugf("removing CDI annotation: %s=%s", key, annotations[key])
+			delete(annotations, key)
+		}
+	}
 }

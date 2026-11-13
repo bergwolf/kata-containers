@@ -9,7 +9,11 @@ import (
 	"fmt"
 )
 
-func validateHypervisorConfig(conf *HypervisorConfig) error {
+func validateHypervisorConfig(conf *HypervisorConfig, hypervisorType HypervisorType) error {
+
+	if conf.RemoteHypervisorSocket != "" {
+		return nil
+	}
 
 	if conf.KernelPath == "" {
 		return fmt.Errorf("Missing kernel path")
@@ -22,7 +26,7 @@ func validateHypervisorConfig(conf *HypervisorConfig) error {
 	}
 
 	if conf.NumVCPUs == 0 {
-		conf.NumVCPUs = defaultVCPUs
+		conf.NumVCPUsF = defaultVCPUs
 	}
 
 	if conf.MemorySize == 0 {

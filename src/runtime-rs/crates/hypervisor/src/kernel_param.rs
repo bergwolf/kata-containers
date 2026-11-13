@@ -4,20 +4,92 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 
 use crate::{
-    VM_ROOTFS_DRIVER_BLK, VM_ROOTFS_DRIVER_MMIO, VM_ROOTFS_DRIVER_PMEM, VM_ROOTFS_FILESYSTEM_EROFS,
-    VM_ROOTFS_FILESYSTEM_EXT4, VM_ROOTFS_FILESYSTEM_XFS, VM_ROOTFS_ROOT_BLK, VM_ROOTFS_ROOT_PMEM,
+    VM_ROOTFS_DRIVER_BLK, VM_ROOTFS_DRIVER_BLK_CCW, VM_ROOTFS_DRIVER_MMIO, VM_ROOTFS_DRIVER_PMEM,
+    VM_ROOTFS_ROOT_BLK, VM_ROOTFS_ROOT_PMEM,
 };
+use kata_types::config::hypervisor::{parse_kernel_verity_params, VERITY_BLOCK_SIZE_BYTES};
 use kata_types::config::LOG_VPORT_OPTION;
+use kata_types::fs::{
+    VM_ROOTFS_FILESYSTEM_EROFS, VM_ROOTFS_FILESYSTEM_EXT4, VM_ROOTFS_FILESYSTEM_XFS,
+};
 
 // Port where the agent will send the logs. Logs are sent through the vsock in cases
 // where the hypervisor has no console.sock, i.e dragonball
 const VSOCK_LOGS_PORT: &str = "1025";
 
 const KERNEL_KV_DELIMITER: &str = "=";
-const KERNEL_PARAM_DELIMITER: &str = " ";
+const KERNEL_PARAM_DELIMITER: char = ' ';
+
+// Split kernel params on spaces, but keep quoted substrings intact.
+// Example: dm-mod.create="dm-verity,,,ro,0 736328 verity 1 /dev/vda1 /dev/vda2 ...".
+fn split_kernel_params(params_string: &str) -> Vec<String> {
+    let mut params = Vec::new();
+    let mut current = String::new();
+    let mut in_quote = false;
+
+    for c in params_string.chars() {
+        if c == '"' {
+            in_quote = !in_quote;
+            current.push(c);
+            continue;
+        }
+
+        if c == KERNEL_PARAM_DELIMITER && !in_quote {
+            let trimmed = current.trim();
+            if !trimmed.is_empty() {
+                params.push(trimmed.to_string());
+            }
+            current.clear();
+            continue;
+        }
+
+        current.push(c);
+    }
+
+    let trimmed = current.trim();
+    if !trimmed.is_empty() {
+        params.push(trimmed.to_string());
+    }
+
+    params
+}
+
+struct KernelVerityConfig {
+    root_hash: String,
+    salt: String,
+    data_blocks: u64,
+    data_block_size: u64,
+    hash_block_size: u64,
+}
+
+fn new_kernel_verity_params(params_string: &str) -> Result<Option<KernelVerityConfig>> {
+    let cfg = parse_kernel_verity_params(params_string).map_err(|err| anyhow!(err.to_string()))?;
+
+    Ok(cfg.map(|params| KernelVerityConfig {
+        root_hash: params.root_hash,
+        salt: params.salt,
+        data_blocks: params.data_blocks,
+        data_block_size: params.data_block_size,
+        hash_block_size: params.hash_block_size,
+    }))
+}
+
+fn kernel_verity_root_flags(rootfs_type: &str) -> Result<String> {
+    let normalized = if rootfs_type.is_empty() {
+        VM_ROOTFS_FILESYSTEM_EXT4
+    } else {
+        rootfs_type
+    };
+
+    match normalized {
+        VM_ROOTFS_FILESYSTEM_EXT4 => Ok("data=ordered,errors=remount-ro ro".to_string()),
+        VM_ROOTFS_FILESYSTEM_XFS | VM_ROOTFS_FILESYSTEM_EROFS => Ok("ro".to_string()),
+        _ => Err(anyhow!("Unsupported rootfs type {}", rootfs_type)),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Param {
@@ -52,6 +124,64 @@ pub(crate) struct KernelParams {
 }
 
 impl KernelParams {
+    // All image-booting backends must select the rootfs independently of the
+    // guest's asynchronous virtio-blk probe order. PARTUUID is resolved by the
+    // kernel itself, before an initrd or udev could provide /dev/disk symlinks.
+    pub(crate) fn new_image_rootfs_kernel_params(
+        image: &str,
+        kernel_verity_params: &str,
+        rootfs_driver: &str,
+        rootfs_type: &str,
+        use_dax: bool,
+    ) -> Result<Self> {
+        if image.is_empty()
+            || !matches!(
+                rootfs_driver,
+                VM_ROOTFS_DRIVER_BLK | VM_ROOTFS_DRIVER_BLK_CCW | VM_ROOTFS_DRIVER_MMIO
+            )
+        {
+            return Self::new_rootfs_kernel_params(
+                kernel_verity_params,
+                rootfs_driver,
+                rootfs_type,
+                use_dax,
+            );
+        }
+
+        let uuids = kata_types::fs::partition_uuids(std::path::Path::new(image))
+            .with_context(|| format!("read rootfs partition identities from {image}"))?;
+        let root = format!(
+            "PARTUUID={}",
+            uuids
+                .get(&1)
+                .context("rootfs image is missing partition 1")?
+        );
+        let hash = if kernel_verity_params.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "PARTUUID={}",
+                uuids
+                    .get(&2)
+                    .context("rootfs image is missing verity partition 2")?
+            )
+        };
+        let mut params = Self::new_rootfs_kernel_params_with_devices(
+            kernel_verity_params,
+            rootfs_driver,
+            rootfs_type,
+            use_dax,
+            &root,
+            &hash,
+        )?;
+        if kernel_verity_params.is_empty() {
+            params.push(Param::new("rootwait", ""));
+        } else {
+            params.push(Param::new("dm-mod.waitfor", &format!("{root},{hash}")));
+        }
+        Ok(params)
+    }
+
     pub(crate) fn new(debug: bool) -> Self {
         // default kernel params
         let mut params = vec![
@@ -59,6 +189,7 @@ impl KernelParams {
             Param::new("panic", "1"),
             Param::new("systemd.unit", "kata-containers.target"),
             Param::new("systemd.mask", "systemd-networkd.service"),
+            Param::new("systemd.mask", "systemd-networkd.socket"),
         ];
 
         if debug {
@@ -68,32 +199,78 @@ impl KernelParams {
         Self { params }
     }
 
-    pub(crate) fn new_rootfs_kernel_params(rootfs_driver: &str, rootfs_type: &str) -> Result<Self> {
+    pub(crate) fn new_rootfs_kernel_params(
+        kernel_verity_params: &str,
+        rootfs_driver: &str,
+        rootfs_type: &str,
+        use_dax: bool,
+    ) -> Result<Self> {
+        let (root_device, hash_device) = match rootfs_driver {
+            VM_ROOTFS_DRIVER_PMEM => (VM_ROOTFS_ROOT_PMEM, "/dev/pmem0p2"),
+            _ => (VM_ROOTFS_ROOT_BLK, "/dev/vda2"),
+        };
+        Self::new_rootfs_kernel_params_with_devices(
+            kernel_verity_params,
+            rootfs_driver,
+            rootfs_type,
+            use_dax,
+            root_device,
+            hash_device,
+        )
+    }
+
+    fn new_rootfs_kernel_params_with_devices(
+        kernel_verity_params: &str,
+        rootfs_driver: &str,
+        rootfs_type: &str,
+        use_dax: bool,
+        root_device: &str,
+        hash_device: &str,
+    ) -> Result<Self> {
         let mut params = vec![];
 
         match rootfs_driver {
             VM_ROOTFS_DRIVER_PMEM => {
-                params.push(Param::new("root", VM_ROOTFS_ROOT_PMEM));
+                params.push(Param::new("root", root_device));
                 match rootfs_type {
-                    VM_ROOTFS_FILESYSTEM_EXT4 | VM_ROOTFS_FILESYSTEM_XFS => {
-                        params.push(Param::new(
-                            "rootflags",
-                            "dax,data=ordered,errors=remount-ro ro",
-                        ));
+                    VM_ROOTFS_FILESYSTEM_EXT4 => {
+                        if use_dax {
+                            params.push(Param::new(
+                                "rootflags",
+                                "dax,data=ordered,errors=remount-ro ro",
+                            ));
+                        } else {
+                            params
+                                .push(Param::new("rootflags", "data=ordered,errors=remount-ro ro"));
+                        }
+                    }
+                    VM_ROOTFS_FILESYSTEM_XFS => {
+                        if use_dax {
+                            params.push(Param::new("rootflags", "dax ro"));
+                        } else {
+                            params.push(Param::new("rootflags", "ro"));
+                        }
                     }
                     VM_ROOTFS_FILESYSTEM_EROFS => {
-                        params.push(Param::new("rootflags", "dax ro"));
+                        if use_dax {
+                            params.push(Param::new("rootflags", "dax ro"));
+                        } else {
+                            params.push(Param::new("rootflags", "ro"));
+                        }
                     }
                     _ => {
                         return Err(anyhow!("Unsupported rootfs type {}", rootfs_type));
                     }
                 }
             }
-            VM_ROOTFS_DRIVER_BLK | VM_ROOTFS_DRIVER_MMIO => {
-                params.push(Param::new("root", VM_ROOTFS_ROOT_BLK));
+            VM_ROOTFS_DRIVER_BLK | VM_ROOTFS_DRIVER_BLK_CCW | VM_ROOTFS_DRIVER_MMIO => {
+                params.push(Param::new("root", root_device));
                 match rootfs_type {
-                    VM_ROOTFS_FILESYSTEM_EXT4 | VM_ROOTFS_FILESYSTEM_XFS => {
+                    VM_ROOTFS_FILESYSTEM_EXT4 => {
                         params.push(Param::new("rootflags", "data=ordered,errors=remount-ro ro"));
+                    }
+                    VM_ROOTFS_FILESYSTEM_XFS => {
+                        params.push(Param::new("rootflags", "ro"));
                     }
                     VM_ROOTFS_FILESYSTEM_EROFS => {
                         params.push(Param::new("rootflags", "ro"));
@@ -110,17 +287,63 @@ impl KernelParams {
 
         params.push(Param::new("rootfstype", rootfs_type));
 
-        Ok(Self { params })
+        let mut params = Self { params };
+        let cfg = match new_kernel_verity_params(kernel_verity_params)? {
+            Some(cfg) => cfg,
+            None => return Ok(params),
+        };
+
+        let data_sectors = (cfg.data_block_size / VERITY_BLOCK_SIZE_BYTES) * cfg.data_blocks;
+        let root_flags = kernel_verity_root_flags(rootfs_type)?;
+
+        let dm_cmd = format!(
+            "dm-verity,,,ro,0 {} verity 1 {} {} {} {} {} 0 sha256 {} {}",
+            data_sectors,
+            root_device,
+            hash_device,
+            cfg.data_block_size,
+            cfg.hash_block_size,
+            cfg.data_blocks,
+            cfg.root_hash,
+            cfg.salt
+        );
+
+        params.remove_all_by_key("root".to_string());
+        params.remove_all_by_key("rootflags".to_string());
+        params.remove_all_by_key("rootfstype".to_string());
+
+        params.push(Param {
+            key: "dm-mod.create".to_string(),
+            value: format!("\"{}\"", dm_cmd),
+        });
+        params.push(Param::new("root", "/dev/dm-0"));
+        params.push(Param::new("rootflags", &root_flags));
+        if rootfs_type.is_empty() {
+            params.push(Param::new("rootfstype", VM_ROOTFS_FILESYSTEM_EXT4));
+        } else {
+            params.push(Param::new("rootfstype", rootfs_type));
+        }
+
+        Ok(params)
     }
 
     pub(crate) fn append(&mut self, params: &mut KernelParams) {
         self.params.append(&mut params.params);
     }
 
+    pub(crate) fn push(&mut self, new_param: Param) {
+        self.params.push(new_param);
+    }
+
+    pub(crate) fn remove_all_by_key(&mut self, key: String) {
+        // Remove all params with the given key from the vector
+        self.params.retain(|param| param.key != key);
+    }
+
     pub(crate) fn from_string(params_string: &str) -> Self {
         let mut params = vec![];
 
-        let parameters_vec: Vec<&str> = params_string.split(KERNEL_PARAM_DELIMITER).collect();
+        let parameters_vec = split_kernel_params(params_string);
 
         for param in parameters_vec.iter() {
             if param.is_empty() {
@@ -152,21 +375,36 @@ impl KernelParams {
             parameters.push(param.to_string()?);
         }
 
-        Ok(parameters.join(KERNEL_PARAM_DELIMITER))
+        Ok(parameters.join(&KERNEL_PARAM_DELIMITER.to_string()))
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use anyhow::Result;
 
     use super::*;
 
     use crate::{
-        VM_ROOTFS_DRIVER_BLK, VM_ROOTFS_DRIVER_PMEM, VM_ROOTFS_FILESYSTEM_EROFS,
-        VM_ROOTFS_FILESYSTEM_EXT4, VM_ROOTFS_FILESYSTEM_XFS, VM_ROOTFS_ROOT_BLK,
-        VM_ROOTFS_ROOT_PMEM,
+        VM_ROOTFS_DRIVER_BLK, VM_ROOTFS_DRIVER_PMEM, VM_ROOTFS_ROOT_BLK, VM_ROOTFS_ROOT_PMEM,
     };
+    use kata_types::fs::{
+        VM_ROOTFS_FILESYSTEM_EROFS, VM_ROOTFS_FILESYSTEM_EXT4, VM_ROOTFS_FILESYSTEM_XFS,
+    };
+
+    pub(crate) fn rootfs_image() -> tempfile::NamedTempFile {
+        use std::io::Write;
+        let mut image = tempfile::NamedTempFile::new().unwrap();
+        let mut mbr = [0u8; 512];
+        mbr[440..444].copy_from_slice(&0x603f58abu32.to_le_bytes());
+        for offset in [446, 462] {
+            mbr[offset + 4] = 0x83;
+            mbr[offset + 12..offset + 16].copy_from_slice(&2048u32.to_le_bytes());
+        }
+        mbr[510..512].copy_from_slice(&[0x55, 0xaa]);
+        image.write_all(&mbr).unwrap();
+        image
+    }
 
     #[test]
     fn test_params() {
@@ -208,6 +446,7 @@ mod tests {
     struct TestData<'a> {
         rootfs_driver: &'a str,
         rootfs_type: &'a str,
+        use_dax: bool,
         expect_params: KernelParams,
         result: Result<()>,
     }
@@ -215,10 +454,11 @@ mod tests {
     #[test]
     fn test_rootfs_kernel_params() {
         let tests = &[
-            // EXT4
+            // EXT4 with DAX
             TestData {
                 rootfs_driver: VM_ROOTFS_DRIVER_PMEM,
                 rootfs_type: VM_ROOTFS_FILESYSTEM_EXT4,
+                use_dax: true,
                 expect_params: KernelParams {
                     params: [
                         Param::new("root", VM_ROOTFS_ROOT_PMEM),
@@ -232,6 +472,7 @@ mod tests {
             TestData {
                 rootfs_driver: VM_ROOTFS_DRIVER_BLK,
                 rootfs_type: VM_ROOTFS_FILESYSTEM_EXT4,
+                use_dax: true,
                 expect_params: KernelParams {
                     params: [
                         Param::new("root", VM_ROOTFS_ROOT_BLK),
@@ -242,14 +483,15 @@ mod tests {
                 },
                 result: Ok(()),
             },
-            // XFS
+            // XFS without DAX
             TestData {
                 rootfs_driver: VM_ROOTFS_DRIVER_PMEM,
                 rootfs_type: VM_ROOTFS_FILESYSTEM_XFS,
+                use_dax: false,
                 expect_params: KernelParams {
                     params: [
                         Param::new("root", VM_ROOTFS_ROOT_PMEM),
-                        Param::new("rootflags", "dax,data=ordered,errors=remount-ro ro"),
+                        Param::new("rootflags", "ro"),
                         Param::new("rootfstype", VM_ROOTFS_FILESYSTEM_XFS),
                     ]
                     .to_vec(),
@@ -259,20 +501,22 @@ mod tests {
             TestData {
                 rootfs_driver: VM_ROOTFS_DRIVER_BLK,
                 rootfs_type: VM_ROOTFS_FILESYSTEM_XFS,
+                use_dax: true,
                 expect_params: KernelParams {
                     params: [
                         Param::new("root", VM_ROOTFS_ROOT_BLK),
-                        Param::new("rootflags", "data=ordered,errors=remount-ro ro"),
+                        Param::new("rootflags", "ro"),
                         Param::new("rootfstype", VM_ROOTFS_FILESYSTEM_XFS),
                     ]
                     .to_vec(),
                 },
                 result: Ok(()),
             },
-            // EROFS
+            // EROFS with DAX
             TestData {
                 rootfs_driver: VM_ROOTFS_DRIVER_PMEM,
                 rootfs_type: VM_ROOTFS_FILESYSTEM_EROFS,
+                use_dax: true,
                 expect_params: KernelParams {
                     params: [
                         Param::new("root", VM_ROOTFS_ROOT_PMEM),
@@ -286,6 +530,7 @@ mod tests {
             TestData {
                 rootfs_driver: VM_ROOTFS_DRIVER_BLK,
                 rootfs_type: VM_ROOTFS_FILESYSTEM_EROFS,
+                use_dax: true,
                 expect_params: KernelParams {
                     params: [
                         Param::new("root", VM_ROOTFS_ROOT_BLK),
@@ -300,6 +545,7 @@ mod tests {
             TestData {
                 rootfs_driver: "foo",
                 rootfs_type: VM_ROOTFS_FILESYSTEM_EXT4,
+                use_dax: true,
                 expect_params: KernelParams {
                     params: [
                         Param::new("root", VM_ROOTFS_ROOT_BLK),
@@ -314,6 +560,7 @@ mod tests {
             TestData {
                 rootfs_driver: VM_ROOTFS_DRIVER_BLK,
                 rootfs_type: "foo",
+                use_dax: true,
                 expect_params: KernelParams {
                     params: [
                         Param::new("root", VM_ROOTFS_ROOT_BLK),
@@ -327,17 +574,74 @@ mod tests {
         ];
 
         for (i, t) in tests.iter().enumerate() {
-            let msg = format!("test[{}]: {:?}", i, t);
-            let result = KernelParams::new_rootfs_kernel_params(t.rootfs_driver, t.rootfs_type);
-            let msg = format!("{}, result: {:?}", msg, result);
-            if t.result.is_ok() {
-                assert!(result.is_ok(), "{}", msg);
-                assert_eq!(t.expect_params, result.unwrap());
-            } else {
-                let expected_error = format!("{}", t.result.as_ref().unwrap_err());
+            let msg = format!("test[{i}]: {t:?}");
+            let result = KernelParams::new_rootfs_kernel_params(
+                "",
+                t.rootfs_driver,
+                t.rootfs_type,
+                t.use_dax,
+            );
+            let msg = format!("{msg}, result: {result:?}");
+            if let Err(expected_err) = &t.result {
+                let expected_error = format!("{expected_err}");
                 let actual_error = format!("{}", result.unwrap_err());
                 assert!(actual_error == expected_error, "{}", msg);
+            } else {
+                assert!(result.is_ok(), "{}", msg);
+                assert_eq!(t.expect_params, result.unwrap());
             }
         }
+    }
+
+    #[test]
+    fn test_kernel_verity_params() -> Result<()> {
+        let params = KernelParams::new_rootfs_kernel_params(
+            "root_hash=abc,salt=def,data_blocks=1,data_block_size=4096,hash_block_size=4096",
+            VM_ROOTFS_DRIVER_BLK,
+            VM_ROOTFS_FILESYSTEM_EXT4,
+            false,
+        )?;
+        let params_string = params.to_string()?;
+        assert!(params_string.contains("dm-mod.create="));
+        assert!(params_string.contains("root=/dev/dm-0"));
+        assert!(params_string.contains("rootfstype=ext4"));
+
+        let err = KernelParams::new_rootfs_kernel_params(
+            "root_hash=abc,data_blocks=1,data_block_size=4096,hash_block_size=4096",
+            VM_ROOTFS_DRIVER_BLK,
+            VM_ROOTFS_FILESYSTEM_EXT4,
+            false,
+        )
+        .expect_err("expected missing salt error");
+        assert!(format!("{err}").contains("Missing kernel_verity_params salt"));
+
+        let err = KernelParams::new_rootfs_kernel_params(
+            "root_hash=abc,salt=def,data_block_size=4096,hash_block_size=4096",
+            VM_ROOTFS_DRIVER_BLK,
+            VM_ROOTFS_FILESYSTEM_EXT4,
+            false,
+        )
+        .expect_err("expected missing data_blocks error");
+        assert!(format!("{err}").contains("Missing kernel_verity_params data_blocks"));
+
+        let err = KernelParams::new_rootfs_kernel_params(
+            "root_hash=abc,salt=def,data_blocks=foo,data_block_size=4096,hash_block_size=4096",
+            VM_ROOTFS_DRIVER_BLK,
+            VM_ROOTFS_FILESYSTEM_EXT4,
+            false,
+        )
+        .expect_err("expected invalid data_blocks error");
+        assert!(format!("{err}").contains("Invalid kernel_verity_params data_blocks"));
+
+        let err = KernelParams::new_rootfs_kernel_params(
+            "root_hash=abc,salt=def,data_blocks=1,data_block_size=4096,hash_block_size=4096,badfield",
+            VM_ROOTFS_DRIVER_BLK,
+            VM_ROOTFS_FILESYSTEM_EXT4,
+            false,
+        )
+        .expect_err("expected invalid entry error");
+        assert!(format!("{err}").contains("Invalid kernel_verity_params entry"));
+
+        Ok(())
     }
 }

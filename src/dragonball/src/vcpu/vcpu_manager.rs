@@ -16,6 +16,9 @@ use std::sync::{Arc, Barrier, Mutex, RwLock};
 use std::time::Duration;
 
 use dbs_arch::VpmuFeatureLevel;
+use dbs_boot::FirmwareType;
+#[cfg(target_arch = "x86_64")]
+use dbs_interrupt::InterruptManager;
 #[cfg(all(feature = "hotplug", feature = "dbs-upcall"))]
 use dbs_upcall::{DevMgrService, UpcallClient};
 use dbs_utils::epoll_manager::{EpollManager, EventOps, EventSet, Events, MutEventSubscriber};
@@ -27,12 +30,17 @@ use vm_memory::GuestAddress;
 use vmm_sys_util::eventfd::EventFd;
 
 use crate::address_space_manager::GuestAddressSpaceImpl;
+#[cfg(target_arch = "x86_64")]
+use crate::api::v1::ConfidentialVmType;
 use crate::api::v1::InstanceInfo;
 use crate::kvm_context::KvmContext;
+use crate::metric::METRICS;
 use crate::vcpu::vcpu_impl::{
     Vcpu, VcpuError, VcpuEvent, VcpuHandle, VcpuResizeResult, VcpuResponse, VcpuStateEvent,
 };
 use crate::vcpu::VcpuConfig;
+#[cfg(target_arch = "x86_64")]
+use crate::vcpu::VcpuState;
 use crate::vm::VmConfigInfo;
 use crate::IoManagerCached;
 
@@ -73,6 +81,10 @@ pub enum VcpuManagerError {
     /// vCPU save failed.
     #[error("failure while save vCPU state")]
     VcpuSave,
+
+    /// SaveState was requested while the vCPU was not paused.
+    #[error("cannot save vCPU state: the vCPU is not paused")]
+    SaveStateNotAllowed,
 
     /// Vcpu is in unexpected state.
     #[error("Vcpu is in unexpected state")]
@@ -188,7 +200,7 @@ pub struct VcpuResizeInfo {
 #[derive(Default)]
 pub(crate) struct VcpuInfo {
     pub(crate) vcpu: Option<Vcpu>,
-    vcpu_fd: Option<Arc<VcpuFd>>,
+    vcpu_fd: Option<VcpuFd>,
     handle: Option<VcpuHandle>,
     tid: u32,
 }
@@ -224,7 +236,7 @@ pub struct VcpuManager {
     vm_as: GuestAddressSpaceImpl,
     pub(crate) vm_fd: Arc<VmFd>,
 
-    action_sycn_tx: Option<Sender<bool>>,
+    action_sycn_tx: Option<Sender<Option<i32>>>,
     vcpus_in_action: (VcpuAction, Vec<u8>),
     pub(crate) reset_event_fd: Option<EventFd>,
 
@@ -234,6 +246,9 @@ pub struct VcpuManager {
     // X86 specific fields.
     #[cfg(target_arch = "x86_64")]
     pub(crate) supported_cpuid: kvm_bindings::CpuId,
+
+    #[cfg(target_arch = "x86_64")]
+    irq_manager: Arc<Box<dyn InterruptManager>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -248,10 +263,21 @@ impl VcpuManager {
         shared_info: Arc<RwLock<InstanceInfo>>,
         io_manager: IoManagerCached,
         epoll_manager: EpollManager,
+        #[cfg(target_arch = "x86_64")] irq_manager: Arc<Box<dyn InterruptManager>>,
     ) -> Result<Arc<Mutex<Self>>> {
         let support_immediate_exit = kvm_context.kvm().check_extension(Cap::ImmediateExit);
         let max_vcpu_count = vm_config_info.max_vcpu_count;
+        #[cfg(not(target_arch = "x86_64"))]
         let kvm_max_vcpu_count = kvm_context.get_max_vcpus();
+        #[cfg(target_arch = "x86_64")]
+        let kvm_max_vcpu_count =
+            if shared_info.read().unwrap().confidential_vm_type == Some(ConfidentialVmType::TDX) {
+                // For TDX VMs, max vcpu allowed from TDX module might be different from that of
+                // kvm context
+                vm_fd.check_extension_int(Cap::MaxVcpus) as usize
+            } else {
+                kvm_context.get_max_vcpus()
+            };
 
         // check the max vcpu count in kvm. max_vcpu_count is u8 and kvm_context.get_max_vcpus()
         // returns usize, so convert max_vcpu_count to usize instead of converting kvm max vcpu to
@@ -259,8 +285,7 @@ impl VcpuManager {
         // be casted into a smaller number.
         if max_vcpu_count as usize > kvm_max_vcpu_count {
             error!(
-                "vcpu_manager: specified vcpu count {} is greater than max allowed count {} by kvm",
-                max_vcpu_count, kvm_max_vcpu_count
+                "vcpu_manager: specified vcpu count {max_vcpu_count} is greater than max allowed count {kvm_max_vcpu_count} by kvm"
             );
             return Err(VcpuManagerError::MaxVcpuLimitation(
                 max_vcpu_count,
@@ -324,6 +349,8 @@ impl VcpuManager {
             upcall_channel: None,
             #[cfg(target_arch = "x86_64")]
             supported_cpuid,
+            #[cfg(target_arch = "x86_64")]
+            irq_manager,
         }));
 
         let handler = Box::new(VcpuEpollHandler {
@@ -384,7 +411,7 @@ impl VcpuManager {
         } else {
             self.vcpu_config.boot_vcpu_count
         };
-        self.create_vcpus(boot_vcpu_count, Some(request_ts), Some(entry_addr))?;
+        self.create_vcpus(boot_vcpu_count, Some(request_ts), Some(entry_addr), None)?;
 
         Ok(())
     }
@@ -405,6 +432,7 @@ impl VcpuManager {
         vcpu_count: u8,
         request_ts: Option<TimestampUs>,
         entry_addr: Option<GuestAddress>,
+        firmware_type: Option<FirmwareType>,
     ) -> Result<Vec<u8>> {
         info!("create vcpus");
         if vcpu_count > self.vcpu_config.max_vcpu_count {
@@ -414,7 +442,7 @@ impl VcpuManager {
         let request_ts = request_ts.unwrap_or_default();
         let mut created_cpus = Vec::new();
         for cpu_id in self.calculate_available_vcpus(vcpu_count) {
-            self.create_vcpu(cpu_id, request_ts.clone(), entry_addr)?;
+            self.create_vcpu(cpu_id, request_ts.clone(), entry_addr, firmware_type)?;
             created_cpus.push(cpu_id);
         }
 
@@ -469,7 +497,106 @@ impl VcpuManager {
     pub fn revalidate_all_vcpus_cache(&mut self) -> Result<()> {
         self.revalidate_vcpus_cache(&self.present_vcpus())
     }
+}
 
+#[cfg(target_arch = "x86_64")]
+impl<'a> dbs_snapshot::Persist<'a> for VcpuManager {
+    type State = Vec<VcpuState>;
+    type SaveArgs = &'a [u32];
+    type RestoreArgs = ();
+    type Error = VcpuManagerError;
+
+    /// Save the states of all started vCPUs.
+    ///
+    /// All vCPUs must be paused (see [`VcpuManager::pause_all_vcpus`])
+    /// before calling this.
+    ///
+    /// # Arguments
+    ///
+    /// * `msr_index_list` - Indices of the MSRs to save, typically
+    ///   `KvmContext::supported_msrs()` (pre-filtered for serializability).
+    #[cfg(target_arch = "x86_64")]
+    fn save_state(&mut self, msr_index_list: &'a [u32]) -> Result<Vec<VcpuState>> {
+        let cpu_indexes = self.present_vcpus();
+        let mut first_error = None;
+        for cpu_id in &cpu_indexes {
+            if let Some(handle) = &self.vcpu_infos[*cpu_id as usize].handle {
+                if let Err(e) = handle.send_event(VcpuEvent::SaveState(msr_index_list.to_vec())) {
+                    first_error.get_or_insert(VcpuManagerError::VcpuEvent(e));
+                }
+            } else {
+                first_error.get_or_insert(VcpuManagerError::VcpuNotFound(*cpu_id));
+            }
+        }
+
+        let mut states = Vec::with_capacity(cpu_indexes.len());
+        for cpu_id in &cpu_indexes {
+            if let Some(handle) = &self.vcpu_infos[*cpu_id as usize].handle {
+                let deadline =
+                    std::time::Instant::now() + Duration::from_millis(CPU_RECV_TIMEOUT_MS);
+                loop {
+                    let remaining = deadline
+                        .checked_duration_since(std::time::Instant::now())
+                        .unwrap_or_default();
+                    match handle.response_receiver().recv_timeout(remaining) {
+                        Ok(VcpuResponse::SavedState(state)) => {
+                            states.push(*state);
+                            break;
+                        }
+                        // Pause/resume acknowledgements are fire-and-forget
+                        // and may still sit in the channel; drain them.
+                        Ok(VcpuResponse::Paused) | Ok(VcpuResponse::Resumed) => continue,
+                        Ok(VcpuResponse::Error(e)) => {
+                            first_error.get_or_insert(VcpuManagerError::Vcpu(e));
+                            break;
+                        }
+                        Ok(VcpuResponse::NotAllowed) => {
+                            first_error.get_or_insert(VcpuManagerError::SaveStateNotAllowed);
+                            break;
+                        }
+                        Ok(_) => {
+                            first_error.get_or_insert(VcpuManagerError::UnexpectedVcpuResponse);
+                            break;
+                        }
+                        Err(e) => {
+                            error!("vCPU save state error! {e:?}");
+                            first_error.get_or_insert(VcpuManagerError::VcpuResponseTimeout(e));
+                            break;
+                        }
+                    }
+                }
+            } else {
+                first_error.get_or_insert(VcpuManagerError::VcpuNotFound(*cpu_id));
+            }
+        }
+
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(states),
+        }
+    }
+
+    /// Restore previously saved vCPU states.
+    ///
+    /// The target vCPUs must have been created (see
+    /// [`VcpuManager::create_vcpus`]) but not started yet: the state is
+    /// applied before the vCPU threads spawn.
+    #[cfg(target_arch = "x86_64")]
+    fn restore_state(&mut self, states: &Vec<VcpuState>, _args: ()) -> Result<()> {
+        for state in states {
+            let info = self
+                .vcpu_infos
+                .get_mut(state.id as usize)
+                .ok_or(VcpuManagerError::VcpuNotFound(state.id))?;
+            let vcpu = info.vcpu.as_mut().ok_or(VcpuManagerError::VcpuNotCreate)?;
+            dbs_snapshot::Persist::restore_state(vcpu, state, ())
+                .map_err(VcpuManagerError::Vcpu)?;
+        }
+        Ok(())
+    }
+}
+
+impl VcpuManager {
     /// return all present vcpus
     pub fn present_vcpus(&self) -> Vec<u8> {
         self.vcpu_infos
@@ -483,6 +610,7 @@ impl VcpuManager {
     /// Get available vcpus to create with target vcpu_count
     /// Argument:
     /// * vcpu_count: target vcpu_count online in VcpuManager.
+    ///
     /// Return:
     /// * return available vcpu ids to create vcpu .
     fn calculate_available_vcpus(&self, vcpu_count: u8) -> Vec<u8> {
@@ -518,6 +646,7 @@ impl VcpuManager {
         &mut self,
         entry_addr: Option<GuestAddress>,
         vcpu: &mut Vcpu,
+        firmware_type: Option<FirmwareType>,
     ) -> std::result::Result<(), VcpuError> {
         vcpu.configure(
             &self.vcpu_config,
@@ -525,6 +654,7 @@ impl VcpuManager {
             &self.vm_as,
             entry_addr,
             None,
+            firmware_type,
         )
     }
 
@@ -533,29 +663,30 @@ impl VcpuManager {
         cpu_index: u8,
         request_ts: TimestampUs,
         entry_addr: Option<GuestAddress>,
+        firmware_type: Option<FirmwareType>,
     ) -> Result<()> {
-        info!("creating vcpu {}", cpu_index);
+        info!("creating vcpu {cpu_index}");
         if self.vcpu_infos.get(cpu_index as usize).is_none() {
             return Err(VcpuManagerError::VcpuNotFound(cpu_index));
         }
         // We will reuse the kvm's vcpufd after first creation, for we can't
         // create vcpufd with same id in one kvm instance.
-        let kvm_vcpu = match &self.vcpu_infos[cpu_index as usize].vcpu_fd {
-            Some(vcpu_fd) => vcpu_fd.clone(),
-            None => {
-                let vcpu_fd = Arc::new(
-                    self.vm_fd
-                        .create_vcpu(cpu_index as u64)
-                        .map_err(VcpuError::VcpuFd)
-                        .map_err(VcpuManagerError::Vcpu)?,
-                );
-                self.vcpu_infos[cpu_index as usize].vcpu_fd = Some(vcpu_fd.clone());
-                vcpu_fd
-            }
+        let kvm_vcpu = match self.vcpu_infos[cpu_index as usize].vcpu_fd.take() {
+            Some(vcpu_fd) => vcpu_fd,
+            None => self
+                .vm_fd
+                .create_vcpu(cpu_index as u64)
+                .map_err(VcpuError::VcpuFd)
+                .map_err(VcpuManagerError::Vcpu)?,
         };
 
         let mut vcpu = self.create_vcpu_arch(cpu_index, kvm_vcpu, request_ts)?;
-        self.configure_single_vcpu(entry_addr, &mut vcpu)
+        METRICS
+            .write()
+            .unwrap()
+            .vcpu
+            .insert(cpu_index as u32, vcpu.metrics());
+        self.configure_single_vcpu(entry_addr, &mut vcpu, firmware_type)
             .map_err(VcpuManagerError::Vcpu)?;
         self.vcpu_infos[cpu_index as usize].vcpu = Some(vcpu);
 
@@ -563,7 +694,7 @@ impl VcpuManager {
     }
 
     fn start_vcpu(&mut self, cpu_index: u8, barrier: Arc<Barrier>) -> Result<()> {
-        info!("starting vcpu {}", cpu_index);
+        info!("starting vcpu {cpu_index}");
         if self.vcpu_infos.get(cpu_index as usize).is_none() {
             return Err(VcpuManagerError::VcpuNotFound(cpu_index));
         }
@@ -600,7 +731,7 @@ impl VcpuManager {
                 {
                     Ok(VcpuResponse::Tid(_, id)) => self.vcpu_infos[*cpu_id as usize].tid = id,
                     Err(e) => {
-                        error!("vCPU get tid error! {:?}", e);
+                        error!("vCPU get tid error! {e:?}");
                         return Err(VcpuManagerError::VcpuGettid);
                     }
                     _ => {
@@ -682,7 +813,7 @@ impl VcpuManager {
 
     // exit vcpus and notify the vmm exit event
     fn exit_vcpus(&mut self, cpu_indexes: &[u8]) -> Result<()> {
-        info!("exiting vcpus {:?}", cpu_indexes);
+        info!("exiting vcpus {cpu_indexes:?}");
         for cpu_id in cpu_indexes {
             if self.vcpu_infos.get(*cpu_id as usize).is_none() {
                 return Err(VcpuManagerError::VcpuNotFound(*cpu_id));
@@ -700,7 +831,7 @@ impl VcpuManager {
             let handle = self.vcpu_infos[*cpu_id as usize].handle.take().unwrap();
             handle
                 .join_vcpu_thread()
-                .map_err(|e| error!("vcpu exit error! {:?}", e))
+                .map_err(|e| error!("vcpu exit error! {e:?}"))
                 .ok();
         }
 
@@ -749,8 +880,10 @@ impl VcpuManager {
 
     fn sync_action_finish(&mut self, got_error: bool) {
         if let Some(tx) = self.action_sycn_tx.take() {
-            if let Err(e) = tx.send(got_error) {
-                debug!("cpu sync action send to closed channel {}", e);
+            let result = if got_error { 0 } else { -1 };
+
+            if let Err(e) = tx.send(Some(result)) {
+                debug!("cpu sync action send to closed channel {e}");
             }
         }
     }
@@ -769,13 +902,14 @@ impl VcpuManager {
     fn create_vcpu_arch(
         &self,
         cpu_index: u8,
-        vcpu_fd: Arc<VcpuFd>,
+        vcpu_fd: VcpuFd,
         request_ts: TimestampUs,
     ) -> Result<Vcpu> {
         // It's safe to unwrap because guest_kernel always exist until vcpu manager done
         Vcpu::new_x86_64(
             cpu_index,
             vcpu_fd,
+            self.vm_fd.clone(),
             // safe to unwrap
             self.io_manager.as_ref().unwrap().clone(),
             self.supported_cpuid.clone(),
@@ -784,6 +918,7 @@ impl VcpuManager {
             self.vcpu_state_sender.clone(),
             request_ts,
             self.support_immediate_exit,
+            self.irq_manager.clone(),
         )
         .map_err(VcpuManagerError::Vcpu)
     }
@@ -798,12 +933,13 @@ impl VcpuManager {
     fn create_vcpu_arch(
         &self,
         cpu_index: u8,
-        vcpu_fd: Arc<VcpuFd>,
+        vcpu_fd: VcpuFd,
         request_ts: TimestampUs,
     ) -> Result<Vcpu> {
         Vcpu::new_aarch64(
             cpu_index,
             vcpu_fd,
+            self.vm_fd.clone(),
             // safe to unwrap
             self.io_manager.as_ref().unwrap().clone(),
             self.reset_event_fd.as_ref().unwrap().try_clone().unwrap(),
@@ -849,7 +985,7 @@ mod hotplug {
         pub fn resize_vcpu(
             &mut self,
             vcpu_count: u8,
-            sync_tx: Option<Sender<bool>>,
+            sync_tx: Option<Sender<Option<i32>>>,
         ) -> std::result::Result<(), VcpuResizeError> {
             if self.get_vcpus_action() != VcpuAction::None {
                 return Err(VcpuResizeError::VcpuIsHotplugging);
@@ -858,7 +994,7 @@ mod hotplug {
 
             if let Some(upcall) = self.upcall_channel.clone() {
                 let now_vcpu = self.present_vcpus_count();
-                info!("resize vcpu: now: {}, desire: {}", now_vcpu, vcpu_count);
+                info!("resize vcpu: now: {now_vcpu}, desire: {vcpu_count}");
                 match vcpu_count.cmp(&now_vcpu) {
                     Ordering::Equal => {
                         info!("resize vcpu: no need to resize");
@@ -884,20 +1020,20 @@ mod hotplug {
             }
 
             let created_vcpus = self
-                .create_vcpus(vcpu_count, None, None)
+                .create_vcpus(vcpu_count, None, None, None)
                 .map_err(VcpuResizeError::Vcpu)?;
             let cpu_ids = self
                 .activate_vcpus(vcpu_count, true)
                 .map_err(|e| {
                     // we need to rollback when activate vcpu error
-                    error!("activate vcpu error, rollback! {:?}", e);
+                    error!("activate vcpu error, rollback! {e:?}");
                     let activated_vcpus: Vec<u8> = created_vcpus
                         .iter()
                         .filter(|&cpu_id| self.vcpu_infos[*cpu_id as usize].handle.is_some())
                         .copied()
                         .collect();
                     if let Err(e) = self.exit_vcpus(&activated_vcpus) {
-                        error!("try to rollback error, stop_vcpu: {:?}", e);
+                        error!("try to rollback error, stop_vcpu: {e:?}");
                     }
                     e
                 })
@@ -1039,10 +1175,7 @@ impl VcpuEpollHandler {
         while let Ok(event) = self.rx.try_recv() {
             match event {
                 VcpuStateEvent::Hotplug((success, cpu_count)) => {
-                    info!(
-                        "get vcpu event, cpu_index {} success {:?}",
-                        cpu_count, success
-                    );
+                    info!("get vcpu event, cpu_index {cpu_count} success {success:?}");
                     self.process_cpu_action(success, cpu_count);
                 }
             }
@@ -1059,7 +1192,7 @@ impl VcpuEpollHandler {
                 }
                 VcpuAction::Hotunplug => {
                     if let Err(e) = vcpu_manager.stop_vcpus_in_action() {
-                        error!("stop vcpus in action error: {:?}", e);
+                        error!("stop vcpus in action error: {e:?}");
                     }
                     // notify hotunplug success
                     vcpu_manager.sync_action_finish(false);
@@ -1093,6 +1226,8 @@ impl MutEventSubscriber for VcpuEpollHandler {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_arch = "x86_64")]
+    use dbs_snapshot::Persist;
     use std::os::unix::io::AsRawFd;
     use std::sync::{Arc, RwLock};
 
@@ -1100,7 +1235,8 @@ mod tests {
     #[cfg(feature = "hotplug")]
     use dbs_virtio_devices::vsock::backend::VsockInnerBackend;
     use seccompiler::BpfProgram;
-    use test_utils::skip_if_not_root;
+    use serial_test::serial;
+    use test_utils::skip_if_kvm_unaccessable;
     use vmm_sys_util::eventfd::EventFd;
 
     use super::*;
@@ -1127,6 +1263,7 @@ mod tests {
                 sockets: 1,
             },
             vpmu_feature: 0,
+            pci_hotplug_enabled: false,
         };
         vm.set_vm_config(vm_config);
         vm.init_guest_memory().unwrap();
@@ -1156,7 +1293,7 @@ mod tests {
 
     #[test]
     fn test_vcpu_manager_config() {
-        skip_if_not_root!();
+        skip_if_kvm_unaccessable!();
         let instance_info = Arc::new(RwLock::new(InstanceInfo::default()));
         let epoll_manager = EpollManager::default();
         let mut vm = Vm::new(None, instance_info, epoll_manager).unwrap();
@@ -1175,6 +1312,7 @@ mod tests {
                 sockets: 1,
             },
             vpmu_feature: 0,
+            pci_hotplug_enabled: false,
         };
         vm.set_vm_config(vm_config.clone());
         vm.init_guest_memory().unwrap();
@@ -1211,7 +1349,7 @@ mod tests {
 
     #[test]
     fn test_vcpu_manager_boot_vcpus() {
-        skip_if_not_root!();
+        skip_if_kvm_unaccessable!();
         let vm = get_vm();
         let mut vcpu_manager = vm.vcpu_manager().unwrap();
 
@@ -1230,16 +1368,16 @@ mod tests {
 
     #[test]
     fn test_vcpu_manager_operate_vcpus() {
-        skip_if_not_root!();
+        skip_if_kvm_unaccessable!();
         let vm = get_vm();
         let mut vcpu_manager = vm.vcpu_manager().unwrap();
 
         // test create vcpu more than max
-        let res = vcpu_manager.create_vcpus(20, None, None);
+        let res = vcpu_manager.create_vcpus(20, None, None, None);
         assert!(matches!(res, Err(VcpuManagerError::ExpectedVcpuExceedMax)));
 
         // test create vcpus
-        assert!(vcpu_manager.create_vcpus(2, None, None).is_ok());
+        assert!(vcpu_manager.create_vcpus(2, None, None, None).is_ok());
         assert_eq!(vcpu_manager.present_vcpus_count(), 0);
         assert_eq!(get_present_unstart_vcpus(&vcpu_manager), 2);
         assert_eq!(vcpu_manager.vcpus().len(), 2);
@@ -1267,8 +1405,9 @@ mod tests {
             .is_ok());
     }
     #[test]
+    #[serial(emulate_res)]
     fn test_vcpu_manager_pause_resume_vcpus() {
-        skip_if_not_root!();
+        skip_if_kvm_unaccessable!();
         *(EMULATE_RES.lock().unwrap()) = EmulationCase::Error(libc::EINTR);
 
         let vm = get_vm();
@@ -1308,9 +1447,62 @@ mod tests {
         assert!(vcpu_manager.resume_all_vcpus().is_ok());
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
+    #[serial(emulate_res)]
+    fn test_vcpu_manager_save_restore_states() {
+        skip_if_kvm_unaccessable!();
+        *(EMULATE_RES.lock().unwrap()) = EmulationCase::Error(libc::EINTR);
+
+        let vm = get_vm();
+        // An in-kernel irqchip is required for LAPIC state access, and it
+        // must be created before the vCPUs. Tolerate EEXIST: the test VM
+        // setup may already have created it.
+        let _ = vm.vm_fd().create_irq_chip();
+        let msr_list = crate::kvm_context::KvmContext::new(None)
+            .unwrap()
+            .supported_msrs(0)
+            .unwrap();
+
+        let mut vcpu_manager = vm.vcpu_manager().unwrap();
+        assert!(vcpu_manager
+            .create_boot_vcpus(TimestampUs::default(), GuestAddress(0))
+            .is_ok());
+
+        // Save directly from the not-yet-started vCPU and restore into it:
+        // exercises the pre-start restore path.
+        let state = vcpu_manager.vcpu_infos[0]
+            .vcpu
+            .as_mut()
+            .unwrap()
+            .save_state(msr_list.as_slice())
+            .unwrap();
+        assert_eq!(state.id, 0);
+        vcpu_manager.restore_state(&vec![state], ()).unwrap();
+
+        // Threaded save: start, pause, save via the event round-trip.
+        assert!(vcpu_manager.start_boot_vcpus(BpfProgram::default()).is_ok());
+
+        // Saving while running is refused with the precondition error.
+        let res = vcpu_manager.save_state(msr_list.as_slice());
+        assert!(
+            matches!(res, Err(VcpuManagerError::SaveStateNotAllowed)),
+            "expected SaveStateNotAllowed, got {:?}",
+            res.as_ref().map(|states| states.len())
+        );
+
+        assert!(vcpu_manager.pause_all_vcpus().is_ok());
+        let states = vcpu_manager.save_state(msr_list.as_slice()).unwrap();
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].id, 0);
+        assert!(!states[0].msrs.is_empty());
+        assert!(vcpu_manager.resume_all_vcpus().is_ok());
+    }
+
+    #[test]
+    #[serial(emulate_res)]
     fn test_vcpu_manager_exit_vcpus() {
-        skip_if_not_root!();
+        skip_if_kvm_unaccessable!();
         *(EMULATE_RES.lock().unwrap()) = EmulationCase::Error(libc::EINTR);
 
         let vm = get_vm();
@@ -1340,8 +1532,9 @@ mod tests {
     }
 
     #[test]
+    #[serial(emulate_res)]
     fn test_vcpu_manager_exit_all_vcpus() {
-        skip_if_not_root!();
+        skip_if_kvm_unaccessable!();
         *(EMULATE_RES.lock().unwrap()) = EmulationCase::Error(libc::EINTR);
 
         let vm = get_vm();
@@ -1366,8 +1559,9 @@ mod tests {
     }
 
     #[test]
+    #[serial(emulate_res)]
     fn test_vcpu_manager_revalidate_vcpus_cache() {
-        skip_if_not_root!();
+        skip_if_kvm_unaccessable!();
         *(EMULATE_RES.lock().unwrap()) = EmulationCase::Error(libc::EINTR);
 
         let vm = get_vm();
@@ -1397,8 +1591,9 @@ mod tests {
     }
 
     #[test]
+    #[serial(emulate_res)]
     fn test_vcpu_manager_revalidate_all_vcpus_cache() {
-        skip_if_not_root!();
+        skip_if_kvm_unaccessable!();
         *(EMULATE_RES.lock().unwrap()) = EmulationCase::Error(libc::EINTR);
 
         let vm = get_vm();
@@ -1423,7 +1618,7 @@ mod tests {
     #[test]
     #[cfg(feature = "hotplug")]
     fn test_vcpu_manager_resize_cpu() {
-        skip_if_not_root!();
+        skip_if_kvm_unaccessable!();
         let vm = get_vm();
         let mut vcpu_manager = vm.vcpu_manager().unwrap();
 

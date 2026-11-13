@@ -7,16 +7,17 @@
 use agent::Storage;
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use kata_sys_util::mount::{bind_remount, umount_all, umount_timeout};
+use hypervisor::utils::remove_dir_all_if_exists;
+use kata_sys_util::mount::{bind_remount, get_mount_points_under, umount_all, umount_timeout};
 use kata_types::k8s::is_watchable_mount;
-use kata_types::mount;
-use nix::sys::stat::stat;
 use std::fs;
 use std::path::Path;
 
 const WATCHABLE_PATH_NAME: &str = "watchable";
 const WATCHABLE_BIND_DEV_TYPE: &str = "watchable-bind";
-pub const EPHEMERAL_PATH: &str = "/run/kata-containers/sandbox/ephemeral";
+const DEFAULT_EPHEMERAL_PATH: &str = "/run/kata-containers/sandbox/ephemeral";
+
+use crate::share_fs::kata_guest_share_dir;
 
 use super::{
     get_host_rw_shared_path,
@@ -24,9 +25,12 @@ use super::{
         self, do_get_host_path, get_host_ro_shared_path, get_host_shared_path,
         mkdir_with_permissions,
     },
-    ShareFsMount, ShareFsMountResult, ShareFsRootfsConfig, ShareFsVolumeConfig,
-    KATA_GUEST_SHARE_DIR, PASSTHROUGH_FS_DIR,
+    ShareFsMount, ShareFsMountResult, ShareFsRootfsConfig, ShareFsVolumeConfig, PASSTHROUGH_FS_DIR,
 };
+
+pub fn ephemeral_path() -> String {
+    DEFAULT_EPHEMERAL_PATH.to_string()
+}
 
 #[derive(Debug)]
 pub struct VirtiofsShareMount {
@@ -82,15 +86,14 @@ impl ShareFsMount for VirtiofsShareMount {
                 .join(WATCHABLE_PATH_NAME);
 
             mkdir_with_permissions(watchable_host_path.clone(), 0o750).context(format!(
-                "unable to create watchable path {:?}",
-                watchable_host_path
+                "unable to create watchable path {watchable_host_path:?}"
             ))?;
 
             // path: /run/kata-containers/shared/containers/passthrough/watchable/config-map-name
             let file_name = Path::new(&guest_path)
                 .file_name()
                 .context("get file name from guest path")?;
-            let watchable_guest_mount = Path::new(KATA_GUEST_SHARE_DIR)
+            let watchable_guest_mount = Path::new(kata_guest_share_dir().as_str())
                 .join(PASSTHROUGH_FS_DIR)
                 .join(WATCHABLE_PATH_NAME)
                 .join(file_name)
@@ -106,6 +109,7 @@ impl ShareFsMount for VirtiofsShareMount {
                 fs_group: None,
                 options: config.mount_options.clone(),
                 mount_point: watchable_guest_mount.clone(),
+                shared: false,
             };
 
             // Update the guest_path, in order to identify what will
@@ -113,51 +117,6 @@ impl ShareFsMount for VirtiofsShareMount {
             guest_path = watchable_guest_mount;
 
             let storages = vec![watchable_storage];
-
-            return Ok(ShareFsMountResult {
-                guest_path,
-                storages,
-            });
-        } else if config.mount.r#type == mount::KATA_EPHEMERAL_VOLUME_TYPE {
-            // refer to the golang `handleEphemeralStorage` code at
-            // https://github.com/kata-containers/kata-containers/blob/9516286f6dd5cfd6b138810e5d7c9e01cf6fc043/src/runtime/virtcontainers/kata_agent.go#L1354
-
-            let source = &config.mount.source;
-            let file_stat =
-                stat(Path::new(source)).with_context(|| format!("mount source {}", source))?;
-
-            // if volume's gid isn't root group(default group), this means there's
-            // an specific fsGroup is set on this local volume, then it should pass
-            // to guest.
-            let dir_options = if file_stat.st_gid != 0 {
-                vec![format!("fsgid={}", file_stat.st_gid)]
-            } else {
-                vec![]
-            };
-
-            let file_name = Path::new(source)
-                .file_name()
-                .context("get file name from mount.source")?;
-            let source = Path::new(EPHEMERAL_PATH)
-                .join(file_name)
-                .into_os_string()
-                .into_string()
-                .map_err(|e| anyhow!("failed to get ephemeral path {:?}", e))?;
-
-            // Create a storage struct so that kata agent is able to create
-            // tmpfs backed volume inside the VM
-            let ephemeral_storage = agent::Storage {
-                driver: String::from(mount::KATA_EPHEMERAL_VOLUME_TYPE),
-                driver_options: Vec::new(),
-                source: String::from("tmpfs"),
-                fs_type: String::from("tmpfs"),
-                fs_group: None,
-                options: dir_options,
-                mount_point: source.clone(),
-            };
-
-            guest_path = source;
-            let storages = vec![ephemeral_storage];
 
             return Ok(ShareFsMountResult {
                 guest_path,
@@ -223,20 +182,243 @@ impl ShareFsMount for VirtiofsShareMount {
             }
         }
 
+        if !config.cid.is_empty() {
+            if let Some(container_dir) = Path::new(&host_dest).parent() {
+                // Remove only the empty container directory. If entries remain, leave them
+                // for their owning cleanup paths rather than deleting them recursively.
+                match fs::remove_dir(container_dir) {
+                    Err(e)
+                        if e.kind() != std::io::ErrorKind::NotFound
+                            && e.kind() != std::io::ErrorKind::DirectoryNotEmpty =>
+                    {
+                        return Err(e).context("remove the container directory");
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         Ok(())
     }
 
     async fn cleanup(&self, sid: &str) -> Result<()> {
-        // Unmount ro path
-        let host_ro_dest = get_host_ro_shared_path(sid);
-        umount_all(host_ro_dest.clone(), true).context("failed to umount ro path")?;
-        fs::remove_dir_all(host_ro_dest).context("failed to remove ro path")?;
-        // As the rootfs and volume have been umounted before calling this function, so just remove the rw dir directly
-        let host_rw_dest = get_host_rw_shared_path(sid);
-        fs::remove_dir_all(host_rw_dest).context("failed to remove rw path")?;
-        // remove the host share directory
-        let host_path = get_host_shared_path(sid);
-        fs::remove_dir_all(host_path).context("failed to remove host shared path")?;
-        Ok(())
+        cleanup_host_share_path(sid)
+    }
+}
+
+/// Unmount and remove a sandbox's host share directory. It needs only the sandbox
+/// ID, so it also serves a sandbox restored by the shim's `delete`, which has no
+/// share fs instance.
+pub(crate) fn cleanup_host_share_path(sid: &str) -> Result<()> {
+    // Cleanup can run multiple times when a previous attempt fails. Return errors
+    // so the resource manager keeps this stage pending for a later retry.
+    // Unmount ro path
+    let host_ro_dest = get_host_ro_shared_path(sid);
+    umount_all(host_ro_dest.clone(), true).context("failed to umount ro path")?;
+
+    // Recursive removal through a surviving bind mount would delete host data.
+    let host_path = get_host_shared_path(sid);
+    let mount_points =
+        get_mount_points_under(&host_path).context("failed to list shared path mounts")?;
+    if !mount_points.is_empty() {
+        warn!(
+            sl!(),
+            "unmounting leftover shared path mounts: {mount_points:?}"
+        );
+    }
+    for mount_point in &mount_points {
+        umount_all(mount_point, true)
+            .with_context(|| format!("failed to umount {}", mount_point.display()))?;
+    }
+    let mount_points =
+        get_mount_points_under(&host_path).context("failed to list shared path mounts")?;
+    if !mount_points.is_empty() {
+        return Err(anyhow!(
+            "shared path {} still has mounts: {mount_points:?}",
+            host_path.display()
+        ));
+    }
+
+    remove_dir_all_if_exists(host_ro_dest).context("failed to remove ro path")?;
+    let host_rw_dest = get_host_rw_shared_path(sid);
+    remove_dir_all_if_exists(host_rw_dest).context("failed to remove rw path")?;
+    // remove the host share directory
+    remove_dir_all_if_exists(host_path).context("failed to remove host shared path")?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ephemeral_path() {
+        assert_eq!(ephemeral_path(), DEFAULT_EPHEMERAL_PATH);
+    }
+
+    // A sandbox restored by `delete` may never have had a host share directory.
+    #[test]
+    fn test_cleanup_host_share_path_without_directory() {
+        // Use an absolute ID to isolate paths without changing the global rootless flag.
+        let temp = tempfile::tempdir().unwrap();
+        let sandbox = temp.path().join("sandbox");
+        let sid = sandbox.to_str().unwrap();
+
+        cleanup_host_share_path(sid).unwrap();
+        assert!(!get_host_shared_path(sid).exists());
+    }
+
+    // What a dead or ended shim leaves: the empty tree, nothing mounted (#5975).
+    #[test]
+    fn test_cleanup_host_share_path_removes_left_tree() {
+        // umount2(2) on a path that is not a mount point needs privilege to return EINVAL.
+        test_utils::skip_if_not_root!();
+
+        let temp = tempfile::tempdir().unwrap();
+        let sandbox = temp.path().join("sandbox");
+        let sid = sandbox.to_str().unwrap();
+        fs::create_dir_all(get_host_rw_shared_path(sid).join(PASSTHROUGH_FS_DIR)).unwrap();
+        fs::create_dir_all(get_host_ro_shared_path(sid)).unwrap();
+
+        cleanup_host_share_path(sid).unwrap();
+        assert!(!get_host_shared_path(sid).exists());
+        // Cleanup is retried by the resource manager, so a second run must succeed.
+        cleanup_host_share_path(sid).unwrap();
+    }
+
+    // Isolate mounts so a failed assertion cannot affect other tests or the host.
+    #[test]
+    #[ignore = "requires root and mount namespace capabilities"]
+    fn test_cleanup_preserves_mounted_volume_source() {
+        const CHILD: &str = "KATA_SHARED_TREE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new("unshare")
+                .args(["--mount", "--propagation", "private", "--"])
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "share_fs::virtio_fs_share_mount::tests::test_cleanup_preserves_mounted_volume_source",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .expect("start private mount namespace (requires unshare)");
+            assert!(
+                output.status.success(),
+                "isolated mount regression failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+
+        use nix::mount::{mount, umount2, MntFlags, MsFlags};
+
+        // Shared propagation reproduces volume mounts appearing in the read-only export.
+        let temp = tempfile::tempdir().unwrap();
+        mount(
+            Some("tmpfs"),
+            temp.path(),
+            Some("tmpfs"),
+            MsFlags::empty(),
+            None::<&str>,
+        )
+        .unwrap();
+        // Detach before TempDir cleanup so a failed assertion cannot remove mounted data.
+        let _unmount = scopeguard::guard(temp.path().to_path_buf(), |root| {
+            umount2(&root, MntFlags::MNT_DETACH).unwrap();
+        });
+        mount(
+            None::<&str>,
+            temp.path(),
+            None::<&str>,
+            MsFlags::MS_SHARED,
+            None::<&str>,
+        )
+        .unwrap();
+
+        let source = temp.path().join("external-source");
+        fs::create_dir(&source).unwrap();
+        mount(
+            Some("tmpfs"),
+            &source,
+            Some("tmpfs"),
+            MsFlags::empty(),
+            None::<&str>,
+        )
+        .unwrap();
+        let sentinel = source.join("sentinel");
+        fs::write(&sentinel, b"externally owned source data").unwrap();
+        let rootfs_source = temp.path().join("rootfs-source");
+        fs::create_dir(&rootfs_source).unwrap();
+        let rootfs_sentinel = rootfs_source.join("sentinel");
+        fs::write(&rootfs_sentinel, b"container rootfs data").unwrap();
+
+        // Use an absolute ID to isolate paths without changing the global rootless flag.
+        let sandbox = temp.path().join("sandbox");
+        let sid = sandbox.to_str().unwrap();
+        let rw = get_host_rw_shared_path(sid);
+        let ro = get_host_ro_shared_path(sid);
+        fs::create_dir_all(&rw).unwrap();
+        fs::create_dir_all(&ro).unwrap();
+        kata_sys_util::mount::bind_mount_unchecked(&rw, &ro, true, MsFlags::MS_SLAVE).unwrap();
+
+        let volume = do_get_host_path("volume", sid, "container", true, false);
+        let ro_volume = do_get_host_path("volume", sid, "container", true, true);
+        let rootfs = do_get_host_path("rootfs", sid, "container", false, false);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let share = VirtiofsShareMount::new(sid);
+        runtime
+            .block_on(share.share_volume(&ShareFsVolumeConfig {
+                cid: "container".into(),
+                source: source.to_str().unwrap().into(),
+                target: "volume".into(),
+                readonly: false,
+                mount_options: vec![],
+                mount: Default::default(),
+                is_rafs: false,
+            }))
+            .unwrap();
+        runtime
+            .block_on(share.share_rootfs(&ShareFsRootfsConfig {
+                cid: "container".into(),
+                source: rootfs_source.to_str().unwrap().into(),
+                target: "rootfs".into(),
+                readonly: false,
+                is_rafs: false,
+            }))
+            .unwrap();
+
+        let is_mounted = |path: &str| kata_sys_util::mount::get_linux_mount_info(path).is_ok();
+        assert!(is_mounted(&volume));
+        assert!(is_mounted(&ro_volume));
+        assert!(is_mounted(&rootfs));
+        // Leave mounts behind to reproduce unfinished container cleanup.
+        let result = runtime.block_on(share.cleanup(sid));
+        let preserved = || {
+            fs::read(&sentinel).ok().as_deref() == Some(b"externally owned source data".as_slice())
+                && fs::read(&rootfs_sentinel).ok().as_deref()
+                    == Some(b"container rootfs data".as_slice())
+        };
+        assert!(
+            preserved(),
+            "shared cleanup deleted source data: {:?}",
+            result
+        );
+        result.unwrap();
+        assert_eq!(
+            kata_sys_util::mount::get_mount_points_under(&sandbox).unwrap(),
+            Vec::<std::path::PathBuf>::new()
+        );
+        assert!(!sandbox.exists());
+        assert!(is_mounted(source.to_str().unwrap()));
+
+        runtime.block_on(share.cleanup(sid)).unwrap();
+        assert!(preserved());
+        assert!(is_mounted(source.to_str().unwrap()));
     }
 }

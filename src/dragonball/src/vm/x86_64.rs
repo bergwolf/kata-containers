@@ -6,23 +6,36 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
+use std::collections::HashMap;
 use std::convert::TryInto;
 use std::ops::Deref;
+use std::os::unix::io::AsRawFd;
 
-use dbs_address_space::AddressSpace;
-use dbs_boot::{add_e820_entry, bootparam, layout, mptable, BootParamsWrapper, InitrdConfig};
+use dbs_acpi::*;
+use dbs_address_space::{AddressSpace, AddressSpaceRegionType};
+use dbs_boot::{
+    add_e820_entry, bootparam, layout, mptable, tdshim::*, BootParamsWrapper, FirmwareType,
+    InitrdConfig,
+};
+use dbs_interrupt::IOAPIC_MAX_NR_REDIR_ENTRIES;
 use dbs_utils::epoll_manager::EpollManager;
 use dbs_utils::time::TimestampUs;
-use kvm_bindings::{kvm_irqchip, kvm_pit_config, kvm_pit_state2, KVM_PIT_SPEAKER_DUMMY};
+use kvm_bindings::{
+    kvm_enable_cap, kvm_irqchip, kvm_pit_config, kvm_pit_state2, KVM_CAP_EXIT_HYPERCALL,
+    KVM_CAP_SPLIT_IRQCHIP, KVM_PIT_SPEAKER_DUMMY,
+};
 use linux_loader::cmdline::Cmdline;
 use linux_loader::configurator::{linux::LinuxBootConfigurator, BootConfigurator, BootParams};
 use slog::info;
+use tdx::launch::MemRegion;
 use vm_memory::{Address, GuestAddress, GuestAddressSpace, GuestMemory};
 
 use crate::address_space_manager::{GuestAddressSpaceImpl, GuestMemoryImpl};
+use crate::api::v1::ConfidentialVmType;
 use crate::error::{Error, Result, StartMicroVmError};
 use crate::event_manager::EventManager;
-use crate::vm::{Vm, VmError};
+use crate::vcpu::KVM_HC_MAP_GPA_RANGE;
+use crate::vm::{VcpuManagerError, Vm, VmError};
 
 /// Configures the system and should be called once per vm before starting vcpu
 /// threads.
@@ -48,6 +61,7 @@ fn configure_system<M: GuestMemory>(
     initrd: &Option<InitrdConfig>,
     boot_cpus: u8,
     max_cpus: u8,
+    pci_legacy_irqs: Option<&HashMap<u8, u8>>,
 ) -> super::Result<()> {
     const KERNEL_BOOT_FLAG_MAGIC: u16 = 0xaa55;
     const KERNEL_HDR_MAGIC: u32 = 0x5372_6448;
@@ -59,7 +73,8 @@ fn configure_system<M: GuestMemory>(
     let himem_start = GuestAddress(layout::HIMEM_START);
 
     // Note that this puts the mptable at the last 1k of Linux's 640k base RAM
-    mptable::setup_mptable(guest_mem, boot_cpus, max_cpus).map_err(Error::MpTableSetup)?;
+    mptable::setup_mptable(guest_mem, boot_cpus, max_cpus, pci_legacy_irqs)
+        .map_err(Error::MpTableSetup)?;
 
     let mut params: BootParamsWrapper = BootParamsWrapper(bootparam::boot_params::default());
 
@@ -168,6 +183,32 @@ impl Vm {
         vm_as: GuestAddressSpaceImpl,
         request_ts: TimestampUs,
     ) -> std::result::Result<(), StartMicroVmError> {
+        self.init_microvm_with_boot_mode(epoll_mgr, vm_as, request_ts, false)
+    }
+
+    /// Initialize a microVM that will resume from a snapshot.
+    ///
+    /// Unlike a cold boot, a snapshot restore does not need to load the guest
+    /// kernel or construct its initial boot register state: guest memory and
+    /// every vCPU register are replaced by the saved state before the vCPUs
+    /// start. Avoiding that throwaway work keeps the restore path focused on
+    /// rebuilding host-side devices and applying the snapshot.
+    pub fn init_microvm_from_snapshot(
+        &mut self,
+        epoll_mgr: EpollManager,
+        vm_as: GuestAddressSpaceImpl,
+        request_ts: TimestampUs,
+    ) -> std::result::Result<(), StartMicroVmError> {
+        self.init_microvm_with_boot_mode(epoll_mgr, vm_as, request_ts, true)
+    }
+
+    fn init_microvm_with_boot_mode(
+        &mut self,
+        epoll_mgr: EpollManager,
+        vm_as: GuestAddressSpaceImpl,
+        request_ts: TimestampUs,
+        restore_from_snapshot: bool,
+    ) -> std::result::Result<(), StartMicroVmError> {
         info!(self.logger, "VM: start initializing microvm ...");
 
         self.init_tss()?;
@@ -175,7 +216,11 @@ impl Vm {
         // while on aarch64 we need to do it the other way around.
         self.setup_interrupt_controller()?;
         self.create_pit()?;
-        self.init_devices(epoll_mgr)?;
+        if restore_from_snapshot {
+            self.init_devices_from_snapshot(epoll_mgr)?;
+        } else {
+            self.init_devices(epoll_mgr)?;
+        }
 
         let reset_event_fd = self.device_manager.get_reset_eventfd().unwrap();
         self.vcpu_manager()
@@ -188,7 +233,64 @@ impl Vm {
             info!(self.logger, "VM: enable CPU disable_idle_exits capability");
         }
 
+        // On a standard cold start, vCPU creation is deferred to
+        // `create_boot_vcpus()` until after the kernel has been loaded.
+        if restore_from_snapshot {
+            let boot_vcpu_count = self.vm_config.vcpu_count;
+            self.vcpu_manager()
+                .map_err(StartMicroVmError::Vcpu)?
+                .create_vcpus(boot_vcpu_count, Some(request_ts), None, None)
+                .map_err(StartMicroVmError::Vcpu)?;
+
+            return Ok(());
+        }
+
         let vm_memory = vm_as.memory();
+
+        if self.firmware_type == Some(FirmwareType::Tdshim) {
+            let tdshim_file = self
+                .kernel_config
+                .as_mut()
+                .ok_or(StartMicroVmError::MissingKernelConfig)?
+                .firmware_file_mut()
+                .ok_or(StartMicroVmError::MissingFirmwareFile)?;
+            let sections =
+                parse_tdvf_sections(tdshim_file).map_err(StartMicroVmError::TdvfError)?;
+            let address_space = self
+                .vm_address_space()
+                .cloned()
+                .ok_or(StartMicroVmError::GuestMemoryNotInitialized)?;
+            let mut hob_address = 0;
+            let acpi_tables: Vec<sdt::Sdt> = vec![
+                create_madt_table(self.vm_config.max_vcpu_count, self.vm_config.vcpu_count),
+                create_fadt_table(),
+                create_dsdt_table(),
+            ];
+
+            self.load_kernel_with_tdshim(
+                &sections,
+                vm_memory.deref(),
+                address_space,
+                &mut hob_address,
+                &acpi_tables,
+            )?;
+
+            let boot_vcpu_count = self.vm_config.vcpu_count;
+            self.vcpu_manager()
+                .map_err(StartMicroVmError::Vcpu)?
+                .create_vcpus(boot_vcpu_count, Some(request_ts), None, self.firmware_type)
+                .map_err(StartMicroVmError::Vcpu)?;
+
+            if self.confidential_vm_type() == Some(ConfidentialVmType::TDX) {
+                self.enable_hc_map_gpa_range()?;
+                self.tdx_init_vcpus(hob_address)?;
+                self.tdx_init_mem_region(vm_memory.deref(), &sections)?;
+                self.tdx_finalize()?;
+            }
+
+            return Ok(());
+        }
+
         let kernel_loader_result = self.load_kernel(vm_memory.deref())?;
         self.vcpu_manager()
             .map_err(StartMicroVmError::Vcpu)?
@@ -209,6 +311,15 @@ impl Vm {
         cmdline: &Cmdline,
         initrd: Option<InitrdConfig>,
     ) -> std::result::Result<(), StartMicroVmError> {
+        // tdshim uses ACPI instead of mptable, and kernel boot parameters
+        // (including e820) would be prepared by firmware
+        if self.firmware_type == Some(FirmwareType::Tdshim) {
+            if initrd.is_some() {
+                return Err(StartMicroVmError::InitrdNotSupported);
+            }
+            return Ok(());
+        }
+
         let cmdline_addr = GuestAddress(dbs_boot::layout::CMDLINE_START);
         linux_loader::loader::load_cmdline(vm_memory, cmdline_addr, cmdline)
             .map_err(StartMicroVmError::LoadCommandline)?;
@@ -219,6 +330,24 @@ impl Vm {
             .as_bytes_with_nul()
             .len();
 
+        #[cfg(feature = "host-device")]
+        {
+            // Don't expect poisoned lock here.
+            let vfio_manager = self.device_manager.vfio_manager.lock().unwrap();
+            configure_system(
+                vm_memory,
+                self.address_space.address_space(),
+                cmdline_addr,
+                cmdline_size,
+                &initrd,
+                self.vm_config.vcpu_count,
+                self.vm_config.max_vcpu_count,
+                vfio_manager.get_pci_legacy_irqs(),
+            )
+            .map_err(StartMicroVmError::ConfigureSystem)
+        }
+
+        #[cfg(not(feature = "host-device"))]
         configure_system(
             vm_memory,
             self.address_space.address_space(),
@@ -227,6 +356,7 @@ impl Vm {
             &initrd,
             self.vm_config.vcpu_count,
             self.vm_config.max_vcpu_count,
+            None,
         )
         .map_err(StartMicroVmError::ConfigureSystem)
     }
@@ -242,13 +372,32 @@ impl Vm {
     pub(crate) fn setup_interrupt_controller(
         &mut self,
     ) -> std::result::Result<(), StartMicroVmError> {
-        self.vm_fd
-            .create_irq_chip()
-            .map_err(|e| StartMicroVmError::ConfigureVm(VmError::VmSetup(e)))
+        // In cases of split irqchip, we do not need to invoke KVM ioctl to create an
+        // in-kernel irqchip. We only need to enable the capability of split irqchip,
+        // and manage the interrupts in userspace.
+        if self.split_irqchip() {
+            let mut enable_split_irqchip = kvm_enable_cap {
+                cap: KVM_CAP_SPLIT_IRQCHIP,
+                ..Default::default()
+            };
+            enable_split_irqchip.args[0] = IOAPIC_MAX_NR_REDIR_ENTRIES as u64;
+            self.vm_fd()
+                .enable_cap(&enable_split_irqchip)
+                .map_err(StartMicroVmError::EnableSplitIrqchip)
+        } else {
+            self.vm_fd
+                .create_irq_chip()
+                .map_err(|e| StartMicroVmError::ConfigureVm(VmError::VmSetup(e)))
+        }
     }
 
     /// Creates an in-kernel device model for the PIT.
     pub(crate) fn create_pit(&self) -> std::result::Result<(), StartMicroVmError> {
+        // In-kernel PIT is not allowed for split irqchip
+        if self.split_irqchip() {
+            return Ok(());
+        }
+
         info!(self.logger, "VM: create pit");
         // We need to enable the emulation of a dummy speaker port stub so that writing to port 0x61
         // (i.e. KVM_SPEAKER_BASE_ADDRESS) does not trigger an exit to user space.
@@ -277,6 +426,225 @@ impl Vm {
             .map_err(|_| StartMicroVmError::RegisterEvent)?;
         self.reset_eventfd = Some(reset_evt);
 
+        Ok(())
+    }
+
+    pub(crate) fn split_irqchip(&self) -> bool {
+        self.shared_info.read().unwrap().split_irqchip()
+    }
+
+    pub(crate) fn kvm_mem_attr_private(&self) -> bool {
+        self.confidential_vm_type() == Some(ConfidentialVmType::TDX)
+    }
+
+    fn load_kernel_with_tdshim(
+        &mut self,
+        sections: &Vec<TdvfSection>,
+        vm_memory: &GuestMemoryImpl,
+        address_space: AddressSpace,
+        hob_address: &mut u64,
+        acpi_tables: &Vec<sdt::Sdt>,
+    ) -> std::result::Result<(), StartMicroVmError> {
+        let mut required_sections = vec!["Bfv", "TdHob", "PayloadParam"];
+
+        for section in sections {
+            match section.r#type {
+                TdvfSectionType::Bfv => {
+                    let tdshim_file = self
+                        .kernel_config
+                        .as_mut()
+                        .ok_or(StartMicroVmError::MissingKernelConfig)?
+                        .firmware_file_mut()
+                        .ok_or(StartMicroVmError::MissingFirmwareFile)?;
+                    load_tdvf_section(tdshim_file, section, vm_memory)
+                        .map_err(StartMicroVmError::TdvfError)?;
+                    required_sections.retain(|s| *s != "Bfv");
+                }
+                TdvfSectionType::Cfv => {
+                    let tdshim_file = self
+                        .kernel_config
+                        .as_mut()
+                        .ok_or(StartMicroVmError::MissingKernelConfig)?
+                        .firmware_file_mut()
+                        .ok_or(StartMicroVmError::MissingFirmwareFile)?;
+                    load_tdvf_section(tdshim_file, section, vm_memory)
+                        .map_err(StartMicroVmError::TdvfError)?;
+                }
+                TdvfSectionType::TdHob => {
+                    *hob_address = section.address;
+                    required_sections.retain(|s| *s != "TdHob");
+                }
+                TdvfSectionType::PayloadParam => {
+                    let cmdline = self
+                        .kernel_config
+                        .as_mut()
+                        .ok_or(StartMicroVmError::MissingKernelConfig)?
+                        .kernel_cmdline();
+                    linux_loader::loader::load_cmdline(
+                        vm_memory,
+                        GuestAddress(section.address),
+                        cmdline,
+                    )
+                    .map_err(StartMicroVmError::LoadCommandline)?;
+                    required_sections.retain(|s| *s != "PayloadParam");
+                }
+                _ => {}
+            }
+        }
+
+        if !required_sections.is_empty() {
+            return Err(StartMicroVmError::MissingTdshimSection(
+                required_sections[0],
+            ));
+        }
+
+        let kernel_loader_result = self.load_kernel(vm_memory)?;
+        let payload_info = PayloadInfo::new(
+            PayloadImageType::RawVmLinux,
+            kernel_loader_result.kernel_load.0,
+        );
+
+        self.write_tdshim_hob_list(
+            *hob_address,
+            vm_memory,
+            address_space,
+            payload_info,
+            acpi_tables,
+        )?;
+
+        Ok(())
+    }
+
+    fn write_tdshim_hob_list(
+        &self,
+        hob_address: u64,
+        vm_memory: &GuestMemoryImpl,
+        address_space: AddressSpace,
+        payload_info: PayloadInfo,
+        acpi_tables: &Vec<sdt::Sdt>,
+    ) -> std::result::Result<(), StartMicroVmError> {
+        let mut hob = TdHob::start(hob_address);
+
+        let mut regions = Vec::new();
+        address_space
+            .walk_regions(|region| {
+                match region.region_type() {
+                    AddressSpaceRegionType::DefaultMemory => {
+                        regions.push((region.start_addr().0, region.len(), true));
+                    }
+                    AddressSpaceRegionType::FirmwareMemory => {
+                        regions.push((region.start_addr().0, region.len(), false));
+                    }
+                    _ => {}
+                }
+                Ok(())
+            })
+            .unwrap();
+
+        for (start, size, is_ram) in regions {
+            hob.add_memory_resource(vm_memory, start, size, is_ram)
+                .map_err(StartMicroVmError::TdvfError)?;
+        }
+
+        hob.add_mmio_resource(
+            vm_memory,
+            layout::MMIO_LOW_START,
+            layout::BIOS_MEM_START - layout::MMIO_LOW_START,
+        )
+        .map_err(StartMicroVmError::TdvfError)?;
+
+        hob.add_payload(vm_memory, payload_info)
+            .map_err(StartMicroVmError::TdvfError)?;
+
+        for sdt in acpi_tables {
+            hob.add_acpi_table(vm_memory, sdt.as_slice())
+                .map_err(StartMicroVmError::TdvfError)?;
+        }
+
+        hob.finish(vm_memory)
+            .map_err(StartMicroVmError::TdvfError)?;
+
+        Ok(())
+    }
+
+    pub(super) fn enable_hc_map_gpa_range(&mut self) -> std::result::Result<(), StartMicroVmError> {
+        let mut enable_hc_map_gpa_range = kvm_enable_cap {
+            cap: KVM_CAP_EXIT_HYPERCALL,
+            ..Default::default()
+        };
+        enable_hc_map_gpa_range.args[0] = 1 << KVM_HC_MAP_GPA_RANGE;
+        self.vm_fd()
+            .enable_cap(&enable_hc_map_gpa_range)
+            .map_err(StartMicroVmError::EnableHcMapGpaRange)
+    }
+
+    pub(super) fn tdx_init_vm(&mut self) -> std::result::Result<(), StartMicroVmError> {
+        let supported_cpuid = self
+            .kvm
+            .supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
+            .map_err(VcpuManagerError::Kvm)
+            .map_err(StartMicroVmError::Vcpu)?;
+
+        self.tdx_launcher
+            .as_mut()
+            .unwrap()
+            .init_vm(self.tdx_capabilities.as_ref().unwrap(), supported_cpuid)
+            .map_err(StartMicroVmError::TdxError)?;
+
+        Ok(())
+    }
+
+    pub(super) fn tdx_init_vcpus(
+        &mut self,
+        hob_address: u64,
+    ) -> std::result::Result<(), StartMicroVmError> {
+        let mut vcpu_fds = Vec::new();
+        self.vcpu_manager()
+            .map_err(StartMicroVmError::Vcpu)?
+            .vcpus()
+            .iter()
+            .for_each(|vcpu| {
+                vcpu_fds.push(vcpu.vcpu_fd().as_raw_fd());
+            });
+
+        let launcher = self.tdx_launcher.as_mut().unwrap();
+        vcpu_fds.iter().for_each(|fd| launcher.add_vcpu_fd(*fd));
+        launcher
+            .init_vcpus(hob_address)
+            .map_err(StartMicroVmError::TdxError)?;
+
+        Ok(())
+    }
+
+    pub(super) fn tdx_init_mem_region(
+        &mut self,
+        vm_memory: &GuestMemoryImpl,
+        sections: &Vec<TdvfSection>,
+    ) -> std::result::Result<(), StartMicroVmError> {
+        let launcher = self.tdx_launcher.as_mut().unwrap();
+        for section in sections {
+            let host_address = vm_memory
+                .get_host_address(GuestAddress(section.address))
+                .map_err(StartMicroVmError::GuestMemoryError)?;
+            let region = MemRegion::new(
+                section.address,
+                section.size / dbs_boot::PAGE_SIZE as u64,
+                section.attributes,
+                host_address as u64,
+            );
+            launcher
+                .init_mem_region(region)
+                .map_err(StartMicroVmError::TdxError)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn tdx_finalize(&mut self) -> std::result::Result<(), StartMicroVmError> {
+        self.tdx_launcher
+            .as_mut()
+            .unwrap()
+            .finalize()
+            .map_err(StartMicroVmError::TdxError)?;
         Ok(())
     }
 }

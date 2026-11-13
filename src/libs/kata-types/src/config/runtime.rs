@@ -9,13 +9,26 @@ use std::path::Path;
 use super::default;
 use crate::config::{ConfigOps, TomlConfig};
 use crate::mount::split_bind_mounts;
-use crate::{eother, validate_path};
+use crate::validate_path;
+
+#[path = "shared_mount.rs"]
+pub mod shared_mount;
+pub use shared_mount::SharedMount;
 
 /// Type of runtime VirtContainer.
 pub const RUNTIME_NAME_VIRTCONTAINER: &str = "virt_container";
 
+/// EmptyDir mode: share the emptyDir folder with the guest using shared-fs.
+pub const EMPTYDIR_MODE_SHARED_FS: &str = "shared-fs";
+
+/// EmptyDir mode: plug a block device to be encrypted in the guest.
+pub const EMPTYDIR_MODE_BLOCK_ENCRYPTED: &str = "block-encrypted";
+
+/// EmptyDir mode: plug a block device to be mounted directly in the guest.
+pub const EMPTYDIR_MODE_BLOCK_PLAIN: &str = "block-plain";
+
 /// Kata runtime configuration information.
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Runtime {
     /// Runtime name: Plan to support virt-container, linux-container, wasm-container
     #[serde(default)]
@@ -33,6 +46,17 @@ pub struct Runtime {
     #[serde(default, rename = "enable_debug")]
     pub debug: bool,
 
+    /// The log level will be applied to runtime.
+    /// Possible values are:
+    /// - trace
+    /// - debug
+    /// - info
+    /// - warn
+    /// - error
+    /// - critical
+    #[serde(default = "default_runtime_log_level")]
+    pub log_level: String,
+
     /// Enabled experimental feature list, format: ["a", "b"].
     ///
     /// Experimental features are features not stable enough for production, they may break
@@ -44,6 +68,8 @@ pub struct Runtime {
     ///
     /// Options:
     /// - macvtap: used when the Container network interface can be bridged using macvtap.
+    /// - l3forwarding: for Istio Ambient-style service mesh integration with node proxies.
+    ///   Experimental, IPv4 only.
     /// - none: used when customize network. Only creates a tap device. No veth pair.
     /// - tcfilter: uses tc filter rules to redirect traffic from the network interface provided
     ///   by plugin to a tap interface connected to the VM.
@@ -55,8 +81,7 @@ pub struct Runtime {
     /// This option may have some potential impacts to your host. It should only be used when you
     /// know what you're doing.
     ///
-    /// `disable_new_netns` conflicts with `internetworking_model=tcfilter` and
-    /// `internetworking_model=macvtap`. It works only with `internetworking_model=none`.
+    /// `disable_new_netns` only works with `internetworking_model=none`.
     /// The tap device will be in the host network namespace and can connect to a bridge (like OVS)
     /// directly.
     ///
@@ -85,6 +110,15 @@ pub struct Runtime {
     #[serde(default)]
     pub sandbox_cgroup_only: bool,
 
+    /// If enabled, each vCPU thread will be pinned to a fixed host CPU.
+    ///
+    /// Pinning is only applied when the number of vCPU threads equals
+    /// the number of CPUs in the sandbox's cpuset. When the counts
+    /// diverge (e.g. after hotplug or container removal), pinning is
+    /// reset so all vCPU threads float across the full cpuset.
+    #[serde(default)]
+    pub enable_vcpus_pinning: bool,
+
     /// If enabled, the runtime will create opentracing.io traces and spans.
     /// See https://www.jaegertracing.io/docs/getting-started.
     #[serde(default)]
@@ -112,6 +146,16 @@ pub struct Runtime {
     /// applied by the kata agent. If set to true, seccomp is not applied within the guest.
     #[serde(default)]
     pub disable_guest_seccomp: bool,
+
+    /// Specifies how Kubernetes emptyDir volumes are handled.
+    ///
+    /// Options:
+    /// - shared-fs (default): shares the emptyDir folder with the guest using the method
+    ///   given by the shared_fs setting.
+    /// - block-encrypted: plugs a block device to be encrypted in the guest via CDH/LUKS2.
+    /// - block-plain: plugs a block device to be mounted directly in the guest.
+    #[serde(default)]
+    pub emptydir_mode: String,
 
     /// Determines how VFIO devices should be be presented to the container.
     ///
@@ -148,6 +192,42 @@ pub struct Runtime {
     /// to the hypervisor.
     #[serde(default)]
     pub dan_conf: String,
+
+    /// shared_mount declarations
+    #[serde(default)]
+    pub shared_mounts: Vec<SharedMount>,
+
+    /// If enabled, the runtime will attempt to use fd passthrough feature for process io.
+    #[serde(default)]
+    pub use_passfd_io: bool,
+
+    /// If fd passthrough io is enabled, the runtime will attempt to use the specified port instead of the default port.
+    #[serde(default = "default_passfd_listener_port")]
+    pub passfd_listener_port: u32,
+
+    /// pod_resource_api_sock specifies the unix socket for the Kubelet's
+    /// PodResource API endpoint. If empty, kubernetes based cold plug
+    /// will not be attempted. In order for this feature to work, the
+    /// KubeletPodResourcesGet featureGate must be enabled in Kubelet,
+    /// if using Kubelet older than 1.34.
+
+    /// The pod resource API's socket is relative to the Kubelet's root-dir,
+    /// which is defined by the cluster admin, and its location is:
+    /// ${KubeletRootDir}/pod-resources/kubelet.sock
+
+    /// cold_plug_vfio (see hypervisor config) acts as a feature gate:
+    ///      cold_plug_vfio = "no-port" (default) => no cold plug
+    ///      cold_plug_vfio != "no-port" AND pod_resource_api_sock = "" => need
+    ///              explicit CDI annotation for cold plug (applies mainly
+    ///              to non-k8s cases)
+    ///      cold_plug_vfio != "no-port" AND pod_resource_api_sock != "" => kubelet
+    ///              based cold plug.
+    #[serde(default)]
+    pub pod_resource_api_sock: String,
+}
+
+fn default_passfd_listener_port() -> u32 {
+    default::DEFAULT_PASSFD_LISTENER_PORT
 }
 
 impl ConfigOps for Runtime {
@@ -156,12 +236,19 @@ impl ConfigOps for Runtime {
         if conf.runtime.internetworking_model.is_empty() {
             conf.runtime.internetworking_model = default::DEFAULT_INTERNETWORKING_MODEL.to_owned();
         }
+        if conf.runtime.emptydir_mode.is_empty() {
+            conf.runtime.emptydir_mode = EMPTYDIR_MODE_SHARED_FS.to_owned();
+        }
 
         for bind in conf.runtime.sandbox_bind_mounts.iter_mut() {
             // Split the bind mount, canonicalize the path and then append rw mode to it.
             let (real_path, mode) = split_bind_mounts(bind);
             match Path::new(real_path).canonicalize() {
-                Err(e) => return Err(eother!("sandbox bind mount `{}` is invalid: {}", bind, e)),
+                Err(e) => {
+                    return Err(std::io::Error::other(format!(
+                        "sandbox bind mount `{bind}` is invalid: {e}",
+                    )))
+                }
                 Ok(path) => {
                     *bind = format!("{}{}", path.display(), mode);
                 }
@@ -179,19 +266,32 @@ impl ConfigOps for Runtime {
             && net_model != "macvtap"
             && net_model != "none"
             && net_model != "tcfilter"
+            && net_model != "l3forwarding"
         {
-            return Err(eother!(
-                "Invalid internetworking_model `{}` in configuration file",
-                net_model
-            ));
+            return Err(std::io::Error::other(format!(
+                "Invalid internetworking_model `{net_model}` in configuration file",
+            )));
         }
 
         let vfio_mode = &conf.runtime.vfio_mode;
         if !vfio_mode.is_empty() && vfio_mode != "vfio" && vfio_mode != "guest-kernel" {
-            return Err(eother!(
-                "Invalid vfio_mode `{}` in configuration file",
-                vfio_mode
-            ));
+            return Err(std::io::Error::other(format!(
+                "Invalid vfio_mode `{vfio_mode}` in configuration file",
+            )));
+        }
+
+        let emptydir_mode = &conf.runtime.emptydir_mode;
+        if emptydir_mode != EMPTYDIR_MODE_SHARED_FS
+            && emptydir_mode != EMPTYDIR_MODE_BLOCK_ENCRYPTED
+            && emptydir_mode != EMPTYDIR_MODE_BLOCK_PLAIN
+        {
+            return Err(std::io::Error::other(format!(
+                "Invalid emptydir_mode `{emptydir_mode}` in configuration file",
+            )));
+        }
+
+        for shared_mount in &conf.runtime.shared_mounts {
+            shared_mount.validate()?;
         }
 
         for bind in conf.runtime.sandbox_bind_mounts.iter() {
@@ -214,12 +314,16 @@ impl Runtime {
     }
 }
 
+fn default_runtime_log_level() -> String {
+    String::from("info")
+}
+
 #[cfg(not(feature = "enable-vendor"))]
 mod vendor {
     use super::*;
 
     /// Vendor customization runtime configuration.
-    #[derive(Debug, Default, Deserialize, Serialize)]
+    #[derive(Clone, Debug, Default, Deserialize, Serialize)]
     pub struct RuntimeVendor {}
 
     impl ConfigOps for RuntimeVendor {}
@@ -285,6 +389,53 @@ vfio_mode = "guest_kernel"
     }
 
     #[test]
+    fn test_invalid_emptydir_mode() {
+        let content = r#"
+[runtime]
+emptydir_mode = "invalid-value"
+"#;
+        let config: TomlConfig = TomlConfig::load(content).unwrap();
+        config.validate().unwrap_err();
+    }
+
+    #[test]
+    fn test_valid_emptydir_mode() {
+        let content = r#"
+[runtime]
+emptydir_mode = "shared-fs"
+"#;
+        let config: TomlConfig = TomlConfig::load(content).unwrap();
+        config.validate().unwrap();
+        assert_eq!(&config.runtime.emptydir_mode, "shared-fs");
+
+        let content = r#"
+[runtime]
+emptydir_mode = "block-encrypted"
+"#;
+        let config: TomlConfig = TomlConfig::load(content).unwrap();
+        config.validate().unwrap();
+        assert_eq!(&config.runtime.emptydir_mode, "block-encrypted");
+
+        let content = r#"
+[runtime]
+emptydir_mode = "block-plain"
+"#;
+        let config: TomlConfig = TomlConfig::load(content).unwrap();
+        config.validate().unwrap();
+        assert_eq!(&config.runtime.emptydir_mode, "block-plain");
+    }
+
+    #[test]
+    fn test_default_emptydir_mode() {
+        let content = r#"
+[runtime]
+"#;
+        let config: TomlConfig = TomlConfig::load(content).unwrap();
+        config.validate().unwrap();
+        assert_eq!(&config.runtime.emptydir_mode, "shared-fs");
+    }
+
+    #[test]
     fn test_config() {
         let content = r#"
 [runtime]
@@ -295,6 +446,7 @@ internetworking_model = "macvtap"
 disable_new_netns = true
 sandbox_bind_mounts = []
 sandbox_cgroup_only = true
+enable_vcpus_pinning = true
 enable_tracing = true
 jaeger_endpoint = "localhost:1234"
 jaeger_user = "user"
@@ -315,6 +467,7 @@ field_should_be_ignored = true
         assert!(config.runtime.disable_new_netns);
         assert_eq!(config.runtime.sandbox_bind_mounts.len(), 0);
         assert!(config.runtime.sandbox_cgroup_only);
+        assert!(config.runtime.enable_vcpus_pinning);
         assert!(config.runtime.enable_tracing);
         assert!(config.runtime.is_experiment_enabled("a"));
         assert!(config.runtime.is_experiment_enabled("b"));

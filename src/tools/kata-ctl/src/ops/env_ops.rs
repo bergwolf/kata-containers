@@ -13,7 +13,6 @@ use kata_sys_util::protection;
 use kata_types::config::TomlConfig;
 
 use anyhow::{anyhow, Context, Result};
-use nix::unistd::Uid;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{self, Write};
@@ -150,6 +149,21 @@ pub struct ImageInfo {
     path: String,
 }
 
+// SecurityInfo stores the hypervisor security details
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub struct SecurityInfo {
+    #[serde(default)]
+    rootless: bool,
+    #[serde(default)]
+    disable_seccomp: bool,
+    #[serde(default)]
+    guest_hook_path: String,
+    #[serde(default)]
+    enable_annotations: Vec<String>,
+    #[serde(default)]
+    confidential_guest: bool,
+}
+
 // HypervisorInfo stores hypervisor details
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct HypervisorInfo {
@@ -170,13 +184,9 @@ pub struct HypervisorInfo {
     #[serde(default)]
     virtio_fs_daemon: String,
     #[serde(default)]
-    msize_9p: u32,
-    #[serde(default)]
     memory_slots: u32,
     #[serde(default)]
     pcie_root_port: u32,
-    #[serde(default)]
-    hotplug_vfio_on_rootbus: bool,
     #[serde(default)]
     debug: bool,
     #[serde(default)]
@@ -184,9 +194,11 @@ pub struct HypervisorInfo {
     #[serde(default)]
     enable_iommu_platform: bool,
     #[serde(default)]
-    default_vcpus: i32,
+    default_vcpus: f32,
     #[serde(default)]
     cpu_features: String,
+    #[serde(default)]
+    security_info: SecurityInfo,
 }
 
 // EnvInfo collects all information that will be displayed by the
@@ -374,6 +386,14 @@ pub fn get_hypervisor_info(
     let version =
         get_command_version(&hypervisor_config.path).context("error getting hypervisor version")?;
 
+    let security_info = SecurityInfo {
+        rootless: hypervisor_config.security_info.rootless,
+        disable_seccomp: hypervisor_config.security_info.disable_seccomp,
+        guest_hook_path: hypervisor_config.security_info.guest_hook_path.clone(),
+        enable_annotations: hypervisor_config.security_info.enable_annotations.clone(),
+        confidential_guest: hypervisor_config.security_info.confidential_guest,
+    };
+
     let hypervisor_info = HypervisorInfo {
         machine_type: hypervisor_config.machine_info.machine_type.to_string(),
         machine_accelerators: hypervisor_config
@@ -393,15 +413,14 @@ pub fn get_hypervisor_info(
             .clone()
             .unwrap_or_else(|| String::from("none")),
         virtio_fs_daemon: hypervisor_config.shared_fs.virtio_fs_daemon.to_string(),
-        msize_9p: hypervisor_config.shared_fs.msize_9p,
         memory_slots: hypervisor_config.memory_info.memory_slots,
         pcie_root_port: hypervisor_config.device_info.pcie_root_port,
-        hotplug_vfio_on_rootbus: hypervisor_config.device_info.hotplug_vfio_on_root_bus,
         debug: hypervisor_config.debug_info.enable_debug,
         enable_iommu: hypervisor_config.device_info.enable_iommu,
         enable_iommu_platform: hypervisor_config.device_info.enable_iommu_platform,
         default_vcpus: hypervisor_config.cpu_info.default_vcpus,
         cpu_features: hypervisor_config.cpu_info.cpu_features.to_string(),
+        security_info,
     };
 
     let image_info = ImageInfo {
@@ -447,13 +466,9 @@ pub fn get_env_info(toml_config: &TomlConfig) -> Result<EnvInfo> {
 }
 
 pub fn handle_env(env_args: EnvArgument) -> Result<()> {
-    if !Uid::effective().is_root() {
-        return Err(anyhow!("kata-ctl env command requires root privileges to get host information. Please run as root or use sudo"));
-    }
-
     let mut file: Box<dyn Write> = if let Some(path) = env_args.file {
         Box::new(
-            File::create(path.as_str()).with_context(|| format!("Error creating file {}", path))?,
+            File::create(path.as_str()).with_context(|| format!("Error creating file {path}"))?,
         )
     } else {
         Box::new(io::stdout())
@@ -465,10 +480,10 @@ pub fn handle_env(env_args: EnvArgument) -> Result<()> {
 
     if env_args.json {
         let serialized_json = serde_json::to_string_pretty(&env_info)?;
-        write!(file, "{}", serialized_json)?;
+        write!(file, "{serialized_json}")?;
     } else {
         let toml = toml::to_string(&env_info)?;
-        write!(file, "{}", toml)?;
+        write!(file, "{toml}")?;
     }
 
     Ok(())

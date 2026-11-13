@@ -22,6 +22,7 @@ var ipvlanTrace = getNetworkTrace(IPVlanEndpointType)
 type IPVlanEndpoint struct {
 	EndpointType       EndpointType
 	PCIPath            vcTypes.PciPath
+	CCWDevice          *vcTypes.CcwDevice
 	EndpointProperties NetworkInfo
 	NetPair            NetworkInterfacePair
 	RxRateLimiter      bool
@@ -88,6 +89,16 @@ func (endpoint *IPVlanEndpoint) SetPciPath(pciPath vcTypes.PciPath) {
 	endpoint.PCIPath = pciPath
 }
 
+// CcwDevice returns the CCW device of the endpoint.
+func (endpoint *IPVlanEndpoint) CcwDevice() *vcTypes.CcwDevice {
+	return endpoint.CCWDevice
+}
+
+// SetCcwDevice sets the CCW device of the endpoint.
+func (endpoint *IPVlanEndpoint) SetCcwDevice(ccwDev vcTypes.CcwDevice) {
+	endpoint.CCWDevice = &ccwDev
+}
+
 // NetworkPair returns the network pair of the endpoint.
 func (endpoint *IPVlanEndpoint) NetworkPair() *NetworkInterfacePair {
 	return &endpoint.NetPair
@@ -125,14 +136,44 @@ func (endpoint *IPVlanEndpoint) Detach(ctx context.Context, netNsCreated bool, n
 	})
 }
 
-// HotAttach for ipvlan endpoint not supported yet
-func (endpoint *IPVlanEndpoint) HotAttach(ctx context.Context, h Hypervisor) error {
-	return fmt.Errorf("IPVlanEndpoint does not support Hot attach")
+func (endpoint *IPVlanEndpoint) HotAttach(ctx context.Context, s *Sandbox) error {
+	span, ctx := ipvlanTrace(ctx, "HotAttach", endpoint)
+	defer span.End()
+
+	h := s.hypervisor
+	if err := xConnectVMNetwork(ctx, endpoint, h); err != nil {
+		networkLogger().WithError(err).Error("Error bridging ipvlan ep")
+		return err
+	}
+
+	if _, err := h.HotplugAddDevice(ctx, endpoint, NetDev); err != nil {
+		networkLogger().WithError(err).Error("Error hotplugging ipvlan ep")
+		return err
+	}
+
+	return nil
 }
 
-// HotDetach for ipvlan endpoint not supported yet
-func (endpoint *IPVlanEndpoint) HotDetach(ctx context.Context, h Hypervisor, netNsCreated bool, netNsPath string) error {
-	return fmt.Errorf("IPVlanEndpoint does not support Hot detach")
+func (endpoint *IPVlanEndpoint) HotDetach(ctx context.Context, s *Sandbox, netNsCreated bool, netNsPath string) error {
+	if !netNsCreated {
+		return nil
+	}
+
+	span, ctx := ipvlanTrace(ctx, "HotDetach", endpoint)
+	defer span.End()
+
+	if err := doNetNS(netNsPath, func(_ ns.NetNS) error {
+		return xDisconnectVMNetwork(ctx, endpoint)
+	}); err != nil {
+		networkLogger().WithError(err).Warn("Error un-bridging ipvlan ep")
+	}
+
+	h := s.hypervisor
+	if _, err := h.HotplugRemoveDevice(ctx, endpoint, NetDev); err != nil {
+		networkLogger().WithError(err).Error("Error detach ipvlan ep")
+		return err
+	}
+	return nil
 }
 
 func (endpoint *IPVlanEndpoint) save() persistapi.NetworkEndpoint {

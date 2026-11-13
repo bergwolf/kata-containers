@@ -1,0 +1,256 @@
+#!/usr/bin/env bash
+#
+# Copyright (c) 2024 NVIDIA Corporation
+#
+# SPDX-License-Identifier: Apache-2.0
+
+set -euo pipefail
+[[ -n "${DEBUG:-}" ]] && set -x
+
+shopt -s nullglob
+shopt -s extglob
+
+# Error helpers
+trap 'echo "chroot: ERROR at line ${LINENO}: ${BASH_COMMAND}" >&2' ERR
+die() {
+  local msg="${*:-fatal error}"
+  echo "chroot: ${msg}" >&2
+  exit 1
+}
+arch_target="${1:?arch_target not specified}"
+nvidia_gpu_stack="${2:?nvidia_gpu_stack not specified}"
+cuda_repo_osv="${3:?cuda_repo_osv not specified}"
+cuda_repo_url="${4:?cuda_repo_url not specified}"
+cuda_repo_pkg="${5:?cuda_repo_pkg not specified}"
+tools_repo_url="${6:?tools_repo_url not specified}"
+tools_repo_pkg="${7:?tools_repo_pkg not specified}"
+ctk_version="${8:?ctk_version not specified}"
+dcgm_version="${9:?dcgm_version not specified}"
+dcgm_exporter_version="${10:?dcgm_exporter_version not specified}"
+# Optional: for drivers whose userspace packages require a dedicated
+# repository (not yet published on the repositories configured below).
+# If configured, url and package must both be supplied.
+driver_repo_url="${11:-}"
+driver_repo_pkg="${12:-}"
+APT_INSTALL="apt -o Dpkg::Options::='--force-confdef' -o Dpkg::Options::='--force-confold' -yqq --no-install-recommends install"
+
+export DEBIAN_FRONTEND=noninteractive
+
+is_feature_enabled() {
+	local feature="$1"
+	[[ ",${nvidia_gpu_stack}," == *",${feature},"* ]]
+}
+
+install_nvidia_ctk() {
+	echo "chroot: Installing NVIDIA GPU container runtime"
+	# Base  gives a nvidia-ctk and the nvidia-container-runtime
+	eval "${APT_INSTALL}" nvidia-container-toolkit-base="${ctk_version}"
+}
+
+install_nvidia_fabricmanager() {
+	is_feature_enabled "nvswitch" || {
+		echo "chroot: Skipping NVIDIA fabricmanager installation"
+		return
+	}
+	echo "chroot: Install NVIDIA fabricmanager"
+	eval "${APT_INSTALL}" nvidia-fabricmanager libnvidia-nscq nvlsm
+	apt-mark hold nvidia-fabricmanager libnvidia-nscq nvlsm
+}
+
+install_userspace_components() {
+	# Extract the driver=XXX part first, then get the value
+	if [[ "${nvidia_gpu_stack}" =~ driver=([^,]+) ]]; then
+		driver_version="${BASH_REMATCH[1]}"
+	fi
+	echo "chroot: driver_version: ${driver_version}"
+
+	eval "${APT_INSTALL}" nvidia-driver-pinning-"${driver_version}"
+	eval "${APT_INSTALL}" nvidia-imex nvidia-firmware    \
+		libnvidia-cfg1 libnvidia-gl libnvidia-extra      \
+		libnvidia-decode libnvidia-fbc1 libnvidia-encode \
+		libnvidia-nscq libnvidia-compute nvidia-settings \
+		ocl-icd-libopencl1
+
+	apt-mark hold nvidia-imex nvidia-firmware            \
+		libnvidia-cfg1 libnvidia-gl libnvidia-extra      \
+		libnvidia-decode libnvidia-fbc1 libnvidia-encode \
+		libnvidia-nscq libnvidia-compute nvidia-settings
+
+	# Needed for confidential-data-hub's secure_mount: cryptsetup to unlock
+	# encrypted storage and e2fsprogs to format it. cryptsetup-bin also carries
+	# veritysetup and pulls libdevmapper in via libcryptsetup12. NVAT's own
+	# dependencies (libxml2 among them) ship inside the coco-guest-components
+	# tarball, see chisseled_nvat().
+	eval "${APT_INSTALL}" cryptsetup-bin e2fsprogs
+
+	apt-mark hold cryptsetup-bin e2fsprogs
+
+	# NVRC loads the NVIDIA driver modules from the gpu extension's self-contained
+	# module tree via `modprobe --dirname <extension>`, a kmod feature the base
+	# busybox lacks. Install the real kmod here so the nvidia base chisel can
+	# pull /usr/bin/kmod (and its libzstd/liblzma deps) from this stage.
+	eval "${APT_INSTALL}" kmod
+	apt-mark hold kmod
+}
+
+setup_apt_repositories() {
+	echo "chroot: Setup APT repositories"
+
+	# Architecture to mirror mapping
+	declare -A arch_to_mirror=(
+		["x86_64"]="us.archive.ubuntu.com/ubuntu"
+		["aarch64"]="ports.ubuntu.com/ubuntu-ports"
+	)
+
+	local mirror="${arch_to_mirror[${arch_target}]}"
+	[[ -z "${mirror}" ]] && die "Unknown arch_target: ${arch_target}"
+
+	local deb_arch="amd64"
+	[[ "${arch_target}" == "aarch64" ]] && deb_arch="arm64"
+
+	mkdir -p /var/cache/apt/archives/partial /var/log/apt                  \
+		/var/lib/dpkg/{info,updates,alternatives,triggers,parts}
+
+	touch /var/lib/dpkg/status
+
+	rm -f /etc/apt/sources.list.d/*
+
+	key="/usr/share/keyrings/ubuntu-archive-keyring.gpg"
+	comp="main restricted universe multiverse"
+
+	cat <<-CHROOT_EOF > /etc/apt/sources.list.d/"${cuda_repo_osv}".list
+		deb [arch=${deb_arch} signed-by=${key}] http://${mirror} ${cuda_repo_osv} ${comp}
+		deb [arch=${deb_arch} signed-by=${key}] http://${mirror} ${cuda_repo_osv}-updates ${comp}
+		deb [arch=${deb_arch} signed-by=${key}] http://${mirror} ${cuda_repo_osv}-security ${comp}
+		deb [arch=${deb_arch} signed-by=${key}] http://${mirror} ${cuda_repo_osv}-backports ${comp}
+	CHROOT_EOF
+
+	# Tools repository is always needed for toolkit, DCGM and other helpers
+	curl -fsSL -O "${tools_repo_url}/${tools_repo_pkg}"
+	dpkg -i "${tools_repo_pkg}" && rm -f "${tools_repo_pkg}"
+
+	# Remote or local CUDA repository
+	curl -fsSL -O "${cuda_repo_url}/${cuda_repo_pkg}"
+	dpkg -i "${cuda_repo_pkg}" && rm -f "${cuda_repo_pkg}"
+
+	# Drivers released separately from the toolkit ship their userspace
+	# (pinning, libnvidia-*, fabricmanager, nvlsm, imex) in a dedicated
+	# repository - without it those packages only resolve for drivers
+	# already published on the repositories above. The toolkit and driver
+	# repositories are disjoint package sets (shared cuda-keyring aside),
+	# so provenance only matters against the network repositories: local
+	# file origins are pinned at 900 (below), above the network ones, and
+	# nvidia-driver-pinning pins the driver set to exact versions - pins
+	# decide, never listing order. A half-configured pair must fail here:
+	# silently skipping it surfaces later as a misleading
+	# package-resolution error.
+	if [[ -n "${driver_repo_url}" || -n "${driver_repo_pkg}" ]]; then
+		[[ -n "${driver_repo_url}" && -n "${driver_repo_pkg}" ]] || \
+			die "driver repository misconfigured: url='${driver_repo_url}' pkg='${driver_repo_pkg}' - set both or neither"
+		curl -fsSL -O "${driver_repo_url}/${driver_repo_pkg}"
+		dpkg -i "${driver_repo_pkg}" && rm -f "${driver_repo_pkg}"
+	fi
+
+	# A local repo ships its signing key inside its own tree, but apt only
+	# trusts keys under /usr/share/keyrings - without this copy `apt update`
+	# rejects the repo as unsigned. A loop because [[ -e ]] would test the
+	# glob literally (nullglob: remote-repo flow matches nothing, skips).
+	for keyring in /var/cuda-repo-*-local/cuda-*-keyring.gpg \
+		/var/nvidia-driver-local-repo-*/nvidia-driver-*-keyring.gpg; do
+		cp "${keyring}" /usr/share/keyrings/
+	done
+
+	# Set priorities: CUDA repos highest, Ubuntu non-driver next, Ubuntu blocked for driver packages
+	cat <<-CHROOT_EOF > /etc/apt/preferences.d/nvidia-priority
+		Package: *
+		Pin: origin $(dirname "${mirror}")
+		Pin-Priority: 400
+
+		Package: nvidia-* libnvidia-*
+		Pin: origin $(dirname "${mirror}")
+		Pin-Priority: -1
+
+		Package: *
+		Pin: origin developer.download.nvidia.com
+		Pin-Priority: 800
+
+		Package: *
+		Pin: origin ""
+		Pin-Priority: 900
+	CHROOT_EOF
+
+	apt update
+}
+
+install_nvidia_dcgm() {
+	is_feature_enabled "dcgm" || {
+		echo "chroot: Skipping NVIDIA DCGM installation"
+		return
+	}
+
+	echo "chroot: Install NVIDIA DCGM"
+
+	# -core pulls nv-hostengine and libdcgm, which is all the chisel takes; the
+	# CUDA flavour packages are multi-hundred-MB module blobs the guest never
+	# uses. The exporter provides the metrics endpoint the dcgm feature exposes.
+	# Both are version-locked because the repository only ever offers the newest
+	# DCGM, so an unpinned install re-bases the guest on whatever NVIDIA
+	# published last.
+	#
+	# -core depends on its sub-packages at exactly its own version, but apt
+	# picks the newest candidate for each of them, so pinning -core alone
+	# breaks as soon as NVIDIA respins the release (e.g. 1:4.7.0-1 -> -2).
+	# Pin the whole family so apt resolves it at ${dcgm_version}.
+	cat <<-CHROOT_EOF > /etc/apt/preferences.d/nvidia-dcgm
+		Package: datacenter-gpu-manager-4-* dcgmi libdcgm nv-hostengine
+		Pin: version ${dcgm_version}
+		Pin-Priority: 1001
+	CHROOT_EOF
+
+	eval "${APT_INSTALL}" datacenter-gpu-manager-4-core="${dcgm_version}" \
+		datacenter-gpu-manager-exporter="${dcgm_exporter_version}"
+
+	apt-mark hold datacenter-gpu-manager-4-core datacenter-gpu-manager-exporter
+}
+
+install_devkit_packages() {
+	is_feature_enabled "devkit" || {
+		echo "chroot: Skipping devkit packages installation"
+		return
+	}
+
+	echo "chroot: Install devkit packages"
+
+	eval "${APT_INSTALL}" kmod
+	apt-mark hold kmod
+}
+
+cleanup_rootfs() {
+	echo "chroot: Cleanup NVIDIA GPU rootfs"
+
+	apt-mark hold libstdc++6 libzstd1 libgnutls30t64 pciutils linuxptp libnftnl11
+	apt autoremove -yqq
+
+	apt clean
+	apt autoclean
+
+	rm -rf /var/lib/apt/lists/* /var/cache/apt/* /var/log/apt /var/cache/debconf
+	rm -f /etc/apt/sources.list
+	rm -f /usr/bin/nvidia-ngx-updater /usr/bin/nvidia-container-runtime
+	rm -f /var/log/{nvidia-installer.log,dpkg.log,alternatives.log}
+
+	# Clear and regenerate the ld cache
+	rm -f /etc/ld.so.cache
+	ldconfig
+}
+
+# Start of script
+echo "chroot: Setup NVIDIA GPU package rootfs"
+
+setup_apt_repositories
+install_userspace_components
+install_nvidia_fabricmanager
+install_nvidia_ctk
+install_nvidia_dcgm
+install_devkit_packages
+cleanup_rootfs

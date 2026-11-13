@@ -11,7 +11,11 @@ import (
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
 )
 
-func validateHypervisorConfig(conf *HypervisorConfig) error {
+func validateHypervisorConfig(conf *HypervisorConfig, hypervisorType HypervisorType) error {
+
+	if conf.RemoteHypervisorSocket != "" {
+		return nil
+	}
 
 	if conf.KernelPath == "" {
 		return fmt.Errorf("Missing kernel path")
@@ -32,8 +36,8 @@ func validateHypervisorConfig(conf *HypervisorConfig) error {
 		return err
 	}
 
-	if conf.NumVCPUs == 0 {
-		conf.NumVCPUs = defaultVCPUs
+	if conf.NumVCPUsF == 0 {
+		conf.NumVCPUsF = defaultVCPUs
 	}
 
 	if conf.MemorySize == 0 {
@@ -50,13 +54,14 @@ func validateHypervisorConfig(conf *HypervisorConfig) error {
 		conf.BlockDeviceDriver = config.VirtioBlockCCW
 	}
 
-	if conf.DefaultMaxVCPUs == 0 || conf.DefaultMaxVCPUs > defaultMaxVCPUs {
-		conf.DefaultMaxVCPUs = defaultMaxVCPUs
+	// CoCo guest hardening: virtio-mmio is not hardened for confidential computing.
+	if conf.ConfidentialGuest && conf.BlockDeviceDriver == config.VirtioMmio {
+		return fmt.Errorf("confidential guests must not use virtio-mmio (use virtio-blk-pci); virtio-mmio is not hardened for CoCo")
 	}
 
-	if conf.ConfidentialGuest && conf.NumVCPUs != conf.DefaultMaxVCPUs {
-		hvLogger.Warnf("Confidential guests do not support hotplugging of vCPUs. Setting DefaultMaxVCPUs to NumVCPUs (%d)", conf.NumVCPUs)
-		conf.DefaultMaxVCPUs = conf.NumVCPUs
+	maxVCPUs := MaxVCPUs(hypervisorType)
+	if conf.DefaultMaxVCPUs == 0 || conf.DefaultMaxVCPUs > maxVCPUs {
+		conf.DefaultMaxVCPUs = maxVCPUs
 	}
 
 	if conf.Msize9p == 0 && conf.SharedFS != config.VirtioFS {

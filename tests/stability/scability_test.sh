@@ -8,9 +8,11 @@ set -o pipefail
 
 # General env
 SCRIPT_PATH=$(dirname "$(readlink -f "$0")")
-source "${SCRIPT_PATH}/../metrics/lib/common.bash"
+# shellcheck source=/dev/null
+source "${SCRIPT_PATH}/common_stability.bash"
 
 NUM_CONTAINERS="$1"
+# shellcheck disable=SC2034
 TIMEOUT_LAUNCH="$2"
 PAYLOAD_ARGS="${PAYLOAD_ARGS:-tail -f /dev/null}"
 IMAGE="${IMAGE:-quay.io/prometheus/busybox:latest}"
@@ -29,8 +31,8 @@ EOF
 
 function main() {
 	# Verify enough arguments
-	if [ $# != 2 ]; then
-		echo >&2 "error: Not enough arguments [$@]"
+	if [[ $# != 2 ]]; then
+		echo >&2 "error: Not enough arguments [$*]"
 		help
 		exit 1
 	fi
@@ -39,30 +41,27 @@ function main() {
 	local containers=()
 	local not_started_count="${NUM_CONTAINERS}"
 
-	init_env
-	check_cmds "${cmds[@]}"
-	sudo -E ctr i pull "${IMAGE}"
+	clean_env_ctr
+	# shellcheck disable=SC2154
+	sudo -E "${CTR_EXE}" i pull "${IMAGE}"
 
 	info "Creating ${NUM_CONTAINERS} containers"
 
 	for ((i=1; i<= "${NUM_CONTAINERS}"; i++)); do
-		containers+=($(random_name))
-		sudo -E ctr run -d --runtime "${CTR_RUNTIME}" "${IMAGE}" "${containers[-1]}" sh -c "${PAYLOAD_ARGS}"
+		local name
+		name=$(random_name)
+		containers+=("${name}")
+		# shellcheck disable=SC2154
+		sudo -E "${CTR_EXE}" run -d --runtime "${CTR_RUNTIME}" "${IMAGE}" "${containers[-1]}" sh -c "${PAYLOAD_ARGS}"
 		((not_started_count--))
-		info "$not_started_count remaining containers"
+		info "${not_started_count} remaining containers"
 	done
 
 	# Check that the requested number of containers are running
-	check_containers_are_up & pid=$!
-	(sleep "${TIMEOUT_LAUNCH}" && kill -HUP "${pid}") 2>/dev/null & pid_tout=$!
+	check_containers_are_up "${NUM_CONTAINERS}"
 
-	if wait "${pid}" 2>/dev/null; then
-		pkill -HUP -P "${pid_tout}"
-		wait "${pid_tout}"
-	else
-		warn "Time out exceeded"
-		return 1
-	fi
+	# Check that the requested number of containers are running
+	check_containers_are_running "${NUM_CONTAINERS}"
 
 	clean_env_ctr
 }

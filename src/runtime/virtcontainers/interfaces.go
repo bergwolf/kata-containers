@@ -72,6 +72,8 @@ type VCSandbox interface {
 
 	GetOOMEvent(ctx context.Context) (string, error)
 	GetHypervisorPid() (int, error)
+	// RescanNetwork re-scans the network namespace for late-discovered endpoints.
+	RescanNetwork(ctx context.Context) error
 
 	UpdateRuntimeMetrics() error
 	GetAgentMetrics(ctx context.Context) (string, error)
@@ -82,6 +84,7 @@ type VCSandbox interface {
 
 	GetIPTables(ctx context.Context, isIPv6 bool) ([]byte, error)
 	SetIPTables(ctx context.Context, isIPv6 bool, data []byte) error
+	SetPolicy(ctx context.Context, policy string) error
 }
 
 // VCContainer is the Container interface

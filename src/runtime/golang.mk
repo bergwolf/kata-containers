@@ -21,13 +21,23 @@ endif
 ifeq (,$(not_check_version))
     have_yq=$(shell if [ -x "$(GOPATH)/bin/yq" ]; then echo "true"; else echo ""; fi)
     ifeq (,$(have_yq))
-        $(info INFO: yq was not found, installing it)
+        $(info INFO: yq was not found in GOPATH/bin, installing it)
         install_yq=$(shell ../../ci/install_yq.sh)
     endif
     ifneq (,$(install_yq))
         $(error "ERROR: install yq failed")
     endif
-    golang_version_min=$(shell $(GOPATH)/bin/yq r ../../versions.yaml languages.golang.version)
+
+    YQ_VERSION=$(shell $(GOPATH)/bin/yq --version | grep -oE "version v?[0-9]+" | grep -oE "[0-9]+")
+    QUERY="languages.golang.version"
+
+    ifneq (,$(findstring 4,$(YQ_VERSION)))
+        YQ_CMD=$(GOPATH)/bin/yq eval .$(QUERY) ../../versions.yaml
+    else
+        YQ_CMD=$(GOPATH)/bin/yq r ../../versions.yaml $(QUERY)
+    endif
+
+    golang_version_min=$(shell $(YQ_CMD))
 
     ifeq (,$(golang_version_min))
         $(error "ERROR: cannot determine minimum golang version")

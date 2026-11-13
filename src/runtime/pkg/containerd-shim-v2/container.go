@@ -7,11 +7,12 @@ package containerdshim
 
 import (
 	"io"
+	"sync"
 	"time"
 
+	taskAPI "github.com/containerd/containerd/api/runtime/task/v2"
 	"github.com/containerd/containerd/api/types/task"
 	"github.com/containerd/containerd/errdefs"
-	taskAPI "github.com/containerd/containerd/runtime/v2/task"
 	"github.com/opencontainers/runtime-spec/specs-go"
 
 	vc "github.com/kata-containers/kata-containers/src/runtime/virtcontainers"
@@ -22,6 +23,7 @@ type container struct {
 	ttyio       *ttyIO
 	spec        *specs.Spec
 	exitTime    time.Time
+	execsMu     sync.RWMutex
 	execs       map[string]*exec
 	exitIOch    chan struct{}
 	stdinPipe   io.WriteCloser
@@ -60,7 +62,7 @@ func newContainer(s *service, r *taskAPI.CreateTaskRequest, containerType vc.Con
 		terminal:    r.Terminal,
 		cType:       containerType,
 		execs:       make(map[string]*exec),
-		status:      task.StatusCreated,
+		status:      task.Status_CREATED,
 		exitIOch:    make(chan struct{}),
 		exitCh:      make(chan uint32, 1),
 		stdinCloser: make(chan struct{}),

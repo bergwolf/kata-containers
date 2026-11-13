@@ -16,13 +16,15 @@ import (
 
 // NetConfig struct for NetConfig
 type NetConfig struct {
-	Tap               *string            `json:"tap,omitempty"`
-	Ip                *string            `json:"ip,omitempty"`
+	Tap *string `json:"tap,omitempty"`
+	// IPv4 or IPv6 address
+	Ip *string `json:"ip,omitempty"`
+	// Must be a valid IPv4 netmask if ip is an IPv4 address or a valid IPv6 netmask if ip is an IPv6 address.
 	Mask              *string            `json:"mask,omitempty"`
 	Mac               *string            `json:"mac,omitempty"`
 	HostMac           *string            `json:"host_mac,omitempty"`
 	Mtu               *int32             `json:"mtu,omitempty"`
-	Iommu             *bool              `json:"iommu,omitempty"`
+	Iommu             *IommuType         `json:"iommu,omitempty"`
 	NumQueues         *int32             `json:"num_queues,omitempty"`
 	QueueSize         *int32             `json:"queue_size,omitempty"`
 	VhostUser         *bool              `json:"vhost_user,omitempty"`
@@ -30,7 +32,11 @@ type NetConfig struct {
 	VhostMode         *string            `json:"vhost_mode,omitempty"`
 	Id                *string            `json:"id,omitempty"`
 	PciSegment        *int32             `json:"pci_segment,omitempty"`
+	PciDeviceId       *int32             `json:"pci_device_id,omitempty"`
 	RateLimiterConfig *RateLimiterConfig `json:"rate_limiter_config,omitempty"`
+	OffloadTso        *bool              `json:"offload_tso,omitempty"`
+	OffloadUfo        *bool              `json:"offload_ufo,omitempty"`
+	OffloadCsum       *bool              `json:"offload_csum,omitempty"`
 }
 
 // NewNetConfig instantiates a new NetConfig object
@@ -43,7 +49,7 @@ func NewNetConfig() *NetConfig {
 	this.Ip = &ip
 	var mask string = "255.255.255.0"
 	this.Mask = &mask
-	var iommu bool = false
+	var iommu IommuType = IOMMUTYPE_OFF
 	this.Iommu = &iommu
 	var numQueues int32 = 2
 	this.NumQueues = &numQueues
@@ -53,6 +59,12 @@ func NewNetConfig() *NetConfig {
 	this.VhostUser = &vhostUser
 	var vhostMode string = "Client"
 	this.VhostMode = &vhostMode
+	var offloadTso bool = false
+	this.OffloadTso = &offloadTso
+	var offloadUfo bool = false
+	this.OffloadUfo = &offloadUfo
+	var offloadCsum bool = false
+	this.OffloadCsum = &offloadCsum
 	return &this
 }
 
@@ -65,7 +77,7 @@ func NewNetConfigWithDefaults() *NetConfig {
 	this.Ip = &ip
 	var mask string = "255.255.255.0"
 	this.Mask = &mask
-	var iommu bool = false
+	var iommu IommuType = IOMMUTYPE_OFF
 	this.Iommu = &iommu
 	var numQueues int32 = 2
 	this.NumQueues = &numQueues
@@ -75,6 +87,12 @@ func NewNetConfigWithDefaults() *NetConfig {
 	this.VhostUser = &vhostUser
 	var vhostMode string = "Client"
 	this.VhostMode = &vhostMode
+	var offloadTso bool = false
+	this.OffloadTso = &offloadTso
+	var offloadUfo bool = false
+	this.OffloadUfo = &offloadUfo
+	var offloadCsum bool = false
+	this.OffloadCsum = &offloadCsum
 	return &this
 }
 
@@ -271,9 +289,9 @@ func (o *NetConfig) SetMtu(v int32) {
 }
 
 // GetIommu returns the Iommu field value if set, zero value otherwise.
-func (o *NetConfig) GetIommu() bool {
+func (o *NetConfig) GetIommu() IommuType {
 	if o == nil || o.Iommu == nil {
-		var ret bool
+		var ret IommuType
 		return ret
 	}
 	return *o.Iommu
@@ -281,7 +299,7 @@ func (o *NetConfig) GetIommu() bool {
 
 // GetIommuOk returns a tuple with the Iommu field value if set, nil otherwise
 // and a boolean to check if the value has been set.
-func (o *NetConfig) GetIommuOk() (*bool, bool) {
+func (o *NetConfig) GetIommuOk() (*IommuType, bool) {
 	if o == nil || o.Iommu == nil {
 		return nil, false
 	}
@@ -297,8 +315,8 @@ func (o *NetConfig) HasIommu() bool {
 	return false
 }
 
-// SetIommu gets a reference to the given bool and assigns it to the Iommu field.
-func (o *NetConfig) SetIommu(v bool) {
+// SetIommu gets a reference to the given IommuType and assigns it to the Iommu field.
+func (o *NetConfig) SetIommu(v IommuType) {
 	o.Iommu = &v
 }
 
@@ -526,6 +544,38 @@ func (o *NetConfig) SetPciSegment(v int32) {
 	o.PciSegment = &v
 }
 
+// GetPciDeviceId returns the PciDeviceId field value if set, zero value otherwise.
+func (o *NetConfig) GetPciDeviceId() int32 {
+	if o == nil || o.PciDeviceId == nil {
+		var ret int32
+		return ret
+	}
+	return *o.PciDeviceId
+}
+
+// GetPciDeviceIdOk returns a tuple with the PciDeviceId field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+func (o *NetConfig) GetPciDeviceIdOk() (*int32, bool) {
+	if o == nil || o.PciDeviceId == nil {
+		return nil, false
+	}
+	return o.PciDeviceId, true
+}
+
+// HasPciDeviceId returns a boolean if a field has been set.
+func (o *NetConfig) HasPciDeviceId() bool {
+	if o != nil && o.PciDeviceId != nil {
+		return true
+	}
+
+	return false
+}
+
+// SetPciDeviceId gets a reference to the given int32 and assigns it to the PciDeviceId field.
+func (o *NetConfig) SetPciDeviceId(v int32) {
+	o.PciDeviceId = &v
+}
+
 // GetRateLimiterConfig returns the RateLimiterConfig field value if set, zero value otherwise.
 func (o *NetConfig) GetRateLimiterConfig() RateLimiterConfig {
 	if o == nil || o.RateLimiterConfig == nil {
@@ -556,6 +606,102 @@ func (o *NetConfig) HasRateLimiterConfig() bool {
 // SetRateLimiterConfig gets a reference to the given RateLimiterConfig and assigns it to the RateLimiterConfig field.
 func (o *NetConfig) SetRateLimiterConfig(v RateLimiterConfig) {
 	o.RateLimiterConfig = &v
+}
+
+// GetOffloadTso returns the OffloadTso field value if set, zero value otherwise.
+func (o *NetConfig) GetOffloadTso() bool {
+	if o == nil || o.OffloadTso == nil {
+		var ret bool
+		return ret
+	}
+	return *o.OffloadTso
+}
+
+// GetOffloadTsoOk returns a tuple with the OffloadTso field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+func (o *NetConfig) GetOffloadTsoOk() (*bool, bool) {
+	if o == nil || o.OffloadTso == nil {
+		return nil, false
+	}
+	return o.OffloadTso, true
+}
+
+// HasOffloadTso returns a boolean if a field has been set.
+func (o *NetConfig) HasOffloadTso() bool {
+	if o != nil && o.OffloadTso != nil {
+		return true
+	}
+
+	return false
+}
+
+// SetOffloadTso gets a reference to the given bool and assigns it to the OffloadTso field.
+func (o *NetConfig) SetOffloadTso(v bool) {
+	o.OffloadTso = &v
+}
+
+// GetOffloadUfo returns the OffloadUfo field value if set, zero value otherwise.
+func (o *NetConfig) GetOffloadUfo() bool {
+	if o == nil || o.OffloadUfo == nil {
+		var ret bool
+		return ret
+	}
+	return *o.OffloadUfo
+}
+
+// GetOffloadUfoOk returns a tuple with the OffloadUfo field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+func (o *NetConfig) GetOffloadUfoOk() (*bool, bool) {
+	if o == nil || o.OffloadUfo == nil {
+		return nil, false
+	}
+	return o.OffloadUfo, true
+}
+
+// HasOffloadUfo returns a boolean if a field has been set.
+func (o *NetConfig) HasOffloadUfo() bool {
+	if o != nil && o.OffloadUfo != nil {
+		return true
+	}
+
+	return false
+}
+
+// SetOffloadUfo gets a reference to the given bool and assigns it to the OffloadUfo field.
+func (o *NetConfig) SetOffloadUfo(v bool) {
+	o.OffloadUfo = &v
+}
+
+// GetOffloadCsum returns the OffloadCsum field value if set, zero value otherwise.
+func (o *NetConfig) GetOffloadCsum() bool {
+	if o == nil || o.OffloadCsum == nil {
+		var ret bool
+		return ret
+	}
+	return *o.OffloadCsum
+}
+
+// GetOffloadCsumOk returns a tuple with the OffloadCsum field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+func (o *NetConfig) GetOffloadCsumOk() (*bool, bool) {
+	if o == nil || o.OffloadCsum == nil {
+		return nil, false
+	}
+	return o.OffloadCsum, true
+}
+
+// HasOffloadCsum returns a boolean if a field has been set.
+func (o *NetConfig) HasOffloadCsum() bool {
+	if o != nil && o.OffloadCsum != nil {
+		return true
+	}
+
+	return false
+}
+
+// SetOffloadCsum gets a reference to the given bool and assigns it to the OffloadCsum field.
+func (o *NetConfig) SetOffloadCsum(v bool) {
+	o.OffloadCsum = &v
 }
 
 func (o NetConfig) MarshalJSON() ([]byte, error) {
@@ -602,8 +748,20 @@ func (o NetConfig) MarshalJSON() ([]byte, error) {
 	if o.PciSegment != nil {
 		toSerialize["pci_segment"] = o.PciSegment
 	}
+	if o.PciDeviceId != nil {
+		toSerialize["pci_device_id"] = o.PciDeviceId
+	}
 	if o.RateLimiterConfig != nil {
 		toSerialize["rate_limiter_config"] = o.RateLimiterConfig
+	}
+	if o.OffloadTso != nil {
+		toSerialize["offload_tso"] = o.OffloadTso
+	}
+	if o.OffloadUfo != nil {
+		toSerialize["offload_ufo"] = o.OffloadUfo
+	}
+	if o.OffloadCsum != nil {
+		toSerialize["offload_csum"] = o.OffloadCsum
 	}
 	return json.Marshal(toSerialize)
 }

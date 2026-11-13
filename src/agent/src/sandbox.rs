@@ -7,25 +7,32 @@ use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::fs;
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd};
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 use std::{thread, time};
 
 use anyhow::{anyhow, Context, Result};
 use kata_types::cpu::CpuSet;
 use kata_types::mount::StorageDevice;
-use libc::pid_t;
+use libc::{pid_t, syscall};
+use nix::fcntl::{self, OFlag};
+use nix::sched::{setns, unshare, CloneFlags};
+use nix::sys::stat::Mode;
 use oci::{Hook, Hooks};
-use protocols::agent::OnlineCPUMemRequest;
+use oci_spec::runtime as oci;
+use protocols::agent::{OnlineCPUMemRequest, SharedMount};
 use regex::Regex;
-use rustjail::cgroups as rustjail_cgroups;
+use rustjail::cgroups::{self as rustjail_cgroups, DevicesCgroupInfo};
 use rustjail::container::BaseContainer;
 use rustjail::container::LinuxContainer;
 use rustjail::process::Process;
 use slog::Logger;
+use thiserror::Error;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::oneshot;
 use tokio::sync::Mutex;
@@ -41,7 +48,16 @@ use crate::storage::StorageDeviceGeneric;
 use crate::uevent::{Uevent, UeventMatcher};
 use crate::watcher::BindWatcher;
 
-pub const ERR_INVALID_CONTAINER_ID: &str = "Invalid container id";
+/// Errors that can occur when looking up processes in the sandbox.
+#[derive(Debug, Error)]
+pub enum SandboxError {
+    #[error("Invalid container id")]
+    InvalidContainerId,
+    #[error("Process not found: init process missing")]
+    InitProcessNotFound,
+    #[error("Process not found: invalid exec id")]
+    InvalidExecId,
+}
 
 type UeventWatcher = (Box<dyn UeventMatcher>, oneshot::Sender<Uevent>);
 
@@ -49,6 +65,12 @@ type UeventWatcher = (Box<dyn UeventMatcher>, oneshot::Sender<Uevent>);
 pub struct StorageState {
     count: Arc<AtomicU32>,
     device: Arc<dyn StorageDevice>,
+
+    /// Whether the storage is shared across multiple containers (e.g.
+    /// block-based emptyDirs). Shared storages should not be cleaned up
+    /// when a container exits; cleanup happens only when the sandbox is
+    /// destroyed.
+    shared: bool,
 }
 
 impl Debug for StorageState {
@@ -58,22 +80,20 @@ impl Debug for StorageState {
 }
 
 impl StorageState {
-    fn new() -> Self {
+    fn new(shared: bool) -> Self {
         StorageState {
             count: Arc::new(AtomicU32::new(1)),
             device: Arc::new(StorageDeviceGeneric::default()),
-        }
-    }
-
-    pub fn from_device(device: Arc<dyn StorageDevice>) -> Self {
-        Self {
-            count: Arc::new(AtomicU32::new(1)),
-            device,
+            shared,
         }
     }
 
     pub fn path(&self) -> Option<&str> {
         self.device.path()
+    }
+
+    pub fn is_shared(&self) -> bool {
+        self.shared
     }
 
     pub async fn ref_count(&self) -> u32 {
@@ -89,6 +109,8 @@ impl StorageState {
     }
 }
 
+pub type PciHostGuestMapping = HashMap<pci::Address, pci::Address>;
+
 #[derive(Debug)]
 pub struct Sandbox {
     pub logger: Logger,
@@ -98,6 +120,8 @@ pub struct Sandbox {
     pub network: Network,
     pub mounts: Vec<String>,
     pub container_mounts: HashMap<String, Vec<String>>,
+    /// dm-verity devices per container for cleanup
+    pub container_verity_devices: HashMap<String, Vec<String>>,
     pub uevent_map: HashMap<String, Uevent>,
     pub uevent_watchers: Vec<Option<UeventWatcher>>,
     pub shared_utsns: Namespace,
@@ -112,7 +136,8 @@ pub struct Sandbox {
     pub event_rx: Arc<Mutex<Receiver<String>>>,
     pub event_tx: Option<Sender<String>>,
     pub bind_watcher: BindWatcher,
-    pub pcimap: HashMap<pci::Address, pci::Address>,
+    pub pcimap: HashMap<String, PciHostGuestMapping>,
+    pub devcg_info: Arc<RwLock<DevicesCgroupInfo>>,
 }
 
 impl Sandbox {
@@ -131,6 +156,7 @@ impl Sandbox {
             containers: HashMap::new(),
             mounts: Vec::new(),
             container_mounts: HashMap::new(),
+            container_verity_devices: HashMap::new(),
             uevent_map: HashMap::new(),
             uevent_watchers: Vec::new(),
             shared_utsns: Namespace::new(&logger),
@@ -146,13 +172,16 @@ impl Sandbox {
             event_tx: Some(tx),
             bind_watcher: BindWatcher::new(),
             pcimap: HashMap::new(),
+            devcg_info: Arc::new(RwLock::new(DevicesCgroupInfo::default())),
         })
     }
 
     /// Add a new storage object or increase reference count of existing one.
     /// The caller may detect new storage object by checking `StorageState.refcount == 1`.
+    /// The `shared` flag indicates if this storage is shared across multiple containers;
+    /// if true, cleanup will be skipped when containers exit.
     #[instrument]
-    pub async fn add_sandbox_storage(&mut self, path: &str) -> StorageState {
+    pub async fn add_sandbox_storage(&mut self, path: &str, shared: bool) -> StorageState {
         match self.storages.entry(path.to_string()) {
             Entry::Occupied(e) => {
                 let state = e.get().clone();
@@ -160,7 +189,7 @@ impl Sandbox {
                 state
             }
             Entry::Vacant(e) => {
-                let state = StorageState::new();
+                let state = StorageState::new(shared);
                 e.insert(state.clone());
                 state
             }
@@ -168,22 +197,32 @@ impl Sandbox {
     }
 
     /// Update the storage device associated with a path.
+    /// Preserves the existing shared flag and reference count.
     pub fn update_sandbox_storage(
         &mut self,
         path: &str,
         device: Arc<dyn StorageDevice>,
     ) -> std::result::Result<Arc<dyn StorageDevice>, Arc<dyn StorageDevice>> {
-        if !self.storages.contains_key(path) {
-            return Err(device);
+        match self.storages.get(path) {
+            None => Err(device),
+            Some(existing) => {
+                let state = StorageState {
+                    device,
+                    ..existing.clone()
+                };
+                // Safe to unwrap() because we have just ensured existence of entry via get().
+                let state = self.storages.insert(path.to_string(), state).unwrap();
+                Ok(state.device)
+            }
         }
-
-        let state = StorageState::from_device(device);
-        // Safe to unwrap() because we have just ensured existence of entry.
-        let state = self.storages.insert(path.to_string(), state).unwrap();
-        Ok(state.device)
     }
 
     /// Decrease reference count and destroy the storage object if reference count reaches zero.
+    ///
+    /// For shared storages (e.g., emptyDir volumes), cleanup is skipped even when refcount
+    /// reaches zero. The storage entry is kept in the map so subsequent containers can reuse
+    /// the already-mounted storage. Actual cleanup happens when the sandbox is destroyed.
+    ///
     /// Returns `Ok(true)` if the reference count has reached zero and the storage object has been
     /// removed.
     #[instrument]
@@ -192,6 +231,10 @@ impl Sandbox {
             None => Err(anyhow!("Sandbox storage with path {} not found", path)),
             Some(state) => {
                 if state.dec_and_test_ref_count().await {
+                    if state.is_shared() {
+                        state.count.store(1, Ordering::Release);
+                        return Ok(false);
+                    }
                     if let Some(storage) = self.storages.remove(path) {
                         storage.device.cleanup()?;
                     }
@@ -238,7 +281,7 @@ impl Sandbox {
             }
 
             let mut pid_ns = Namespace::new(&self.logger).get_pid();
-            pid_ns.path = format!("/proc/{}/ns/pid", init_pid);
+            pid_ns.path = format!("/proc/{init_pid}/ns/pid");
 
             self.sandbox_pidns = Some(pid_ns);
         }
@@ -254,29 +297,44 @@ impl Sandbox {
         self.containers.get_mut(id)
     }
 
+    pub fn find_container_by_name(&self, name: &str) -> Option<&LinuxContainer> {
+        self.containers
+            .values()
+            .find(|&c| c.config.container_name == name)
+    }
+
     pub fn find_process(&mut self, pid: pid_t) -> Option<&mut Process> {
-        for (_, c) in self.containers.iter_mut() {
-            if let Some(p) = c.processes.get_mut(&pid) {
-                return Some(p);
+        for c in self.containers.values_mut() {
+            for p in c.processes.values_mut() {
+                if p.pid == pid {
+                    return Some(p);
+                }
             }
         }
 
         None
     }
 
-    pub fn find_container_process(&mut self, cid: &str, eid: &str) -> Result<&mut Process> {
+    pub fn find_container_process(
+        &mut self,
+        cid: &str,
+        eid: &str,
+    ) -> Result<&mut Process, SandboxError> {
         let ctr = self
             .get_container(cid)
-            .ok_or_else(|| anyhow!(ERR_INVALID_CONTAINER_ID))?;
+            .ok_or(SandboxError::InvalidContainerId)?;
 
         if eid.is_empty() {
+            let init_pid = ctr.init_process_pid;
             return ctr
                 .processes
-                .get_mut(&ctr.init_process_pid)
-                .ok_or_else(|| anyhow!("cannot find init process!"));
+                .values_mut()
+                .find(|p| p.pid == init_pid)
+                .ok_or(SandboxError::InitProcessNotFound);
         }
 
-        ctr.get_process(eid).map_err(|_| anyhow!("Invalid exec id"))
+        ctr.get_process(eid)
+            .map_err(|_| SandboxError::InvalidExecId)
     }
 
     #[instrument]
@@ -305,17 +363,22 @@ impl Sandbox {
 
         let guest_cpuset = rustjail_cgroups::fs::get_guest_cpuset()?;
 
-        for (_, ctr) in self.containers.iter() {
-            if let Some(spec) = ctr.config.spec.as_ref() {
-                if let Some(linux) = spec.linux.as_ref() {
-                    if let Some(resources) = linux.resources.as_ref() {
-                        if let Some(cpus) = resources.cpu.as_ref() {
-                            info!(self.logger, "updating {}", ctr.id.as_str());
-                            ctr.cgroup_manager
-                                .update_cpuset_path(guest_cpuset.as_str(), &cpus.cpus)?;
-                        }
-                    }
+        for ctr in self.containers.values() {
+            match ctr
+                .config
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.linux().as_ref())
+                .and_then(|linux| linux.resources().as_ref())
+                .and_then(|resources| resources.cpu().as_ref())
+                .and_then(|cpus| cpus.cpus().as_ref())
+            {
+                Some(cpu_set) => {
+                    info!(self.logger, "updating {}", ctr.id.as_str());
+                    ctr.cgroup_manager
+                        .update_cpuset_path(guest_cpuset.as_str(), cpu_set)?;
                 }
+                None => continue,
             }
         }
 
@@ -326,15 +389,16 @@ impl Sandbox {
     pub fn add_hooks(&mut self, dir: &str) -> Result<()> {
         let mut hooks = Hooks::default();
         if let Ok(hook) = self.find_hooks(dir, "prestart") {
-            hooks.prestart = hook;
+            hooks.set_prestart(Some(hook));
         }
         if let Ok(hook) = self.find_hooks(dir, "poststart") {
-            hooks.poststart = hook;
+            hooks.set_poststart(Some(hook));
         }
         if let Ok(hook) = self.find_hooks(dir, "poststop") {
-            hooks.poststop = hook;
+            hooks.set_poststop(Some(hook));
         }
         self.hooks = Some(hooks);
+
         Ok(())
     }
 
@@ -352,16 +416,13 @@ impl Sandbox {
             }
 
             let name = entry.file_name();
-            let hook = Hook {
-                path: Path::new(hook_path)
-                    .join(hook_type)
-                    .join(&name)
-                    .to_str()
-                    .unwrap()
-                    .to_owned(),
-                args: vec![name.to_str().unwrap().to_owned(), hook_type.to_owned()],
-                ..Default::default()
-            };
+            let mut hook = oci::Hook::default();
+            hook.set_path(PathBuf::from(hook_path).join(hook_type).join(&name));
+            hook.set_args(Some(vec![
+                name.to_str().unwrap().to_owned(),
+                hook_type.to_owned(),
+            ]));
+
             info!(
                 self.logger,
                 "found {} hook {:?} mode {:o}",
@@ -369,6 +430,7 @@ impl Sandbox {
                 hook,
                 entry.metadata()?.permissions().mode()
             );
+
             hooks.push(hook);
         }
 
@@ -402,6 +464,160 @@ impl Sandbox {
                 }
             }
         });
+    }
+
+    #[instrument]
+    pub fn setup_shared_mounts(&self, c: &LinuxContainer, mounts: &Vec<SharedMount>) -> Result<()> {
+        let mut src_ctrs: HashMap<String, i32> = HashMap::new();
+        for shared_mount in mounts {
+            if !src_ctrs.contains_key(&shared_mount.src_ctr) {
+                if let Some(c) = self.find_container_by_name(&shared_mount.src_ctr) {
+                    src_ctrs.insert(shared_mount.src_ctr.clone(), c.init_process_pid);
+                }
+            }
+        }
+
+        // If there are no shared mounts to be set up, return directly.
+        if src_ctrs.is_empty() {
+            return Ok(());
+        }
+
+        let mounts = mounts.clone();
+        // Open mount namespace file descriptors
+        let init_mntns_owned = fcntl::open(
+            "/proc/self/ns/mnt",
+            OFlag::O_RDONLY | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .context("failed to open /proc/self/ns/mnt")?;
+        let init_mntns = init_mntns_owned.as_raw_fd();
+
+        let dst_mntns_path = format!("/proc/{}/ns/mnt", c.init_process_pid);
+        let dst_mntns_owned = fcntl::open(
+            dst_mntns_path.as_str(),
+            OFlag::O_RDONLY | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .with_context(|| format!("failed to open {}", dst_mntns_path))?;
+        let dst_mntns = dst_mntns_owned.as_raw_fd();
+
+        // Convert OwnedFd to File to ensure proper cleanup
+        // Safe because we just opened these fds
+        let _init_mntns_f = unsafe { fs::File::from_raw_fd(init_mntns_owned.into_raw_fd()) };
+        let _dst_mntns_f = unsafe { fs::File::from_raw_fd(dst_mntns_owned.into_raw_fd()) };
+        let new_thread = std::thread::spawn(move || {
+            || -> Result<()> {
+                // A process can't join a new mount namespace if it is sharing
+                // filesystem-related attributes (using CLONE_FS flag) with another process.
+                // Ref: https://man7.org/linux/man-pages/man2/setns.2.html
+                //
+                // The implementation of the Rust standard library's std::thread relies on
+                // the CLONE_FS parameter at the low level.
+                // Therefore, it is not possible to switch directly to the mount namespace using setns.
+                // Instead, it is necessary to first switch to a new mount namespace using unshare.
+                unshare(CloneFlags::CLONE_NEWNS)
+                    .map_err(|e| anyhow!("failed to create new mount namespace: {}", e))?;
+                for m in mounts {
+                    if let Some(src_init_pid) = src_ctrs.get(m.src_ctr()) {
+                        // Shared mount points are created by application process within the source container,
+                        // so we need to ensure they are already prepared.
+                        let borrowed_fd = unsafe { BorrowedFd::borrow_raw(init_mntns) };
+                        setns(borrowed_fd, CloneFlags::CLONE_NEWNS).map_err(|e| {
+                            anyhow!("switch to initial mount namespace failed: {}", e)
+                        })?;
+                        let mut is_ready = false;
+                        let start_time = Instant::now();
+                        let time_out = Duration::from_millis(10_000);
+                        loop {
+                            let proc_mounts_path = format!("/proc/{}/mounts", *src_init_pid);
+                            let proc_mounts = fs::read_to_string(proc_mounts_path.as_str())?;
+                            let lines: Vec<&str> = proc_mounts.split('\n').collect();
+                            for line in lines {
+                                let parts: Vec<&str> = line.split_whitespace().collect();
+                                if parts.len() >= 2 && parts[1] == m.src_path() {
+                                    is_ready = true;
+                                    break;
+                                }
+                            }
+
+                            if is_ready {
+                                break;
+                            }
+
+                            if start_time.elapsed() >= time_out {
+                                break;
+                            }
+
+                            thread::sleep(Duration::from_millis(100));
+                        }
+                        if !is_ready {
+                            continue;
+                        }
+
+                        // Switch to the src container to obtain shared mount points.
+                        let src_mntns_path = format!("/proc/{}/ns/mnt", *src_init_pid);
+                        let src_mntns = fcntl::open(
+                            src_mntns_path.as_str(),
+                            OFlag::O_RDONLY | OFlag::O_CLOEXEC,
+                            Mode::empty(),
+                        )
+                        .map_err(|e| {
+                            anyhow!("failed to open {}: {}", src_mntns_path.as_str(), e)
+                        })?;
+                        // safe because the fd are opened by fcntl::open and used directly.
+                        let _src_mntns_f =
+                            unsafe { fs::File::from_raw_fd(src_mntns.into_raw_fd()) };
+                        setns(&_src_mntns_f, CloneFlags::CLONE_NEWNS).map_err(|e| {
+                            anyhow!("switch to source mount namespace failed: {}", e)
+                        })?;
+                        let src = std::ffi::CString::new(m.src_path())?;
+                        let mount_fd = unsafe {
+                            syscall(
+                                libc::SYS_open_tree,
+                                libc::AT_FDCWD,
+                                src.as_ptr(),
+                                0x1 | 0x8000 | libc::O_CLOEXEC, // OPEN_TREE_CLONE | AT_RECURSIVE | OPEN_TREE_CLOEXEC
+                            ) as i32
+                        };
+                        if mount_fd < 0 {
+                            return Err(anyhow!(
+                                "failed to clone mounted subtree on {}",
+                                m.src_path()
+                            ));
+                        }
+                        // safe because we have checked whether mount_fd is valid
+                        let _mount_f = unsafe { fs::File::from_raw_fd(mount_fd) };
+
+                        // Switch to the dst container and mount them.
+                        let borrowed_fd = unsafe { BorrowedFd::borrow_raw(dst_mntns) };
+                        setns(borrowed_fd, CloneFlags::CLONE_NEWNS).map_err(|e| {
+                            anyhow!("switch to destination mount namespace failed: {}", e)
+                        })?;
+                        fs::create_dir_all(m.dst_path())?;
+                        let dst = std::ffi::CString::new(m.dst_path())?;
+                        let empty = std::ffi::CString::new("")?;
+                        unsafe {
+                            syscall(
+                                libc::SYS_move_mount,
+                                mount_fd,
+                                empty.as_ptr(),
+                                libc::AT_FDCWD,
+                                dst.as_ptr(),
+                                4, // MOVE_MOUNT_F_EMPTY_PATH
+                            )
+                        };
+                    }
+                }
+
+                Ok(())
+            }()
+        });
+
+        new_thread
+            .join()
+            .map_err(|e| anyhow!("Failed to join thread {:?}!", e))??;
+
+        Ok(())
     }
 }
 
@@ -493,12 +709,15 @@ fn onlined_cpus() -> Result<i32> {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
+#[allow(unused_imports)]
 mod tests {
     use super::*;
     use crate::mount::baremount;
     use anyhow::{anyhow, Error};
     use nix::mount::MsFlags;
-    use oci::{Linux, Root, Spec};
+    use oci::{Linux, LinuxBuilder, LinuxDeviceCgroup, LinuxResources, Root, Spec, SpecBuilder};
+    use oci_spec::runtime as oci;
     use rustjail::container::LinuxContainer;
     use rustjail::process::Process;
     use rustjail::specconv::CreateOpts;
@@ -507,8 +726,11 @@ mod tests {
     use std::io::prelude::*;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
+    use std::time::{SystemTime, UNIX_EPOCH};
     use tempfile::{tempdir, Builder, TempDir};
     use test_utils::skip_if_not_root;
+
+    const CGROUP_PARENT: &str = "kata.agent.test.k8s.io";
 
     fn bind_mount(src: &str, dst: &str, logger: &Logger) -> Result<(), Error> {
         let src_path = Path::new(src);
@@ -529,26 +751,24 @@ mod tests {
         let tmpdir_path = tmpdir.path().to_str().unwrap();
 
         // Add a new sandbox storage
-        let new_storage = s.add_sandbox_storage(tmpdir_path).await;
+        let new_storage = s.add_sandbox_storage(tmpdir_path, false).await;
 
         // Check the reference counter
         let ref_count = new_storage.ref_count().await;
         assert_eq!(
             ref_count, 1,
-            "Invalid refcount, got {} expected 1.",
-            ref_count
+            "Invalid refcount, got {ref_count} expected 1."
         );
 
         // Use the existing sandbox storage
-        let new_storage = s.add_sandbox_storage(tmpdir_path).await;
+        let new_storage = s.add_sandbox_storage(tmpdir_path, false).await;
 
         // Since we are using existing storage, the reference counter
         // should be 2 by now.
         let ref_count = new_storage.ref_count().await;
         assert_eq!(
             ref_count, 2,
-            "Invalid refcount, got {} expected 2.",
-            ref_count
+            "Invalid refcount, got {ref_count} expected 2."
         );
     }
 
@@ -582,7 +802,7 @@ mod tests {
 
         assert!(bind_mount(srcdir_path, destdir_path, &logger).is_ok());
 
-        s.add_sandbox_storage(destdir_path).await;
+        s.add_sandbox_storage(destdir_path, false).await;
         let storage = StorageDeviceGeneric::new(destdir_path.to_string());
         assert!(s
             .update_sandbox_storage(destdir_path, Arc::new(storage))
@@ -600,7 +820,7 @@ mod tests {
             let other_dir_path = other_dir.path().to_str().unwrap();
             other_dir_str = other_dir_path.to_string();
 
-            s.add_sandbox_storage(other_dir_path).await;
+            s.add_sandbox_storage(other_dir_path, false).await;
             let storage = StorageDeviceGeneric::new(other_dir_path.to_string());
             assert!(s
                 .update_sandbox_storage(other_dir_path, Arc::new(storage))
@@ -619,9 +839,9 @@ mod tests {
         let storage_path = "/tmp/testEphe";
 
         // Add a new sandbox storage
-        s.add_sandbox_storage(storage_path).await;
+        s.add_sandbox_storage(storage_path, false).await;
         // Use the existing sandbox storage
-        let state = s.add_sandbox_storage(storage_path).await;
+        let state = s.add_sandbox_storage(storage_path, false).await;
         assert!(
             state.ref_count().await > 1,
             "Expects false as the storage is not new."
@@ -635,11 +855,7 @@ mod tests {
         // Reference counter should decrement to 1.
         let storage = &s.storages[storage_path];
         let refcount = storage.ref_count().await;
-        assert_eq!(
-            refcount, 1,
-            "Invalid refcount, got {} expected 1.",
-            refcount
-        );
+        assert_eq!(refcount, 1, "Invalid refcount, got {refcount} expected 1.");
 
         assert!(
             s.remove_sandbox_storage(storage_path).await.unwrap(),
@@ -664,16 +880,38 @@ mod tests {
     }
 
     fn create_dummy_opts() -> CreateOpts {
-        let root = Root {
-            path: String::from("/"),
-            ..Default::default()
-        };
+        let start = SystemTime::now();
+        let since_the_epoch = start
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards");
 
-        let spec = Spec {
-            linux: Some(Linux::default()),
-            root: Some(root),
-            ..Default::default()
-        };
+        let mut root = Root::default();
+        root.set_path(PathBuf::from("/"));
+
+        let mut cgroup = LinuxDeviceCgroup::default();
+        cgroup.set_allow(true);
+        cgroup.set_access(Some(String::from("rwm")));
+
+        let mut linux_resources = LinuxResources::default();
+        linux_resources.set_devices(Some(vec![cgroup]));
+
+        let cgroups_path = format!(
+            "/{}/dummycontainer{}",
+            CGROUP_PARENT,
+            since_the_epoch.as_micros()
+        );
+
+        let spec = SpecBuilder::default()
+            .linux(
+                LinuxBuilder::default()
+                    .cgroups_path(cgroups_path)
+                    .resources(linux_resources)
+                    .build()
+                    .unwrap(),
+            )
+            .root(root)
+            .build()
+            .unwrap();
 
         CreateOpts {
             cgroup_name: "".to_string(),
@@ -683,6 +921,7 @@ mod tests {
             spec: Some(spec),
             rootless_euid: false,
             rootless_cgroup: false,
+            container_name: "".to_string(),
         }
     }
 
@@ -692,22 +931,24 @@ mod tests {
             .map_err(|e| anyhow!(e).context("tempdir failed"))
             .unwrap();
 
-        // Create a new container
-        (
-            LinuxContainer::new(
-                "some_id",
-                dir.path().join("rootfs").to_str().unwrap(),
-                create_dummy_opts(),
-                &slog_scope::logger(),
-            )
-            .unwrap(),
-            dir,
+        let container = LinuxContainer::new(
+            "some_id",
+            dir.path().join("rootfs").to_str().unwrap(),
+            None,
+            create_dummy_opts(),
+            &slog_scope::logger(),
         )
+        .unwrap();
+
+        // Create a new container
+        (container, dir)
     }
 
     #[tokio::test]
     #[serial]
     async fn get_container_entry_exist() {
+        skip_if_not_root!();
+
         let logger = slog::Logger::root(slog::Discard, o!());
         let mut s = Sandbox::new(&logger).unwrap();
         let (linux_container, _root) = create_linuxcontainer();
@@ -730,7 +971,10 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    #[cfg(not(target_arch = "powerpc64"))]
     async fn add_and_get_container() {
+        skip_if_not_root!();
+
         let logger = slog::Logger::root(slog::Discard, o!());
         let mut s = Sandbox::new(&logger).unwrap();
         let (linux_container, _root) = create_linuxcontainer();
@@ -742,6 +986,8 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn update_shared_pidns() {
+        skip_if_not_root!();
+
         let logger = slog::Logger::root(slog::Discard, o!());
         let mut s = Sandbox::new(&logger).unwrap();
         let test_pid = 9999;
@@ -753,7 +999,7 @@ mod tests {
 
         assert!(s.sandbox_pidns.is_some());
 
-        let ns_path = format!("/proc/{}/ns/pid", test_pid);
+        let ns_path = format!("/proc/{test_pid}/ns/pid");
         assert_eq!(s.sandbox_pidns.unwrap().path, ns_path);
     }
 
@@ -776,9 +1022,18 @@ mod tests {
 
         assert!(s.add_hooks(tmpdir_path).is_ok());
         assert!(s.hooks.is_some());
-        assert!(s.hooks.as_ref().unwrap().prestart.len() == 1);
-        assert!(s.hooks.as_ref().unwrap().poststart.is_empty());
-        assert!(s.hooks.as_ref().unwrap().poststop.is_empty());
+        assert!(s.hooks.as_ref().unwrap().prestart().clone().unwrap().len() == 1);
+        // As we don't create poststart/xxx, the poststart will be none
+        assert!(s.hooks.as_ref().unwrap().poststart().clone().is_none());
+        // poststop path is created but as the problem of file perm is rejected.
+        assert!(s
+            .hooks
+            .as_ref()
+            .unwrap()
+            .poststop()
+            .clone()
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -791,7 +1046,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(not(target_arch = "powerpc64"))]
     async fn test_find_container_process() {
+        skip_if_not_root!();
+
         let logger = slog::Logger::root(slog::Discard, o!());
         let mut s = Sandbox::new(&logger).unwrap();
         let cid = "container-123";
@@ -800,15 +1058,26 @@ mod tests {
         linux_container.init_process_pid = 1;
         linux_container.id = cid.to_string();
         // add init process
-        linux_container.processes.insert(
-            1,
-            Process::new(&logger, &oci::Process::default(), "1", true, 1).unwrap(),
-        );
+        let mut init_process =
+            Process::new(&logger, &oci::Process::default(), "1", true, 1, None).unwrap();
+        init_process.pid = 1;
+        linux_container
+            .processes
+            .insert("1".to_string(), init_process);
         // add exec process
-        linux_container.processes.insert(
-            123,
-            Process::new(&logger, &oci::Process::default(), "exec-123", false, 1).unwrap(),
-        );
+        let mut exec_process = Process::new(
+            &logger,
+            &oci::Process::default(),
+            "exec-123",
+            false,
+            1,
+            None,
+        )
+        .unwrap();
+        exec_process.pid = 123;
+        linux_container
+            .processes
+            .insert("exec-123".to_string(), exec_process);
 
         s.add_container(linux_container);
 
@@ -836,10 +1105,13 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(not(target_arch = "powerpc64"))]
     async fn test_find_process() {
+        skip_if_not_root!();
+
         let logger = slog::Logger::root(slog::Discard, o!());
 
-        let test_pids = [std::i32::MIN, -1, 0, 1, std::i32::MAX];
+        let test_pids = [i32::MIN, -1, 0, 1, i32::MAX];
 
         for test_pid in test_pids {
             let mut s = Sandbox::new(&logger).unwrap();
@@ -851,12 +1123,13 @@ mod tests {
                 "this_is_a_test_process",
                 true,
                 1,
+                None,
             )
             .unwrap();
             // processes interally only have pids when manually set
             test_process.pid = test_pid;
-
-            linux_container.processes.insert(test_pid, test_process);
+            let test_exec_id = test_process.exec_id.clone();
+            linux_container.processes.insert(test_exec_id, test_process);
 
             s.add_container(linux_container);
 
@@ -1038,7 +1311,7 @@ mod tests {
         let tmpdir_path = tmpdir.path().to_str().unwrap();
 
         for (i, d) in tests.iter().enumerate() {
-            let current_test_dir_path = format!("{}/test_{}", tmpdir_path, i);
+            let current_test_dir_path = format!("{tmpdir_path}/test_{i}");
             fs::create_dir(&current_test_dir_path).unwrap();
 
             // create numbered directories and fill using root name
@@ -1047,7 +1320,7 @@ mod tests {
                     "{}/{}{}",
                     current_test_dir_path, d.directory_autogen_name, j
                 );
-                let subfile_path = format!("{}/{}", subdir_path, SYSFS_ONLINE_FILE);
+                let subfile_path = format!("{subdir_path}/{SYSFS_ONLINE_FILE}");
                 fs::create_dir(&subdir_path).unwrap();
                 let mut subfile = File::create(subfile_path).unwrap();
                 subfile.write_all(b"0").unwrap();
@@ -1074,18 +1347,15 @@ mod tests {
                 result.is_ok()
             );
 
-            assert_eq!(result.is_ok(), d.result.is_ok(), "{}", msg);
+            assert_eq!(result.is_ok(), d.result.is_ok(), "{msg}");
 
             if d.result.is_ok() {
                 let test_result_val = *d.result.as_ref().ok().unwrap();
                 let result_val = result.ok().unwrap();
 
-                msg = format!(
-                    "test[{}]: {:?}, expected {}, actual {}",
-                    i, d, test_result_val, result_val
-                );
+                msg = format!("test[{i}]: {d:?}, expected {test_result_val}, actual {result_val}");
 
-                assert_eq!(test_result_val, result_val, "{}", msg);
+                assert_eq!(test_result_val, result_val, "{msg}");
             }
         }
     }

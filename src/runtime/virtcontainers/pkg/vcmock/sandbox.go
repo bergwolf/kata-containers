@@ -231,7 +231,7 @@ func (s *Sandbox) UpdateRuntimeMetrics() error {
 // GetAgentMetrics implements the VCSandbox function of the same name.
 func (s *Sandbox) GetAgentMetrics(ctx context.Context) (string, error) {
 	if s.GetAgentMetricsFunc != nil {
-		return s.GetAgentMetricsFunc()
+		return s.GetAgentMetricsFunc(ctx)
 	}
 	return "", nil
 }
@@ -255,6 +255,10 @@ func (s *Sandbox) GetHypervisorPid() (int, error) {
 	return 0, nil
 }
 
+func (s *Sandbox) RescanNetwork(ctx context.Context) error {
+	return nil
+}
+
 func (s *Sandbox) GuestVolumeStats(ctx context.Context, path string) ([]byte, error) {
 	return nil, nil
 }
@@ -267,5 +271,9 @@ func (s *Sandbox) GetIPTables(ctx context.Context, isIPv6 bool) ([]byte, error) 
 }
 
 func (s *Sandbox) SetIPTables(ctx context.Context, isIPv6 bool, data []byte) error {
+	return nil
+}
+
+func (s *Sandbox) SetPolicy(ctx context.Context, policy string) error {
 	return nil
 }

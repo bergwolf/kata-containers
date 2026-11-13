@@ -8,12 +8,14 @@ mod hybrid_vsock;
 pub use hybrid_vsock::HybridVsock;
 mod vsock;
 pub use vsock::Vsock;
+mod remote;
+pub use remote::Remote;
 
 use std::{
     pin::Pin,
     task::{Context as TaskContext, Poll},
     {
-        os::unix::{io::IntoRawFd, prelude::RawFd},
+        os::unix::io::{AsRawFd, RawFd},
         sync::Arc,
     },
 };
@@ -24,10 +26,12 @@ use tokio::{
     io::{AsyncRead, ReadBuf},
     net::UnixStream,
 };
+use ttrpc::asynchronous::transport::Socket as TtrpcSocket;
 use url::Url;
 
 const VSOCK_SCHEME: &str = "vsock";
 const HYBRID_VSOCK_SCHEME: &str = "hvsock";
+const REMOTE_SCHEME: &str = "remote";
 
 /// Socket stream
 pub enum Stream {
@@ -50,18 +54,15 @@ impl Stream {
             Stream::Unix(stream) | Stream::Vsock(stream) => Pin::new(stream).poll_read(cx, buf),
         }
     }
-}
-
-impl IntoRawFd for Stream {
-    fn into_raw_fd(self) -> RawFd {
+    pub(crate) fn raw_fd(&self) -> RawFd {
         match self {
-            Stream::Unix(stream) | Stream::Vsock(stream) => match stream.into_std() {
-                Ok(stream) => stream.into_raw_fd(),
-                Err(err) => {
-                    error!(sl!(), "failed to into std unix stream {:?}", err);
-                    -1
-                }
-            },
+            Stream::Unix(stream) | Stream::Vsock(stream) => stream.as_raw_fd(),
+        }
+    }
+
+    pub(crate) fn into_ttrpc_socket(self) -> TtrpcSocket {
+        match self {
+            Stream::Unix(stream) | Stream::Vsock(stream) => TtrpcSocket::from(stream),
         }
     }
 }
@@ -87,9 +88,14 @@ pub struct ConnectConfig {
 
 impl ConnectConfig {
     pub fn new(dial_timeout_ms: u64, reconnect_timeout_ms: u64) -> Self {
+        // With static sandbox resource sizing enabled by default, tiny CPU
+        // allocations can make early guest boot/agent startup exceed 3s on
+        // loaded nodes. Keep a reasonable lower bound to avoid premature
+        // sandbox teardown during agent bring-up.
+        const MIN_RECONNECT_TIMEOUT_MS: u64 = 10_000;
         Self {
             dial_timeout_ms,
-            reconnect_timeout_ms,
+            reconnect_timeout_ms: reconnect_timeout_ms.max(MIN_RECONNECT_TIMEOUT_MS),
         }
     }
 }
@@ -98,10 +104,11 @@ impl ConnectConfig {
 enum SockType {
     Vsock(Vsock),
     HybridVsock(HybridVsock),
+    Remote(Remote),
 }
 
 #[async_trait]
-pub trait Sock: Send + Sync {
+pub trait Sock: Send + Sync + std::fmt::Debug {
     async fn connect(&self, config: &ConnectConfig) -> Result<Stream>;
 }
 
@@ -114,6 +121,7 @@ pub fn new(address: &str, port: u32) -> Result<Arc<dyn Sock>> {
     match parse(address, port).context("parse url")? {
         SockType::Vsock(sock) => Ok(Arc::new(sock)),
         SockType::HybridVsock(sock) => Ok(Arc::new(sock)),
+        SockType::Remote(sock) => Ok(Arc::new(sock)),
     }
 }
 
@@ -135,6 +143,13 @@ fn parse(address: &str, port: u32) -> Result<SockType> {
             }
             let uds = path[0];
             Ok(SockType::HybridVsock(HybridVsock::new(uds, port)))
+        }
+        REMOTE_SCHEME => {
+            let path: Vec<&str> = url.path().split(':').collect();
+            if path.len() != 1 {
+                return Err(anyhow!("invalid path {:?}", path));
+            }
+            Ok(SockType::Remote(Remote::new(path[0].to_string())))
         }
         _ => Err(anyhow!("Unsupported scheme")),
     }

@@ -10,8 +10,9 @@ metadata:
   labels:
     app: tcp-liveness
 spec:
-  terminationGracePeriodSeconds: 0
   runtimeClassName: kata
+  securityContext:
+    supplementalGroups: [1, 2, 3, 4, 6, 10, 11, 20, 26, 27]
   containers:
   - name: tcp-liveness
     image: ${agnhost_image}

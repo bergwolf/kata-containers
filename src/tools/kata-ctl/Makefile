@@ -13,7 +13,7 @@ TARGET = $(PROJECT_COMPONENT)
 INSTALL_PATH = $(HOME)/.cargo
 
 VERSION_FILE := ./VERSION
-export VERSION := $(shell grep -v ^\# $(VERSION_FILE))
+export VERSION := $(shell grep -v ^\# $(VERSION_FILE) 2>/dev/null || echo "unknown")
 COMMIT_NO := $(shell git rev-parse HEAD 2>/dev/null || true)
 COMMIT_NO_SHORT := $(shell git rev-parse --short HEAD 2>/dev/null || true)
 export COMMIT := $(if $(shell git status --porcelain --untracked-files=no 2>/dev/null || true),${COMMIT_NO}-dirty,${COMMIT_NO})
@@ -30,14 +30,30 @@ GENERATED_REPLACEMENTS= \
 
 GENERATED_FILES := $(GENERATED_CODE)
 
+EXTRA_RUSTFEATURES :=
+
+ifeq ($(USE_BUILTIN_DB),true)
+    EXTRA_RUSTFEATURES += dragonball
+endif
+
+ifneq ($(EXTRA_RUSTFEATURES),)
+    override EXTRA_RUSTFEATURES := --features $(EXTRA_RUSTFEATURES)
+endif
+
 .DEFAULT_GOAL := default
+
+ifeq ($(ARCH), ppc64le)
+default build check test:
+	@echo "Building kata-ctl on $(ARCH) is currently being skipped"
+	exit 0
+else
 
 default: $(TARGET) build
 
 $(TARGET): $(GENERATED_CODE)
 
 build:
-	@RUSTFLAGS="$(EXTRA_RUSTFLAGS) --deny warnings" cargo build --target $(TRIPLE) $(if $(findstring release,$(BUILD_TYPE)),--release) $(EXTRA_RUSTFEATURES)
+	@RUSTFLAGS="$(EXTRA_RUSTFLAGS) --deny warnings" cargo build -p kata-ctl --target $(TRIPLE) $(if $(findstring release,$(BUILD_TYPE)),--release) $(EXTRA_RUSTFEATURES)
 
 static-checks-build: $(GENERATED_CODE)
 
@@ -49,21 +65,19 @@ clean:
 	@cargo clean
 	@rm -f $(GENERATED_FILES)
 
-vendor:
-	cargo vendor
-
 test: $(GENERATED_CODE)
-	@RUSTFLAGS="$(EXTRA_RUSTFLAGS) --deny warnings" cargo test --target $(TRIPLE) $(if $(findstring release,$(BUILD_TYPE)),--release) $(EXTRA_RUSTFEATURES) -- --nocapture
+	@RUSTFLAGS="$(EXTRA_RUSTFLAGS) --deny warnings" cargo test -p kata-ctl --target $(TRIPLE) $(if $(findstring release,$(BUILD_TYPE)),--release) $(EXTRA_RUSTFEATURES) -- --nocapture
 
 install:
-	@RUSTFLAGS="$(EXTRA_RUSTFLAGS) --deny warnings" cargo install --locked --target $(TRIPLE) --path . --root $(INSTALL_PATH)
+	@RUSTFLAGS="$(EXTRA_RUSTFLAGS) --deny warnings" cargo install --locked --target $(TRIPLE) --path . --root $(INSTALL_PATH) $(EXTRA_RUSTFEATURES)
 
 check: $(GENERATED_CODE) standard_rust_check
+
+endif
 
 .PHONY: \
 	build \
 	check \
 	clean \
 	install \
-	test \
-	vendor
+	test

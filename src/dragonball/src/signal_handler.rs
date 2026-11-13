@@ -1,11 +1,12 @@
 // Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use dbs_utils::metric::IncMetric;
 use libc::{_exit, c_int, c_void, siginfo_t, SIGBUS, SIGSEGV, SIGSYS};
 use log::error;
 use vmm_sys_util::signal::register_signal_handler;
 
-use crate::metric::{IncMetric, METRICS};
+use crate::metric::METRICS;
 
 // The offset of `si_syscall` (offending syscall identifier) within the siginfo structure
 // expressed as an `(u)int*`.
@@ -51,11 +52,8 @@ extern "C" fn sigsys_handler(num: c_int, info: *mut siginfo_t, _unused: *mut c_v
     let syscall = unsafe { *(info as *const i32).offset(SI_OFF_SYSCALL) as usize };
     // SIGSYS is triggered when bad syscalls are detected. num_faults is only added when SIGSYS is detected
     // so it actually only collects the count for bad syscalls.
-    METRICS.seccomp.num_faults.inc();
-    error!(
-        "Shutting down VM after intercepting a bad syscall ({}).",
-        syscall
-    );
+    METRICS.read().unwrap().seccomp.num_faults.inc();
+    error!("Shutting down VM after intercepting a bad syscall ({syscall}).");
 
     // Safe because we're terminating the process anyway. We don't actually do anything when
     // running unit tests.
@@ -82,15 +80,12 @@ extern "C" fn sigbus_sigsegv_handler(num: c_int, info: *mut siginfo_t, _unused: 
     // Other signals which might do async unsafe things incompatible with the rest of this
     // function are blocked due to the sa_mask used when registering the signal handler.
     match si_signo {
-        SIGBUS => METRICS.signals.sigbus.inc(),
-        SIGSEGV => METRICS.signals.sigsegv.inc(),
+        SIGBUS => METRICS.read().unwrap().signals.sigbus.inc(),
+        SIGSEGV => METRICS.read().unwrap().signals.sigsegv.inc(),
         _ => (),
     }
 
-    error!(
-        "Shutting down VM after intercepting signal {}, code {}.",
-        si_signo, si_code
-    );
+    error!("Shutting down VM after intercepting signal {si_signo}, code {si_code}.");
 
     // Safe because we're terminating the process anyway. We don't actually do anything when
     // running unit tests.
@@ -125,7 +120,7 @@ mod tests {
 
     use libc::{cpu_set_t, syscall};
     use std::convert::TryInto;
-    use std::{mem, process, thread};
+    use std::{mem, thread};
 
     use seccompiler::{apply_filter, BpfProgram, SeccompAction, SeccompFilter};
 
@@ -155,49 +150,36 @@ mod tests {
 
     #[test]
     fn test_signal_handler() {
+        // When METRICS initializes lazy, it will call the call_once to add locks.
+        // If the signal interrupts the initialization process, initializing again the
+        // metrics in the signal interrupt handler will cause a deadlock.
+        lazy_static::initialize(&METRICS);
         let child = thread::spawn(move || {
             assert!(register_signal_handlers().is_ok());
 
+            // Trigger SIGBUS/SIGSEGV *before* installing the seccomp filter.
+            // Call SIGBUS signal handler.
+            assert_eq!(METRICS.read().unwrap().signals.sigbus.count(), 0);
+            unsafe { libc::raise(SIGBUS) };
+
+            // Call SIGSEGV signal handler.
+            assert_eq!(METRICS.read().unwrap().signals.sigsegv.count(), 0);
+            unsafe { libc::raise(SIGSEGV) };
+
+            // Install a seccomp filter that traps a known syscall so that we can verify SIGSYS handling.
             let filter = SeccompFilter::new(
-                vec![
-                    (libc::SYS_brk, vec![]),
-                    (libc::SYS_exit, vec![]),
-                    (libc::SYS_futex, vec![]),
-                    (libc::SYS_getpid, vec![]),
-                    (libc::SYS_munmap, vec![]),
-                    (libc::SYS_kill, vec![]),
-                    (libc::SYS_rt_sigprocmask, vec![]),
-                    (libc::SYS_rt_sigreturn, vec![]),
-                    (libc::SYS_sched_getaffinity, vec![]),
-                    (libc::SYS_set_tid_address, vec![]),
-                    (libc::SYS_sigaltstack, vec![]),
-                    (libc::SYS_write, vec![]),
-                ]
-                .into_iter()
-                .collect(),
-                SeccompAction::Trap,
+                vec![(libc::SYS_mkdirat, vec![])].into_iter().collect(),
                 SeccompAction::Allow,
+                SeccompAction::Trap,
                 std::env::consts::ARCH.try_into().unwrap(),
             )
             .unwrap();
 
             assert!(apply_filter(&TryInto::<BpfProgram>::try_into(filter).unwrap()).is_ok());
-            assert_eq!(METRICS.seccomp.num_faults.count(), 0);
+            assert_eq!(METRICS.read().unwrap().seccomp.num_faults.count(), 0);
 
-            // Call the blacklisted `SYS_mkdirat`.
+            // Invoke the blacklisted syscall to trigger SIGSYS and exercise the SIGSYS handler.
             unsafe { syscall(libc::SYS_mkdirat, "/foo/bar\0") };
-
-            // Call SIGBUS signal handler.
-            assert_eq!(METRICS.signals.sigbus.count(), 0);
-            unsafe {
-                syscall(libc::SYS_kill, process::id(), SIGBUS);
-            }
-
-            // Call SIGSEGV signal handler.
-            assert_eq!(METRICS.signals.sigsegv.count(), 0);
-            unsafe {
-                syscall(libc::SYS_kill, process::id(), SIGSEGV);
-            }
         });
         assert!(child.join().is_ok());
 
@@ -211,9 +193,9 @@ mod tests {
         // tests, so we use this as an heuristic to decide if we check the assertion.
         if cpu_count() > 1 {
             // The signal handler should let the program continue during unit tests.
-            assert!(METRICS.seccomp.num_faults.count() >= 1);
+            assert!(METRICS.read().unwrap().seccomp.num_faults.count() >= 1);
         }
-        assert!(METRICS.signals.sigbus.count() >= 1);
-        assert!(METRICS.signals.sigsegv.count() >= 1);
+        assert!(METRICS.read().unwrap().signals.sigbus.count() >= 1);
+        assert!(METRICS.read().unwrap().signals.sigsegv.count() >= 1);
     }
 }

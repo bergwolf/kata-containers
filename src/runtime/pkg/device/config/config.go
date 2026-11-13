@@ -13,8 +13,11 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/container-orchestrated-devices/container-device-interface/pkg/cdi"
 	"github.com/go-ini/ini"
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/device"
 	vcTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
+	"github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
 )
 
@@ -227,13 +230,22 @@ func (p PCIePort) Valid() bool {
 	return false
 }
 
-type PCIePortMapping map[string]bool
-
 var (
 	// Each of this structures keeps track of the devices attached to the
 	// different types of PCI ports. We can deduces the Bus number from it
 	// and eliminate duplicates being assigned.
-	PCIeDevices = map[PCIePort]PCIePortMapping{}
+	PCIeDevicesPerPort = map[PCIePort][]VFIODev{}
+
+	// NUMARootPorts maps host NUMA node IDs to root port IDs on pxb-pcie
+	// bridges.  When NUMA-aware PCIe topology is active (pxb-pcie),
+	// createPCIeTopology populates this so VFIODevice.Attach() can assign
+	// each device to the root port on its host NUMA node's pxb-pcie bus.
+	// Key: host NUMA node ID, Value: slice of root port IDs on that node's pxb.
+	NUMARootPorts = map[int][]string{}
+
+	// NUMARootPortDeviceCount tracks how many devices have been assigned
+	// to each host NUMA node's root ports (for round-robin assignment).
+	NUMARootPortDeviceCount = map[int]int{}
 )
 
 // DeviceInfo is an embedded type that contains device data common to all types of devices.
@@ -277,6 +289,9 @@ type DeviceInfo struct {
 
 	// If applicable, should this device be considered RO
 	ReadOnly bool
+
+	// DiscardUnmap enables discard/unmap support for this block device.
+	DiscardUnmap bool
 
 	// ColdPlug specifies whether the device must be cold plugged (true)
 	// or hot plugged (false).
@@ -325,6 +340,9 @@ type BlockDrive struct {
 
 	// ReadOnly sets the device file readonly
 	ReadOnly bool
+
+	// DiscardUnmap enables discard/unmap support for this block device.
+	DiscardUnmap bool
 
 	// Pmem enables persistent memory. Use File as backing file
 	// for a nvdimm device in the guest
@@ -396,6 +414,9 @@ type VFIODev struct {
 	// sysfsdev of VFIO mediated device
 	SysfsDev string
 
+	// DevfsDev is used to identify a VFIO Group device or IOMMMUFD VFIO device
+	DevfsDev string
+
 	// VendorID specifies vendor id
 	VendorID string
 
@@ -414,17 +435,32 @@ type VFIODev struct {
 	// Type of VFIO device
 	Type VFIODeviceType
 
+	// NUMANode is the host NUMA node this device is attached to.
+	// -1 means no affinity or unknown.
+	NUMANode int
+
 	// IsPCIe specifies device is PCIe or PCI
 	IsPCIe bool
 
 	// APDevices are the Adjunct Processor devices assigned to the mdev
 	APDevices []string
 
-	// Rank identifies a device in a IOMMU group
-	Rank int
-
 	// Port is the PCIe port type to which the device is attached
 	Port PCIePort
+
+	// HostPath is the path to the device on the host we need it as a reference
+	// to match a /dev/vfio/<num> device to a device in GK mode
+	HostPath string
+}
+
+// IOMMUFDID returns the IOMMUFD ID if the VFIO device is backed by IOMMUFD
+// otherwise returns an empty string.
+func (t VFIODev) IOMMUFDID() string {
+	if !strings.HasPrefix(t.DevfsDev, device.IommufdDevPath) {
+		return ""
+	}
+	basename := filepath.Base(t.DevfsDev)
+	return strings.TrimPrefix(basename, "vfio")
 }
 
 // RNGDev represents a random number generator device
@@ -433,6 +469,14 @@ type RNGDev struct {
 	ID string
 	// Filename is the file to use as entropy source.
 	Filename string
+}
+
+// BalloonDev represents a balloon device
+type BalloonDev struct {
+	ID                string
+	DeflateOnOOM      bool
+	DisableModern     bool
+	FreePageReporting bool
 }
 
 // VhostUserDeviceAttrs represents data shared by most vhost-user devices
@@ -642,4 +686,71 @@ type DeviceState struct {
 	// ColdPlug specifies whether the device must be cold plugged (true)
 	// or hot plugged (false).
 	ColdPlug bool
+}
+
+// CDI (Container Device Interface), is a specification, for container- runtimes,
+// to support third-party devices.
+// It introduces an abstract notion of a device as a resource. Such devices are
+// uniquely specified by a fully-qualified name that is constructed from a
+// vendor ID, a device class, and a name that is unique per vendor ID-device
+// class pair.
+//
+// vendor.com/class=unique_name
+//
+// The combination of vendor ID and device class (vendor.com/class in the
+// above example) is referred to as the device kind.
+// CDI concerns itself only with enabling containers to be device aware.
+// Areas like resource management are explicitly left out of CDI (and are
+// expected to be handled by the orchestrator). Because of this focus, the CDI
+// specification is simple to implement and allows great flexibility for
+// runtimes and orchestrators.
+func WithCDI(annotations map[string]string, cdiSpecDirs []string, spec *specs.Spec) (*specs.Spec, error) {
+	// Add devices from CDI annotations
+	_, devsFromAnnotations, err := cdi.ParseAnnotations(annotations)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse CDI device annotations: %w", err)
+	}
+
+	if len(devsFromAnnotations) == 0 {
+		// No devices found, skip device injection
+		return spec, nil
+	}
+
+	if err = injectDevices(cdiSpecDirs, spec, devsFromAnnotations); err != nil {
+		return nil, err
+	}
+
+	// One crucial thing to keep in mind is that CDI device injection
+	// might add OCI Spec environment variables, hooks, and mounts as
+	// well. Therefore it is important that none of the corresponding
+	// OCI Spec fields are reset up in the call stack once we return.
+	return spec, nil
+}
+
+// InjectCDIDevices injects the specified devices into the oci spec.
+// Devices must be a slice of strings of the form
+// vendor.com/class=unique_name
+func InjectCDIDevices(spec *specs.Spec, devices []string) error {
+	return injectDevices(nil, spec, devices)
+}
+
+func injectDevices(cdiSpecDirs []string, spec *specs.Spec, devices []string) error {
+	var registry cdi.Registry
+	if len(cdiSpecDirs) > 0 {
+		// We can override the directories where to search for CDI specs
+		// if needed, the default is /etc/cdi /var/run/cdi
+		registry = cdi.GetRegistry(cdi.WithSpecDirs(cdiSpecDirs...))
+	} else {
+		registry = cdi.GetRegistry()
+	}
+
+	if err := registry.Refresh(); err != nil {
+		return fmt.Errorf("CDI registry refresh failed: %w", err)
+	}
+
+	if _, err := registry.InjectDevices(spec, devices...); err != nil {
+		return fmt.Errorf("CDI device injection failed: %w", err)
+	}
+
+	return nil
 }

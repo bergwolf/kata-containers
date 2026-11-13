@@ -7,7 +7,7 @@
 use std::{
     fs,
     io::Write,
-    os::unix::{io::IntoRawFd, prelude::OsStrExt},
+    os::unix::{io::IntoRawFd, net::UnixStream, prelude::OsStrExt},
     path::{Path, PathBuf},
 };
 
@@ -17,7 +17,7 @@ use kata_types::{container::ContainerType, k8s};
 use unix_socket::UnixListener;
 
 use crate::{
-    shim::{ShimExecutor, ENV_KATA_RUNTIME_BIND_FD},
+    shim::{socket_path, ShimExecutor, ENV_KATA_RUNTIME_BIND_FD},
     Error,
 };
 
@@ -34,8 +34,13 @@ impl ShimExecutor {
 
     fn do_start(&mut self) -> Result<PathBuf> {
         let bundle_path = get_bundle_path().context("get bundle path")?;
-        let spec = self.load_oci_spec(&bundle_path)?;
-        let (container_type, id) = k8s::container_type_with_id(&spec);
+
+        let mut container_type = ContainerType::PodSandbox;
+        let mut id = None;
+
+        if let Ok(spec) = self.load_oci_spec(&bundle_path) {
+            (container_type, id) = k8s::container_type_with_id(&spec);
+        }
 
         match container_type {
             ContainerType::PodSandbox | ContainerType::SingleContainer => {
@@ -50,8 +55,7 @@ impl ShimExecutor {
                 let sid = id
                     .ok_or(Error::InvalidArgument)
                     .context("get sid for container")?;
-                let (address, pid) = self.get_shim_info_from_sandbox(&sid)?;
-                self.write_pid_file(&bundle_path, pid)?;
+                let address = self.socket_address(&sid).context("socket address")?;
                 self.write_address(&bundle_path, &address)?;
                 Ok(address)
             }
@@ -61,7 +65,6 @@ impl ShimExecutor {
     fn new_command(&self) -> Result<std::process::Command> {
         if self.args.id.is_empty()
             || self.args.namespace.is_empty()
-            || self.args.address.is_empty()
             || self.args.publish_binary.is_empty()
         {
             return Err(anyhow!("invalid param"));
@@ -106,33 +109,28 @@ impl ShimExecutor {
 
         Ok(child.id())
     }
-
-    fn get_shim_info_from_sandbox(&self, sandbox_id: &str) -> Result<(PathBuf, u32)> {
-        // All containers of a pod share the same pod socket address.
-        let address = self.socket_address(sandbox_id).context("socket address")?;
-        let bundle_path = get_bundle_path().context("get bundle path")?;
-        let parent_bundle_path = Path::new(&bundle_path)
-            .parent()
-            .unwrap_or_else(|| Path::new(""));
-        let sandbox_bundle_path = parent_bundle_path
-            .join(sandbox_id)
-            .canonicalize()
-            .context(Error::GetBundlePath)?;
-        let pid = self.read_pid_file(&sandbox_bundle_path)?;
-
-        Ok((address, pid))
-    }
 }
 
 fn new_listener(address: &Path) -> Result<UnixListener> {
-    let trim_path = address.strip_prefix("unix:").context("trim path")?;
-    let file_path = Path::new("/").join(trim_path);
+    let file_path = socket_path(address)?;
     let file_path = file_path.as_path();
     if let Some(parent_dir) = file_path.parent() {
         fs::create_dir_all(parent_dir).context("create parent dir")?;
     }
 
-    UnixListener::bind(file_path).context("bind address")
+    match UnixListener::bind(file_path) {
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            // The socket file of a shim that exited without cleaning up stays
+            // at the address and makes every later start of the same sandbox
+            // fail. Only a live shim accepts connections, so leave it alone.
+            if UnixStream::connect(file_path).is_ok() {
+                return Err(e).context("bind address: socket in use by a running shim");
+            }
+            fs::remove_file(file_path).context("remove stale socket")?;
+            UnixListener::bind(file_path).context("bind address after removing stale socket")
+        }
+        res => res.context("bind address"),
+    }
 }
 
 #[cfg(test)]
@@ -140,7 +138,6 @@ mod tests {
     use std::path::Path;
 
     use serial_test::serial;
-    use tests_utils::gen_id;
 
     use super::*;
     use crate::Args;
@@ -176,50 +173,6 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_get_info_from_sandbox() {
-        let dir = tempfile::tempdir().unwrap();
-        let sandbox_id = gen_id(16);
-        let bundle_path = &dir.path().join(&sandbox_id);
-        std::fs::create_dir(bundle_path).unwrap();
-        std::env::set_current_dir(bundle_path).unwrap();
-
-        let args = Args {
-            id: sandbox_id.to_owned(),
-            namespace: "default_namespace".into(),
-            address: "default_address".into(),
-            publish_binary: "containerd".into(),
-            bundle: bundle_path.to_str().unwrap().into(),
-            ..Default::default()
-        };
-        let executor = ShimExecutor::new(args);
-
-        let addr = executor.socket_address(&executor.args.id).unwrap();
-        executor.write_address(bundle_path, &addr).unwrap();
-        executor.write_pid_file(bundle_path, 1267).unwrap();
-
-        let container_id = gen_id(16);
-        let bundle_path2 = &dir.path().join(&container_id);
-        std::fs::create_dir(bundle_path2).unwrap();
-        std::env::set_current_dir(bundle_path2).unwrap();
-
-        let args = Args {
-            id: container_id,
-            namespace: "default_namespace".into(),
-            address: "default_address".into(),
-            publish_binary: "containerd".into(),
-            bundle: bundle_path2.to_str().unwrap().into(),
-            ..Default::default()
-        };
-        let executor2 = ShimExecutor::new(args);
-
-        let (address, pid) = executor2.get_shim_info_from_sandbox(&sandbox_id).unwrap();
-
-        assert_eq!(pid, 1267);
-        assert_eq!(&address, &addr);
-    }
-
-    #[test]
-    #[serial]
     fn test_new_listener() {
         let path = "/tmp/aaabbbccc";
         let uds_path = format!("unix://{}", path);
@@ -227,5 +180,31 @@ mod tests {
 
         let _ = new_listener(Path::new(&uds_path)).unwrap();
         std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn test_new_listener_stale_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stale.sock");
+        let uds_path = format!("unix://{}", path.display());
+
+        // A listener that is dropped leaves its socket file behind, like a shim
+        // that exited without cleaning up.
+        drop(new_listener(Path::new(&uds_path)).unwrap());
+        assert!(path.exists());
+
+        let _listener = new_listener(Path::new(&uds_path)).unwrap();
+    }
+
+    #[test]
+    fn test_new_listener_live_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("live.sock");
+        let uds_path = format!("unix://{}", path.display());
+
+        let _live = new_listener(Path::new(&uds_path)).unwrap();
+
+        assert!(new_listener(Path::new(&uds_path)).is_err());
+        assert!(path.exists());
     }
 }

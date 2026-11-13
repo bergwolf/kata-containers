@@ -1,0 +1,62 @@
+[package]
+authors.workspace = true
+edition = "2021"
+license.workspace = true
+name = "kata-deploy"
+rust-version.workspace = true
+version = "0.1.0"
+
+[[bin]]
+name = "kata-deploy"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+env_logger = "0.10"
+flate2 = "1"
+humantime = "2.1.0"
+k8s-openapi = { default-features = false, features = [
+  "v1_33",
+], version = "0.26" }
+# kata-deploy doesn't use kube::runtime (controllers/watchers/reflectors) or
+# kube::derive (the CustomResource macro). Skipping those features keeps the
+# binary smaller and trims the static data segment that gets mapped into RSS.
+#
+# `ring` matches kube's own default crypto provider for rustls 0.23+ and
+# must stay enabled — without it, rustls panics at runtime with
+# "Could not automatically determine the process-level CryptoProvider".
+json-patch = "4"
+kube = { default-features = false, features = [
+  "client",
+  "jsonpatch",
+  "ring",
+  "rustls-tls",
+], version = "2.0" }
+libc.workspace = true
+log.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml = "0.9"
+tar = "0.4.46"
+tokio = { features = [
+  "io-util",
+  "macros",
+  "net",
+  "rt-multi-thread",
+  "signal",
+  "sync",
+  "time",
+], workspace = true }
+toml_edit = "0.22"
+walkdir = "2"
+# We speak D-Bus to systemd ourselves (see src/utils/dbus.rs) and only need the
+# wire format, not a D-Bus library.
+zbus = { default-features = false, version = "6" }
+zstd = "0.13.3"
+
+[dev-dependencies]
+rstest.workspace = true
+serial_test.workspace = true
+tempfile.workspace = true

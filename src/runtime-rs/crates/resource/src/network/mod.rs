@@ -10,6 +10,7 @@ mod dan;
 mod endpoint;
 pub use dan::{dan_config_path, Dan, DanNetworkConfig};
 pub use endpoint::endpoint_persist::EndpointState;
+pub(crate) use endpoint::rebind_saved_physical_endpoints;
 pub use endpoint::Endpoint;
 mod network_entity;
 mod network_info;
@@ -17,17 +18,76 @@ pub use network_info::NetworkInfo;
 mod network_model;
 pub use network_model::NetworkModel;
 mod network_with_netns;
+pub(crate) use network_with_netns::netns_has_interfaces;
 pub use network_with_netns::NetworkWithNetNsConfig;
 use network_with_netns::NetworkWithNetns;
 mod network_pair;
 use network_pair::NetworkPair;
+mod restored;
+pub use restored::remove_kata_links;
+pub(crate) use restored::RestoredNetwork;
 mod utils;
+pub use kata_sys_util::netns::{generate_netns_name, NetnsGuard};
 use tokio::sync::RwLock;
-pub use utils::netns::{generate_netns_name, NetnsGuard};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use hypervisor::{device::device_manager::DeviceManager, Hypervisor};
+
+/// How far a network got attaching its endpoints.
+///
+/// `setup()` attaches the endpoints of `entity_list` in order and returns on
+/// the first failure. An attach that failed can still have changed the host:
+/// a physical endpoint binds its VF to vfio-pci before the later, fallible
+/// steps of its attach, and nothing rolls that back. The endpoints after it
+/// were never touched.
+///
+/// So the network keeps two watermarks over the endpoint list. The index
+/// past the last endpoint whose attach *started*: `remove()` detaches
+/// exactly those, whether the setup succeeded, failed half way, or the shim
+/// died before it got to the rest, and `Dan::save()` records exactly those.
+/// (`NetworkWithNetns::save()` records every *constructed* endpoint instead:
+/// its construction already made TAPs on the host, and recording a physical
+/// endpoint whose attach never started only costs a no-op rebind.) Without
+/// this, a failed setup either dropped the network (and the VF stayed on
+/// vfio-pci), or detached endpoints that were never attached. And the index
+/// past the last endpoint whose attach *finished*: a retried setup resumes
+/// after those, instead of replaying an attach that succeeded and
+/// hotplugging its device a second time.
+///
+/// Atomics rather than a lock: `setup()` holds the inner read lock while
+/// it runs, and `save()` can be called concurrently by a sandbox state save.
+#[derive(Default)]
+pub(crate) struct AttachProgress {
+    started: std::sync::atomic::AtomicUsize,
+    finished: std::sync::atomic::AtomicUsize,
+}
+
+impl AttachProgress {
+    /// Record that the attach of the endpoint at `index` is starting. Called
+    /// before the attach, so an attach that fails part way is still recorded.
+    pub(crate) fn begin(&self, index: usize) {
+        self.started
+            .fetch_max(index + 1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether the attach of the endpoint at `index` has started.
+    pub(crate) fn includes(&self, index: usize) -> bool {
+        index < self.started.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Record that the attach of the endpoint at `index` succeeded, so a
+    /// retried setup resumes after it instead of attaching it again.
+    pub(crate) fn finish(&self, index: usize) {
+        self.finished
+            .fetch_max(index + 1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether the attach of the endpoint at `index` succeeded.
+    pub(crate) fn is_finished(&self, index: usize) -> bool {
+        index < self.finished.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
 
 #[derive(Debug)]
 pub enum NetworkConfig {
@@ -43,6 +103,27 @@ pub trait Network: Send + Sync {
     async fn neighs(&self) -> Result<Vec<agent::ARPNeighbor>>;
     async fn save(&self) -> Option<Vec<EndpointState>>;
     async fn remove(&self, h: &dyn Hypervisor) -> Result<()>;
+    /// The network namespace the endpoints live in, for the saved state:
+    /// a recovery can only remove what is left in the namespace when it
+    /// knows which one it was.
+    async fn netns_path(&self) -> Option<String> {
+        None
+    }
+    /// Returns the list of network endpoints. Used to resolve PCI paths
+    /// via QMP before sending update_interface to the agent.
+    async fn endpoints(&self) -> Vec<std::sync::Arc<dyn endpoint::Endpoint>> {
+        vec![]
+    }
+
+    async fn has_passthrough_network_devices(&self) -> bool {
+        for endpoint in self.endpoints().await {
+            if endpoint.host_bdf().await.is_some() {
+                return true;
+            }
+        }
+
+        false
+    }
 }
 
 pub async fn new(
@@ -60,5 +141,93 @@ pub async fn new(
                 .await
                 .context("New directly attachable network")?,
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[derive(Debug, Default)]
+    struct TestEndpoint {
+        bdf: Option<String>,
+    }
+
+    #[async_trait]
+    impl endpoint::Endpoint for TestEndpoint {
+        async fn name(&self) -> String {
+            "eth0".to_owned()
+        }
+        async fn hardware_addr(&self) -> String {
+            "02:00:ca:fe:00:04".to_owned()
+        }
+        async fn attach(&self) -> Result<Option<String>> {
+            Ok(None)
+        }
+        async fn detach(&self, _hypervisor: &dyn Hypervisor) -> Result<()> {
+            Ok(())
+        }
+        async fn save(&self) -> Option<EndpointState> {
+            None
+        }
+        async fn host_bdf(&self) -> Option<String> {
+            self.bdf.clone()
+        }
+    }
+
+    struct TestNetwork {
+        endpoints: Vec<Arc<dyn endpoint::Endpoint>>,
+    }
+
+    #[async_trait]
+    impl Network for TestNetwork {
+        async fn setup(&self) -> Result<()> {
+            Ok(())
+        }
+        async fn interfaces(&self) -> Result<Vec<agent::Interface>> {
+            Ok(vec![])
+        }
+        async fn routes(&self) -> Result<Vec<agent::Route>> {
+            Ok(vec![])
+        }
+        async fn neighs(&self) -> Result<Vec<agent::ARPNeighbor>> {
+            Ok(vec![])
+        }
+        async fn save(&self) -> Option<Vec<EndpointState>> {
+            None
+        }
+        async fn remove(&self, _h: &dyn Hypervisor) -> Result<()> {
+            Ok(())
+        }
+        async fn endpoints(&self) -> Vec<Arc<dyn endpoint::Endpoint>> {
+            self.endpoints.clone()
+        }
+    }
+
+    fn test_endpoint(bdf: Option<&str>) -> Arc<TestEndpoint> {
+        Arc::new(TestEndpoint {
+            bdf: bdf.map(|bdf| bdf.to_owned()),
+        })
+    }
+
+    fn endpoint(bdf: Option<&str>) -> Arc<dyn endpoint::Endpoint> {
+        test_endpoint(bdf)
+    }
+
+    #[tokio::test]
+    async fn test_has_passthrough_network_devices() {
+        let network = TestNetwork { endpoints: vec![] };
+        assert!(!network.has_passthrough_network_devices().await);
+
+        let network = TestNetwork {
+            endpoints: vec![endpoint(None)],
+        };
+        assert!(!network.has_passthrough_network_devices().await);
+
+        let network = TestNetwork {
+            endpoints: vec![endpoint(None), endpoint(Some("0000:b5:09.7"))],
+        };
+        assert!(network.has_passthrough_network_devices().await);
     }
 }

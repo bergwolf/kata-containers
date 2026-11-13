@@ -14,12 +14,12 @@ Ideally, VM-based container runtime implementations would become translation
 layers from the runtime specification they implement (e.g. the [OCI runtime-spec][oci]
 or the [Kubernetes CRI][cri]) to the `virtcontainers` API.
 
-`virtcontainers` was used as a foundational package for the [Clear Containers][cc] [runtime][cc-runtime] implementation.
+`virtcontainers` was used as a foundational package for the [Kata Containers][kata-containers] [runtime][kata-containers-runtime] implementation, formerly the Clear Containers runtime implementation.
 
 [oci]: https://github.com/opencontainers/runtime-spec
 [cri]: https://github.com/kubernetes/community/blob/master/contributors/devel/sig-node/container-runtime-interface.md
-[cc]: https://github.com/clearcontainers/
-[cc-runtime]: https://github.com/clearcontainers/runtime/
+[kata-containers]: https://github.com/kata-containers/
+[kata-containers-runtime]: https://github.com/kata-containers/runtime/
 
 # Out of scope
 
@@ -139,7 +139,7 @@ See [Kata Containers Architecture](../../../docs/design/architecture/README.md#s
 
 # Devices
 
-Support has been added to pass [VFIO](https://www.kernel.org/doc/Documentation/vfio.txt) 
+Support has been added to pass [VFIO](https://www.kernel.org/doc/Documentation/vfio.txt)
 assigned devices on the docker command line with --device.
 Support for passing other devices including block devices with --device has
 not been added yet. [PCI](#how-to-pass-a-device-using-vfio-pci-passthrough) and
@@ -152,7 +152,7 @@ cards) devices can be passed.
 
 IOMMU group represents the smallest set of devices for which the IOMMU has
 visibility and which is isolated from other groups.  VFIO uses this information
-to enforce safe ownership of devices for userspace. 
+to enforce safe ownership of devices for userspace.
 
 You will need Intel VT-d capable hardware. Check if IOMMU is enabled in your host
 kernel by verifying `CONFIG_VFIO_NOIOMMU` is not in the kernel configuration. If it is set,
@@ -160,7 +160,7 @@ you will need to rebuild your kernel.
 
 The following kernel configuration options need to be enabled:
 ```
-CONFIG_VFIO_IOMMU_TYPE1=m 
+CONFIG_VFIO_IOMMU_TYPE1=m
 CONFIG_VFIO=m
 CONFIG_VFIO_PCI=m
 ```
@@ -218,7 +218,7 @@ $ ls /dev/vfio
 docker run -it --device=/dev/vfio/16 centos/tools bash
 ```
 
-9. Running `lspci` within the container should show the device among the 
+9. Running `lspci` within the container should show the device among the
 PCI devices. The driver for the device needs to be present within the
 Clear Containers kernel. If the driver is missing,  you can add it to your
 custom container kernel using the [osbuilder](https://github.com/clearcontainers/osbuilder)
@@ -232,7 +232,7 @@ is also supported in Kata. Pass-through happens separated by adapter and
 domain, i.e. a passable VFIO device has one or multiple adapter-domain
 combinations.
 
-1. You must follow the [kernel documentation for preparing VFIO-AP passthrough](https://www.kernel.org/doc/html/latest/s390/vfio-ap.html).
+1. You must follow the [kernel documentation for preparing VFIO-AP passthrough](https://www.kernel.org/doc/Documentation/s390/vfio-ap.txt).
 In short, your host kernel should have the following enabled or available as
 module (in case of modules, load the modules accordingly, e.g. through
 `modprobe`). If one is missing, you will have to update your kernel
@@ -289,7 +289,7 @@ $ ls /dev/vfio
 6. This device can now be passed. To verify the cards are there, you can use
 `lszcrypt` from `s390-tools` (`s390-tools` in Alpine, Debian, and Ubuntu,
 `s390utils` in Fedora). With `lszcrypt`, you can see the cards after the
-[configuration time](https://www.ibm.com/support/knowledgecenter/en/linuxonibm/com.ibm.linux.z.ubdd/ludd_t_crypt_add.html)
+[configuration time](https://www.ibm.com/docs/en/linux-on-systems?topic=c-lszcrypt-2)
 has passed.
 
 ```sh

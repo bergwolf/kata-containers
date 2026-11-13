@@ -5,6 +5,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
+load "${BATS_TEST_DIRNAME}/lib.sh"
 load "${BATS_TEST_DIRNAME}/../../common.bash"
 load "${BATS_TEST_DIRNAME}/tests_common.sh"
 
@@ -13,14 +14,19 @@ setup() {
 	agnhost_name="${container_images_agnhost_name}"
 	agnhost_version="${container_images_agnhost_version}"
 
-	get_pod_config_dir
+	setup_common || die "setup_common failed"
 }
 
 @test "Liveness probe" {
 	pod_name="liveness-exec"
 
+	yaml_file="${pod_config_dir}/probe-pod-liveness.yaml"
+	cp "${pod_config_dir}/pod-liveness.yaml" "${yaml_file}"
+	set_node "${yaml_file}" "$node"
+	auto_generate_policy "${pod_config_dir}" "${yaml_file}"
+
 	# Create pod
-	kubectl create -f "${pod_config_dir}/pod-liveness.yaml"
+	kubectl create -f "${yaml_file}"
 
 	# Check pod creation
 	kubectl wait --for=condition=Ready --timeout=$timeout pod "$pod_name"
@@ -36,10 +42,16 @@ setup() {
 @test "Liveness http probe" {
 	pod_name="liveness-http"
 
-	# Create pod
+	# Create pod specification.
+	yaml_file="${pod_config_dir}/http-pod-liveness.yaml"
+
 	sed -e "s#\${agnhost_image}#${agnhost_name}:${agnhost_version}#" \
-		"${pod_config_dir}/pod-http-liveness.yaml" |\
-		kubectl create -f -
+		"${pod_config_dir}/pod-http-liveness.yaml" > "${yaml_file}"
+	set_node "${yaml_file}" "$node"
+	auto_generate_policy "${pod_config_dir}" "${yaml_file}"
+
+	# Create pod
+	kubectl create -f "${yaml_file}"
 
 	# Check pod creation
 	kubectl wait --for=condition=Ready --timeout=$timeout pod "$pod_name"
@@ -49,17 +61,25 @@ setup() {
 
 	# Sleep necessary to check liveness probe returns a failure code
 	sleep "$sleep_liveness"
-	kubectl describe pod "$pod_name" | grep "Started container"
+	# For k8s up to 1.34 we need to check for "Started container"
+	# For k8s 1.35 and onwards we need to check for "Container started"
+	kubectl describe pod "$pod_name" | grep -E "Started container|Container started"
 }
 
 
 @test "Liveness tcp probe" {
 	pod_name="tcptest"
 
-	# Create pod
+	# Create pod specification.
+	yaml_file="${pod_config_dir}/tcp-pod-liveness.yaml"
+
 	sed -e "s#\${agnhost_image}#${agnhost_name}:${agnhost_version}#" \
-		"${pod_config_dir}/pod-tcp-liveness.yaml" |\
-		kubectl create -f -
+		"${pod_config_dir}/pod-tcp-liveness.yaml" > "${yaml_file}"
+	set_node "${yaml_file}" "$node"
+	auto_generate_policy "${pod_config_dir}" "${yaml_file}"
+
+	# Create pod
+	kubectl create -f "${yaml_file}"
 
 	# Check pod creation
 	kubectl wait --for=condition=Ready --timeout=$timeout pod "$pod_name"
@@ -69,12 +89,14 @@ setup() {
 
 	# Sleep necessary to check liveness probe returns a failure code
 	sleep "$sleep_liveness"
-	kubectl describe pod "$pod_name" | grep "Started container"
+	# For k8s up to 1.34 we need to check for "Started container"
+	# For k8s 1.35 and onwards we need to check for "Container started"
+	kubectl describe pod "$pod_name" | grep -E "Started container|Container started"
 }
 
 teardown() {
 	# Debugging information
-	kubectl describe "pod/$pod_name"
+	rm -f "${yaml_file}"
 
-	kubectl delete pod "$pod_name"
+	teardown_common "${node}" "${node_start_time:-}"
 }

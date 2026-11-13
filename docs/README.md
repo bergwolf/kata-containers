@@ -9,7 +9,8 @@ For details of the other Kata Containers repositories, see the
 
 ## Getting Started
 
-* [Installation guides](./install/README.md): Install and run Kata Containers with Docker or Kubernetes
+* [Quick Start Guide](./quick-start-guide.md): Understand the basics and run your first Kata workload in minutes
+* [Installation guide](./installation.md): Install and run Kata Containers with Docker or Kubernetes
 
 ## Tracing
 
@@ -32,6 +33,7 @@ See the [how-to documentation](how-to).
 * [Intel QAT with Kata](./use-cases/using-Intel-QAT-and-kata.md)
 * [SPDK vhost-user with Kata](./use-cases/using-SPDK-vhostuser-and-kata.md)
 * [Intel SGX with Kata](./use-cases/using-Intel-SGX-and-kata.md)
+* [IBM Crypto Express passthrough with Confidential Containers](./use-cases/CEX-passthrough-and-coco.md)
 
 ## Developer Guide
 
@@ -40,6 +42,7 @@ Documents that help to understand and contribute to Kata Containers.
 ### Design and Implementations
 
 * [Kata Containers Architecture](design/architecture): Architectural overview of Kata Containers
+* [Kata Containers CI](../ci/README.md): Kata Containers CI document
 * [Kata Containers E2E Flow](design/end-to-end-flow.md): The entire end-to-end flow of Kata Containers
 * [Kata Containers design](./design/README.md): More Kata Containers design documents
 * [Kata Containers threat model](./threat-model/threat-model.md): Kata Containers threat model
@@ -49,6 +52,7 @@ Documents that help to understand and contribute to Kata Containers.
 * [Developer Guide](Developer-Guide.md): Setup the Kata Containers developing environments
 * [How to contribute to Kata Containers](https://github.com/kata-containers/community/blob/main/CONTRIBUTING.md)
 * [Code of Conduct](../CODE_OF_CONDUCT.md)
+* [How to submit a blog post](Blog-Post-Submission-Guide.md)
 
 ## Help Writing a Code PR
 
@@ -69,7 +73,6 @@ Documents that help to understand and contribute to Kata Containers.
 
 ### The Release Process
 
-* [Release strategy](Stable-Branch-Strategy.md)
 * [Release Process](Release-Process.md)
 
 ## Presentations
@@ -81,3 +84,7 @@ Documents that help to understand and contribute to Kata Containers.
 If you have a suggestion for how we can improve the
 [website](https://katacontainers.io), please raise an issue (or a PR) on
 [the repository that holds the source for the website](https://github.com/OpenStackweb/kata-netlify-refresh).
+
+### Toolchain Guidance
+
+* [Toolchain Guidance](./Toolchain-Guidance.md)

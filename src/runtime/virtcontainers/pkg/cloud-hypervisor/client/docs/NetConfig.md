@@ -5,12 +5,12 @@
 Name | Type | Description | Notes
 ------------ | ------------- | ------------- | -------------
 **Tap** | Pointer to **string** |  | [optional] 
-**Ip** | Pointer to **string** |  | [optional] [default to "192.168.249.1"]
-**Mask** | Pointer to **string** |  | [optional] [default to "255.255.255.0"]
+**Ip** | Pointer to **string** | IPv4 or IPv6 address | [optional] [default to "192.168.249.1"]
+**Mask** | Pointer to **string** | Must be a valid IPv4 netmask if ip is an IPv4 address or a valid IPv6 netmask if ip is an IPv6 address. | [optional] [default to "255.255.255.0"]
 **Mac** | Pointer to **string** |  | [optional] 
 **HostMac** | Pointer to **string** |  | [optional] 
 **Mtu** | Pointer to **int32** |  | [optional] 
-**Iommu** | Pointer to **bool** |  | [optional] [default to false]
+**Iommu** | Pointer to [**IommuType**](IommuType.md) |  | [optional] [default to IOMMUTYPE_OFF]
 **NumQueues** | Pointer to **int32** |  | [optional] [default to 2]
 **QueueSize** | Pointer to **int32** |  | [optional] [default to 256]
 **VhostUser** | Pointer to **bool** |  | [optional] [default to false]
@@ -18,7 +18,11 @@ Name | Type | Description | Notes
 **VhostMode** | Pointer to **string** |  | [optional] [default to "Client"]
 **Id** | Pointer to **string** |  | [optional] 
 **PciSegment** | Pointer to **int32** |  | [optional] 
+**PciDeviceId** | Pointer to **int32** |  | [optional] 
 **RateLimiterConfig** | Pointer to [**RateLimiterConfig**](RateLimiterConfig.md) |  | [optional] 
+**OffloadTso** | Pointer to **bool** |  | [optional] [default to false]
+**OffloadUfo** | Pointer to **bool** |  | [optional] [default to false]
+**OffloadCsum** | Pointer to **bool** |  | [optional] [default to false]
 
 ## Methods
 
@@ -191,20 +195,20 @@ HasMtu returns a boolean if a field has been set.
 
 ### GetIommu
 
-`func (o *NetConfig) GetIommu() bool`
+`func (o *NetConfig) GetIommu() IommuType`
 
 GetIommu returns the Iommu field if non-nil, zero value otherwise.
 
 ### GetIommuOk
 
-`func (o *NetConfig) GetIommuOk() (*bool, bool)`
+`func (o *NetConfig) GetIommuOk() (*IommuType, bool)`
 
 GetIommuOk returns a tuple with the Iommu field if it's non-nil, zero value otherwise
 and a boolean to check if the value has been set.
 
 ### SetIommu
 
-`func (o *NetConfig) SetIommu(v bool)`
+`func (o *NetConfig) SetIommu(v IommuType)`
 
 SetIommu sets Iommu field to given value.
 
@@ -389,6 +393,31 @@ SetPciSegment sets PciSegment field to given value.
 
 HasPciSegment returns a boolean if a field has been set.
 
+### GetPciDeviceId
+
+`func (o *NetConfig) GetPciDeviceId() int32`
+
+GetPciDeviceId returns the PciDeviceId field if non-nil, zero value otherwise.
+
+### GetPciDeviceIdOk
+
+`func (o *NetConfig) GetPciDeviceIdOk() (*int32, bool)`
+
+GetPciDeviceIdOk returns a tuple with the PciDeviceId field if it's non-nil, zero value otherwise
+and a boolean to check if the value has been set.
+
+### SetPciDeviceId
+
+`func (o *NetConfig) SetPciDeviceId(v int32)`
+
+SetPciDeviceId sets PciDeviceId field to given value.
+
+### HasPciDeviceId
+
+`func (o *NetConfig) HasPciDeviceId() bool`
+
+HasPciDeviceId returns a boolean if a field has been set.
+
 ### GetRateLimiterConfig
 
 `func (o *NetConfig) GetRateLimiterConfig() RateLimiterConfig`
@@ -413,6 +442,81 @@ SetRateLimiterConfig sets RateLimiterConfig field to given value.
 `func (o *NetConfig) HasRateLimiterConfig() bool`
 
 HasRateLimiterConfig returns a boolean if a field has been set.
+
+### GetOffloadTso
+
+`func (o *NetConfig) GetOffloadTso() bool`
+
+GetOffloadTso returns the OffloadTso field if non-nil, zero value otherwise.
+
+### GetOffloadTsoOk
+
+`func (o *NetConfig) GetOffloadTsoOk() (*bool, bool)`
+
+GetOffloadTsoOk returns a tuple with the OffloadTso field if it's non-nil, zero value otherwise
+and a boolean to check if the value has been set.
+
+### SetOffloadTso
+
+`func (o *NetConfig) SetOffloadTso(v bool)`
+
+SetOffloadTso sets OffloadTso field to given value.
+
+### HasOffloadTso
+
+`func (o *NetConfig) HasOffloadTso() bool`
+
+HasOffloadTso returns a boolean if a field has been set.
+
+### GetOffloadUfo
+
+`func (o *NetConfig) GetOffloadUfo() bool`
+
+GetOffloadUfo returns the OffloadUfo field if non-nil, zero value otherwise.
+
+### GetOffloadUfoOk
+
+`func (o *NetConfig) GetOffloadUfoOk() (*bool, bool)`
+
+GetOffloadUfoOk returns a tuple with the OffloadUfo field if it's non-nil, zero value otherwise
+and a boolean to check if the value has been set.
+
+### SetOffloadUfo
+
+`func (o *NetConfig) SetOffloadUfo(v bool)`
+
+SetOffloadUfo sets OffloadUfo field to given value.
+
+### HasOffloadUfo
+
+`func (o *NetConfig) HasOffloadUfo() bool`
+
+HasOffloadUfo returns a boolean if a field has been set.
+
+### GetOffloadCsum
+
+`func (o *NetConfig) GetOffloadCsum() bool`
+
+GetOffloadCsum returns the OffloadCsum field if non-nil, zero value otherwise.
+
+### GetOffloadCsumOk
+
+`func (o *NetConfig) GetOffloadCsumOk() (*bool, bool)`
+
+GetOffloadCsumOk returns a tuple with the OffloadCsum field if it's non-nil, zero value otherwise
+and a boolean to check if the value has been set.
+
+### SetOffloadCsum
+
+`func (o *NetConfig) SetOffloadCsum(v bool)`
+
+SetOffloadCsum sets OffloadCsum field to given value.
+
+### HasOffloadCsum
+
+`func (o *NetConfig) HasOffloadCsum() bool`
+
+HasOffloadCsum returns a boolean if a field has been set.
 
 
 [[Back to Model list]](../README.md#documentation-for-models) [[Back to API list]](../README.md#documentation-for-api-endpoints) [[Back to README]](../README.md)

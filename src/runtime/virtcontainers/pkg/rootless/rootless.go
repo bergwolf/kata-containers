@@ -22,11 +22,15 @@ package rootless
 import (
 	"context"
 	"os"
+	"path/filepath"
+	"strconv"
 	"sync"
 
-	"github.com/opencontainers/runc/libcontainer/userns"
+	"github.com/moby/sys/userns"
 	"github.com/sirupsen/logrus"
 )
+
+const vmmUserRuntimeBaseDir = "/run/user"
 
 var (
 	// isRootless states whether execution is rootless or not
@@ -38,7 +42,10 @@ var (
 
 	// XDG_RUNTIME_DIR defines the base directory relative to
 	// which user-specific non-essential runtime files are stored.
-	rootlessDir = os.Getenv("XDG_RUNTIME_DIR")
+	rootlessDir string
+
+	// Used for lazy initialization of rootlessDir
+	rootlessDirOnce sync.Once
 
 	rootlessLog = logrus.WithFields(logrus.Fields{
 		"source": "rootless",
@@ -82,5 +89,19 @@ func isRootlessFunc() bool {
 // GetRootlessDir returns the path to the location for rootless
 // container and sandbox storage
 func GetRootlessDir() string {
+	rootlessDirOnce.Do(func() {
+		rootlessDir = os.Getenv("XDG_RUNTIME_DIR")
+		rootlessLog.WithField("rootlessDir", rootlessDir).Debug("initialized rootlessDir")
+	})
 	return rootlessDir
+}
+
+// VmmUserRuntimeDir returns the runtime directory for a temporary VMM user.
+func VmmUserRuntimeDir(uid uint32) string {
+	return filepath.Join(vmmUserRuntimeBaseDir, strconv.FormatUint(uint64(uid), 10))
+}
+
+// RemoveVmmUserRuntimeDir removes the runtime directory for a temporary VMM user.
+func RemoveVmmUserRuntimeDir(uid uint32) error {
+	return os.RemoveAll(VmmUserRuntimeDir(uid))
 }

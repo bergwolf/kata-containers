@@ -3,24 +3,35 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+mod block_source;
+mod cmdline_generator;
 mod inner;
+mod qmp;
 
+use crate::device::pci_path::PciPath;
 use crate::device::DeviceType;
 use crate::hypervisor_persist::HypervisorState;
-use crate::Hypervisor;
+use crate::utils::SocketAddress;
+use crate::{Hypervisor, MemoryConfig, TdxConfig};
 use crate::{HypervisorConfig, VcpuThreadIds};
 use inner::QemuInner;
-use kata_types::capabilities::Capabilities;
+use kata_types::capabilities::{Capabilities, CapabilityBits};
+use kata_types::config::hypervisor::RootlessUser;
+use persist::sandbox_persist::Persist;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tokio::sync::{mpsc, Mutex};
 
 #[derive(Debug)]
 pub struct Qemu {
     inner: Arc<RwLock<QemuInner>>,
+    exit_waiter: Mutex<(mpsc::Receiver<()>, i32)>,
 }
 
 impl Default for Qemu {
@@ -31,12 +42,15 @@ impl Default for Qemu {
 
 impl Qemu {
     pub fn new() -> Self {
+        let (exit_notify, exit_waiter) = mpsc::channel(1);
+
         Self {
-            inner: Arc::new(RwLock::new(QemuInner::new())),
+            inner: Arc::new(RwLock::new(QemuInner::new(exit_notify))),
+            exit_waiter: Mutex::new((exit_waiter, 0)),
         }
     }
 
-    pub async fn set_hypervisor_config(&mut self, config: HypervisorConfig) {
+    pub async fn set_hypervisor_config(&self, config: HypervisorConfig) {
         let mut inner = self.inner.write().await;
         inner.set_hypervisor_config(config)
     }
@@ -44,9 +58,15 @@ impl Qemu {
 
 #[async_trait]
 impl Hypervisor for Qemu {
-    async fn prepare_vm(&self, id: &str, netns: Option<String>) -> Result<()> {
+    async fn prepare_vm(
+        &self,
+        id: &str,
+        netns: Option<String>,
+        _annotations: &HashMap<String, String>,
+        selinux_label: Option<String>,
+    ) -> Result<()> {
         let mut inner = self.inner.write().await;
-        inner.prepare_vm(id, netns).await
+        inner.prepare_vm(id, netns, selinux_label).await
     }
 
     async fn start_vm(&self, timeout: i32) -> Result<()> {
@@ -56,25 +76,48 @@ impl Hypervisor for Qemu {
 
     async fn stop_vm(&self) -> Result<()> {
         let mut inner = self.inner.write().await;
-        inner.stop_vm()
+        inner.stop_vm().await
+    }
+
+    async fn wait_vm(&self) -> Result<i32> {
+        info!(sl!(), "Wait QEMU VM");
+
+        let mut waiter = self.exit_waiter.lock().await;
+
+        //wait until the qemu process exited.
+        waiter.0.recv().await;
+
+        // Take ownership while holding the lock, then release it before
+        // waiting. stop_vm() must remain able to signal a slow-exiting QEMU.
+        let process = {
+            let inner = self.inner.read().await;
+            inner.take_qemu_process().await
+        };
+        if let Ok(mut process) = process {
+            let status = process.wait().await?;
+            waiter.1 = status.code().unwrap_or(0);
+            self.inner.read().await.mark_exited();
+        }
+
+        Ok(waiter.1)
     }
 
     async fn pause_vm(&self) -> Result<()> {
-        let inner = self.inner.read().await;
+        let mut inner = self.inner.write().await;
         inner.pause_vm()
     }
 
     async fn resume_vm(&self) -> Result<()> {
-        let inner = self.inner.read().await;
+        let mut inner = self.inner.write().await;
         inner.resume_vm()
     }
 
     async fn save_vm(&self) -> Result<()> {
-        let inner = self.inner.read().await;
+        let mut inner = self.inner.write().await;
         inner.save_vm().await
     }
 
-    async fn add_device(&self, device: DeviceType) -> Result<()> {
+    async fn add_device(&self, device: DeviceType) -> Result<DeviceType> {
         let mut inner = self.inner.write().await;
         inner.add_device(device).await
     }
@@ -82,6 +125,28 @@ impl Hypervisor for Qemu {
     async fn remove_device(&self, device: DeviceType) -> Result<()> {
         let mut inner = self.inner.write().await;
         inner.remove_device(device).await
+    }
+
+    async fn update_device(&self, device: DeviceType) -> Result<()> {
+        let mut inner = self.inner.write().await;
+        inner.update_device(device).await
+    }
+
+    async fn set_rootless_user(&self, user: RootlessUser) -> Result<()> {
+        let mut inner = self.inner.write().await;
+        let mut config = inner.hypervisor_config();
+        config.security_info.rootless_user = Some(user);
+        inner.set_hypervisor_config(config);
+        Ok(())
+    }
+
+    async fn tdx_quote_socket_path(&self, config: &TdxConfig) -> Result<Option<PathBuf>> {
+        // QEMU's TDX guest object consumes TdxConfig::qgs_port through its
+        // `quote-generation-socket` property. Other hypervisor backends do not
+        // currently consume qgs_port when adding a TDX protection device, so
+        // for the time being endpoint selection remains VMM-specific.
+        let socket = SocketAddress::new(config.qgs_port);
+        Ok((socket.typ == "unix").then(|| PathBuf::from(socket.path)))
     }
 
     async fn get_agent_socket(&self) -> Result<String> {
@@ -100,7 +165,7 @@ impl Hypervisor for Qemu {
     }
 
     async fn get_thread_ids(&self) -> Result<VcpuThreadIds> {
-        let inner = self.inner.read().await;
+        let mut inner = self.inner.write().await;
         inner.get_thread_ids().await
     }
 
@@ -120,7 +185,7 @@ impl Hypervisor for Qemu {
     }
 
     async fn resize_vcpu(&self, old_vcpus: u32, new_vcpus: u32) -> Result<(u32, u32)> {
-        let inner = self.inner.read().await;
+        let mut inner = self.inner.write().await;
         inner.resize_vcpu(old_vcpus, new_vcpus).await
     }
 
@@ -140,7 +205,7 @@ impl Hypervisor for Qemu {
     }
 
     async fn save_state(&self) -> Result<HypervisorState> {
-        todo!()
+        self.save().await
     }
 
     async fn capabilities(&self) -> Result<Capabilities> {
@@ -151,5 +216,62 @@ impl Hypervisor for Qemu {
     async fn get_hypervisor_metrics(&self) -> Result<String> {
         let inner = self.inner.read().await;
         inner.get_hypervisor_metrics().await
+    }
+
+    async fn set_capabilities(&self, flag: CapabilityBits) {
+        let mut inner = self.inner.write().await;
+        inner.set_capabilities(flag)
+    }
+
+    async fn set_guest_memory_block_size(&self, size: u32) {
+        let mut inner = self.inner.write().await;
+        inner.set_guest_memory_block_size(size);
+    }
+
+    async fn guest_memory_block_size(&self) -> u32 {
+        let inner = self.inner.read().await;
+        inner.guest_memory_block_size()
+    }
+
+    async fn resize_memory(&self, new_mem_mb: u32) -> Result<(u32, MemoryConfig)> {
+        let mut inner = self.inner.write().await;
+        inner.resize_memory(new_mem_mb)
+    }
+
+    async fn get_passfd_listener_addr(&self) -> Result<(String, u32)> {
+        Err(anyhow::anyhow!("Not yet supported"))
+    }
+
+    async fn resolve_vfio_device_pci_path(&self, hostdev_id: &str) -> Result<PciPath> {
+        self.inner
+            .write()
+            .await
+            .resolve_vfio_device_pci_path(hostdev_id)
+    }
+}
+
+#[async_trait]
+impl Persist for Qemu {
+    type State = HypervisorState;
+    type ConstructorArgs = ();
+
+    /// Save a state of the component.
+    async fn save(&self) -> Result<Self::State> {
+        let inner = self.inner.read().await;
+        inner.save().await.context("save qemu hypervisor state")
+    }
+
+    /// Restore a component from a specified state.
+    async fn restore(
+        _hypervisor_args: Self::ConstructorArgs,
+        hypervisor_state: Self::State,
+    ) -> Result<Self> {
+        let (exit_notify, exit_waiter) = mpsc::channel(1);
+
+        let inner = QemuInner::restore(exit_notify, hypervisor_state).await?;
+        Ok(Self {
+            inner: Arc::new(RwLock::new(inner)),
+            exit_waiter: Mutex::new((exit_waiter, 0)),
+        })
     }
 }

@@ -10,9 +10,28 @@ To run  Kata Containers in SNP-VMs, the following software stack is used.
 
 ![Kubernetes integration with shimv2](./images/SNP-stack.svg)
 
-The host BIOS and kernel must be capable of supporting AMD SEV-SNP and configured accordingly. For Kata Containers, the host kernel with branch [`sev-snp-iommu-avic_5.19-rc6_v3`](https://github.com/AMDESE/linux/tree/sev-snp-iommu-avic_5.19-rc6_v3) and commit [`3a88547`](https://github.com/AMDESE/linux/commit/3a885471cf89156ea555341f3b737ad2a8d9d3d0) is known to work in conjunction with SEV Firmware version 1.51.3 (0xh\_1.33.03) available on AMD's [SEV developer website](https://developer.amd.com/sev/). See [AMD's guide](https://github.com/AMDESE/AMDSEV/tree/sev-snp-devel) to configure the host accordingly. Verify that you are able to run SEV-SNP encrypted VMs first. The guest components required for Kata Containers are built as described below.
+The host BIOS and kernel must be capable of supporting AMD SEV-SNP and the host must be configured accordingly.
+
+The latest SEV Firmware version is available on AMD's [SEV Developer Webpage](https://www.amd.com/en/developer/sev.html). It can also be updated via a platform OEM BIOS update.
+
+The host kernel must be equal to or later than upstream version [6.11](https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.11.tar.xz).
+
+[`sev-utils`](https://github.com/amd/sev-utils/blob/coco-202501150000/docs/snp.md) is an easy way to install the required host kernel with the `setup-host` command. However, it will also build compatible guest kernel, OVMF, and QEMU components which are not necessary as these components are packaged with kata. The `sev-utils` script utility can be used with these additional components to test the memory encrypted launch and attestation of a base QEMU SNP guest.
+
+For a simplified way to build just the upstream compatible host kernel, use the Confidential Containers fork of [`amdese-amdsev`](https://github.com/confidential-containers/amdese-amdsev/tree/amd-snp-202501150000). Individual components can be built by running the following command:
+
+```
+./build.sh kernel host --install
+```
 
 **Tip**: It is easiest to first have Kata Containers running on your system and then modify it to run containers in SNP-VMs. Follow the [Developer guide](../Developer-Guide.md#warning) and then follow the below steps. Nonetheless, you can just follow this guide from the start.
+
+!!! note "Running the VMM unprivileged"
+    `/dev/sev` comes up as `root:root 0600`, so an unprivileged QEMU cannot open
+    it and an SNP sandbox with `rootless = true` fails to start. Granting group
+    access to it is host configuration, not something the shim does on the fly;
+    see [How to run a rootless VMM](how-to-run-rootless-vmm.md) for the contract
+    and for the `kata-deploy` setting that provisions it.
 
 ## How to build
 
@@ -28,24 +47,24 @@ __Steps from the Developer Guide:__
 __SNP-specific steps:__
 - Build the SNP-specific kernel as shown below (see this [guide](../../tools/packaging/kernel/README.md#build-kata-containers-kernel) for more information)
 ```bash
-$ pushd kata-containers/tools/packaging/kernel/
-$ ./build-kernel.sh -a x86_64 -x snp setup
-$ ./build-kernel.sh -a x86_64 -x snp build
-$ sudo -E PATH="${PATH}" ./build-kernel.sh -x snp install
+$ pushd kata-containers/tools/packaging/
+$ ./kernel/build-kernel.sh -a x86_64 -x setup
+$ ./kernel/build-kernel.sh -a x86_64 -x build
+$ sudo -E PATH="${PATH}" ./kernel/build-kernel.sh -x install
 $ popd
 ```
 - Build a current OVMF capable of SEV-SNP:
 ```bash
 $ pushd kata-containers/tools/packaging/static-build/ovmf
-$ ./build.sh
-$ tar -xvf edk2-x86_64.tar.gz
+$ ovmf_build=sev ./build.sh
+$ tar -xvf edk2-sev.tar.gz
 $ popd
 ```
 - Build a custom QEMU
 ```bash
 $ source kata-containers/tools/packaging/scripts/lib.sh
-$ qemu_url="$(get_from_kata_deps "assets.hypervisor.qemu-snp-experimental.url")"
-$ qemu_tag="$(get_from_kata_deps "assets.hypervisor.qemu-snp-experimental.tag")"
+$ qemu_url="$(get_from_kata_deps ".assets.hypervisor.qemu-snp-experimental.url")"
+$ qemu_tag="$(get_from_kata_deps ".assets.hypervisor.qemu-snp-experimental.tag")"
 $ git clone "${qemu_url}"
 $ pushd qemu
 $ git checkout "${qemu_tag}"
@@ -53,7 +72,14 @@ $ ./configure --enable-virtfs --target-list=x86_64-softmmu --enable-debug
 $ make -j "$(nproc)"
 $ popd
 ```
-
+- Create cert-chain for SNP attestation ( using [`snphost`](https://github.com/virtee/snphost/blob/main/docs/snphost.1.adoc) )
+```bash
+$ git clone https://github.com/virtee/snphost.git && cd snphost/
+$ cargo build
+$ mkdir /tmp/certs
+$ ./target/debug/snphost fetch vcek der /tmp/certs
+$ ./target/debug/snphost import /tmp/certs /opt/snp/cert_chain.cert
+```
 ### Kata Containers Configuration for SNP
 
 The configuration file located at `/etc/kata-containers/configuration.toml` must be adapted as follows to support SNP-VMs:
@@ -77,6 +103,10 @@ path = "/path/to/qemu/build/qemu-system-x86_64"
 ```toml
 shared_fs = "virtio-9p"
 ```
+- Use `blockfile` snapshotter: Since virtio-fs remains unsupported due to bugs in QEMU snp-v3, and virtio-9p is no longer supported in runtime-rs, it is recommended to use the blockfile snapshotter. This allows container images to be managed via block devices without relying on a shared file system. To enable this, set the `snapshotter` to `blockfile` in the containerd config file, please refer to [blockfile guide](https://github.com/containerd/containerd/blob/main/docs/snapshotters/blockfile.md) for more information. Additionally, shared_fs should be set to "none" since no shared file system is used.
+```toml
+shared_fs = "none"
+```
 - Disable `virtiofsd` since it is no longer required (comment out)
 ```toml
 # virtio_fs_daemon = "/usr/libexec/virtiofsd"
@@ -84,10 +114,6 @@ shared_fs = "virtio-9p"
 - Disable NVDIMM (uncomment)
 ```toml
 disable_image_nvdimm = true
-```
-- Disable shared memory (uncomment)
-```toml
-file_mem_backend = ""
 ```
 - Enable confidential guests (uncomment)
 ```toml
@@ -99,7 +125,11 @@ sev_snp_guest = true
 ```
   - Configure an OVMF (add path)
 ```toml
-firmware = "/path/to/kata-containers/tools/packaging/static-build/ovmf/opt/kata/share/ovmf/OVMF.fd"
+firmware = "/path/to/kata-containers/tools/packaging/static-build/ovmf/opt/kata/share/ovmf/AMDSEV.fd"
+```
+  - SNP attestation (add cert-chain to default path or add the path with cert-chain)
+```toml
+snp_certs_path = "/path/to/cert-chain"
 ```
 
 ## Test Kata Containers with Containerd
@@ -155,4 +185,3 @@ sudo reboot
 ```bash
 sudo rmmod kvm_amd && sudo modprobe kvm_amd sev_snp=0
 ```
-

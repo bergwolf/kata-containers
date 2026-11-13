@@ -6,6 +6,8 @@ on:
       - reopened
       - synchronize
 
+permissions: {}
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
@@ -18,13 +20,15 @@ env:
 
 jobs:
   commit-message-check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      PR_AUTHOR: ${{ github.event.pull_request.user.login }}
     name: Commit Message Check
     steps:
     - name: Get PR Commits
-      if: ${{ !contains(github.event.pull_request.labels.*.name, 'force-skip-ci') }}
       id: 'get-pr-commits'
-      uses: tim-actions/get-pr-commits@v1.2.0
+      uses: tim-actions/get-pr-commits@c64db31d359214d244884dd68f971a110b29ab83 # v1.2.0
       with:
         token: ${{ secrets.GITHUB_TOKEN }}
         # Filter out revert commits
@@ -32,23 +36,25 @@ jobs:
         #
         # Revert "<original-subject-line>"
         #
-        filter_out_pattern: '^Revert "'
+        # The format of a re-re-vert commit as follows:
+        #
+        # Reapply "<original-subject-line>"
+        filter_out_pattern: '^Revert "|^Reapply "'
 
     - name: DCO Check
-      if: ${{ !contains(github.event.pull_request.labels.*.name, 'force-skip-ci') }}
-      uses: tim-actions/dco@2fd0504dc0d27b33f542867c300c60840c6dcb20
+      uses: tim-actions/dco@f2279e6e62d5a7d9115b0cb8e837b777b1b02e21 # v1.1.0
       with:
         commits: ${{ steps.get-pr-commits.outputs.commits }}
 
     - name: Commit Body Missing Check
-      if: ${{ !contains(github.event.pull_request.labels.*.name, 'force-skip-ci') && ( success() || failure() ) }}
-      uses: tim-actions/commit-body-check@v1.0.2
+      if: ${{ success() || failure() }}
+      uses: tim-actions/commit-body-check@d2e0e8e1f0332b3281c98867c42a2fbe25ad3f15 # v1.0.2
       with:
         commits: ${{ steps.get-pr-commits.outputs.commits }}
 
     - name: Check Subject Line Length
-      if: ${{ !contains(github.event.pull_request.labels.*.name, 'force-skip-ci') && ( success() || failure() ) }}
-      uses: tim-actions/commit-message-checker-with-regex@v0.3.1
+      if: ${{ (env.PR_AUTHOR != 'dependabot[bot]') && ( success() || failure() ) }}
+      uses: tim-actions/commit-message-checker-with-regex@d6d9770051dd6460679d1cab1dcaa8cffc5c2bbd # v0.3.1
       with:
         commits: ${{ steps.get-pr-commits.outputs.commits }}
         pattern: '^.{0,75}(\n.*)*$'
@@ -56,8 +62,8 @@ jobs:
         post_error: ${{ env.error_msg }}
 
     - name: Check Body Line Length
-      if: ${{ !contains(github.event.pull_request.labels.*.name, 'force-skip-ci') && ( success() || failure() ) }}
-      uses: tim-actions/commit-message-checker-with-regex@v0.3.1
+      if: ${{ (env.PR_AUTHOR != 'dependabot[bot]') && ( success() || failure() ) }}
+      uses: tim-actions/commit-message-checker-with-regex@d6d9770051dd6460679d1cab1dcaa8cffc5c2bbd # v0.3.1
       with:
         commits: ${{ steps.get-pr-commits.outputs.commits }}
         # Notes:
@@ -86,20 +92,9 @@ jobs:
         error: 'Body line too long (max 150)'
         post_error: ${{ env.error_msg }}
 
-    - name: Check Fixes
-      if: ${{ !contains(github.event.pull_request.labels.*.name, 'force-skip-ci') && ( success() || failure() ) }}
-      uses: tim-actions/commit-message-checker-with-regex@v0.3.1
-      with:
-        commits: ${{ steps.get-pr-commits.outputs.commits }}
-        pattern: '\s*Fixes\s*:?\s*(#\d+|github\.com\/kata-containers\/[a-z-.]*#\d+)|^\s*release\s*:'
-        flags: 'i'
-        error: 'No "Fixes" found'
-        post_error: ${{ env.error_msg }}
-        one_pass_all_pass: 'true'
-
     - name: Check Subsystem
-      if: ${{ !contains(github.event.pull_request.labels.*.name, 'force-skip-ci') && ( success() || failure() ) }}
-      uses: tim-actions/commit-message-checker-with-regex@v0.3.1
+      if: ${{ (env.PR_AUTHOR != 'dependabot[bot]') && ( success() || failure() ) }}
+      uses: tim-actions/commit-message-checker-with-regex@d6d9770051dd6460679d1cab1dcaa8cffc5c2bbd # v0.3.1
       with:
         commits: ${{ steps.get-pr-commits.outputs.commits }}
         pattern: '^[\s\t]*[^:\s\t]+[\s\t]*:'

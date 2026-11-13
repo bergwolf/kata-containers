@@ -92,10 +92,18 @@ func (n *DarwinNetwork) SetEndpoints(endpoints []Endpoint) {
 	n.eps = endpoints
 }
 
+func (n *DarwinNetwork) GetEndpointsNum() (int, error) {
+	return 0, nil
+}
+
 func validGuestRoute(route netlink.Route) bool {
 	return true
 }
 
-func validGuestNeighbor(route netlink.Neigh) bool {
+func validGuestNeighbor(neigh netlink.Neigh, gatewaySet map[string]struct{}) bool {
 	return true
+}
+
+func gatewaySetFromRoutes(routes []netlink.Route) map[string]struct{} {
+	return make(map[string]struct{})
 }

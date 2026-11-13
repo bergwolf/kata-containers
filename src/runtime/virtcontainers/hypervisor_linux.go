@@ -32,12 +32,14 @@ func NewHypervisor(hType HypervisorType) (Hypervisor, error) {
 		return &qemu{}, nil
 	case FirecrackerHypervisor:
 		return &firecracker{}, nil
-	case AcrnHypervisor:
-		return &Acrn{}, nil
 	case ClhHypervisor:
 		return &cloudHypervisor{}, nil
+	case StratovirtHypervisor:
+		return &stratovirt{}, nil
 	case DragonballHypervisor:
 		return &mockHypervisor{}, nil
+	case RemoteHypervisor:
+		return &remoteHypervisor{}, nil
 	case MockHypervisor:
 		return &mockHypervisor{}, nil
 	default:

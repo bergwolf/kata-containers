@@ -9,11 +9,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{anyhow, Context, Result};
-use sha2::Digest;
-
 use crate::{Args, Error};
-
+use anyhow::{anyhow, Context, Result};
+use oci_spec::runtime as oci;
+use runtime_spec as spec;
+use sha2::Digest;
 const SOCKET_ROOT: &str = "/run/containerd";
 const SHIM_PID_FILE: &str = "shim.pid";
 
@@ -32,20 +32,20 @@ impl ShimExecutor {
     }
 
     pub(crate) fn load_oci_spec(&self, path: &Path) -> Result<oci::Spec> {
-        let spec_file = path.join(oci::OCI_SPEC_CONFIG_FILE_NAME);
+        let spec_file = path.join(spec::OCI_SPEC_CONFIG_FILE_NAME);
         oci::Spec::load(spec_file.to_str().unwrap_or_default()).context("load spec")
     }
 
     pub(crate) fn write_address(&self, path: &Path, address: &Path) -> Result<()> {
         let file_path = &path.join("address");
         std::fs::write(file_path, address.as_os_str().as_bytes())
-            .context(Error::FileWrite(format!("{:?}", &file_path)))
+            .context(Error::FileWrite(format!("{:?}", file_path)))
     }
 
     pub(crate) fn write_pid_file(&self, path: &Path, pid: u32) -> Result<()> {
         let file_path = &path.join(SHIM_PID_FILE);
-        std::fs::write(file_path, format!("{}", pid))
-            .context(Error::FileWrite(format!("{:?}", &file_path)))
+        std::fs::write(file_path, format!("{pid}"))
+            .context(Error::FileWrite(format!("{:?}", file_path)))
     }
 
     // There may be a multi-container for a Pod, each container has a bundle path, we need to write
@@ -56,7 +56,7 @@ impl ShimExecutor {
     pub(crate) fn read_pid_file(&self, path: &Path) -> Result<u32> {
         let file_path = path.join(SHIM_PID_FILE);
         let data = std::fs::read_to_string(&file_path)
-            .context(Error::FileOpen(format!("{:?}", file_path)))?;
+            .context(Error::FileOpen(format!("{file_path:?}")))?;
 
         data.parse::<u32>().context(Error::ParsePid)
     }
@@ -72,11 +72,21 @@ impl ShimExecutor {
         // https://github.com/containerd/containerd/blob/v1.6.8/runtime/v2/shim/util_unix.go#L68 to
         // generate a shim socket path.
         Ok(PathBuf::from(format!(
-            "unix://{}/s/{:X}",
+            "unix://{}/s/{}",
             SOCKET_ROOT,
-            hasher.finalize()
+            hasher
+                .finalize()
+                .iter()
+                .map(|b| format!("{b:02X}"))
+                .collect::<String>()
         )))
     }
+}
+
+/// Path of the socket file of a `unix://` address.
+pub(crate) fn socket_path(address: &Path) -> Result<PathBuf> {
+    let trim_path = address.strip_prefix("unix:").context("trim path")?;
+    Ok(Path::new("/").join(trim_path))
 }
 
 #[cfg(test)]

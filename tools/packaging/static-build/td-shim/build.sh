@@ -1,48 +1,52 @@
 #!/usr/bin/env bash
 #
-# Copyright (c) 2022 Intel
+# Copyright (c) 2026 Ant Group
 #
 # SPDX-License-Identifier: Apache-2.0
+#
 
 set -o errexit
 set -o nounset
 set -o pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-readonly tdshim_builder="${script_dir}/build-td-shim.sh"
+readonly td_shim_builder="${script_dir}/build-static-td-shim.sh"
 
+# shellcheck source=/dev/null
 source "${script_dir}/../../scripts/lib.sh"
+
+ARCH=${ARCH:-$(uname -m)}
+# The td-shim firmware is only consumed by Dragonball TDX guests on x86_64.
+[[ "${ARCH}" != "x86_64" ]] && exit 0
 
 DESTDIR=${DESTDIR:-${PWD}}
 PREFIX=${PREFIX:-/opt/kata}
-kata_version="${kata_version:-}"
 tdshim_repo="${tdshim_repo:-}"
 tdshim_version="${tdshim_version:-}"
-tdshim_toolchain="${tdshim_toolchain:-}"
-package_output_dir="${package_output_dir:-}"
 
-[ -n "${tdshim_repo}" ] || tdshim_repo=$(get_from_kata_deps "externals.td-shim.url")
-[ -n "${tdshim_version}" ] || tdshim_version=$(get_from_kata_deps "externals.td-shim.version")
-[ -n "${tdshim_toolchain}" ] || tdshim_toolchain=$(get_from_kata_deps "externals.td-shim.toolchain")
+[[ -n "${tdshim_repo}" ]] || tdshim_repo=$(get_from_kata_deps ".externals.td-shim.url")
+[[ -n "${tdshim_version}" ]] || tdshim_version=$(get_from_kata_deps ".externals.td-shim.version")
 
-[ -n "${tdshim_repo}" ] || die "Failed to get TD-shim repo"
-[ -n "${tdshim_version}" ] || die "Failed to get TD-shim version or commit"
-[ -n "${tdshim_toolchain}" ] || die "Failed to get TD-shim toolchain to be used to build the project"
+[[ -n "${tdshim_repo}" ]] || die "failed to get td-shim repo"
+[[ -n "${tdshim_version}" ]] || die "failed to get td-shim version"
 
-container_image="${TDSHIM_CONTAINER_BUILDER:-${BUILDER_REGISTRY}:td-shim-${tdshim_toolchain}-$(get_last_modification ${script_dir})-$(uname -m)}"
+container_image="${TDSHIM_CONTAINER_BUILDER:-$(get_td_shim_image_name)}"
 
-sudo docker pull ${container_image} || (sudo docker build \
-	--build-arg RUST_TOOLCHAIN="${tdshim_toolchain}" \
-	-t "${container_image}" \
-	"${script_dir}" && \
-	# No-op unless PUSH_TO_REGISTRY is exported as "yes"
-	push_to_registry "${container_image}")
+docker pull "${container_image}" || \
+	(docker build \
+		--build-arg RUST_TOOLCHAIN="$(get_from_kata_deps ".externals.td-shim.toolchain")" \
+		-t "${container_image}" "${script_dir}" && \
+	 # No-op unless PUSH_TO_REGISTRY is exported as "yes"
+	 push_to_registry "${container_image}")
 
-sudo docker run --rm -i -v "${repo_root_dir}:${repo_root_dir}" \
+# shellcheck disable=SC2154
+docker run --rm -i -v "${repo_root_dir}:${repo_root_dir}" \
 	-w "${PWD}" \
 	--env DESTDIR="${DESTDIR}" \
 	--env PREFIX="${PREFIX}" \
 	--env tdshim_repo="${tdshim_repo}" \
 	--env tdshim_version="${tdshim_version}" \
+	--env ARCH="${ARCH}" \
+	--user "$(id -u)":"$(id -g)" \
 	"${container_image}" \
-	bash -c "${tdshim_builder}"
+	bash -c "${td_shim_builder}"

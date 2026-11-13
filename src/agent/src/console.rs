@@ -11,12 +11,13 @@ use nix::libc::{STDERR_FILENO, STDIN_FILENO, STDOUT_FILENO};
 use nix::pty::{openpty, OpenptyResult};
 use nix::sys::socket::{self, AddressFamily, SockFlag, SockType, VsockAddr};
 use nix::sys::stat::Mode;
-use nix::sys::wait;
+use nix::sys::wait::{Id, WaitPidFlag, WaitStatus};
+use nix::sys::{signal, wait};
 use nix::unistd::{self, close, dup2, fork, setsid, ForkResult, Pid};
 use rustjail::pipestream::PipeStream;
 use slog::Logger;
 use std::ffi::CString;
-use std::os::unix::io::{FromRawFd, RawFd};
+use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -29,11 +30,21 @@ use tokio::sync::watch::Receiver;
 
 const CONSOLE_PATH: &str = "/dev/console";
 
+// Shell shipped by the devkit debug guest extension. A fixed path under
+// /run/kata-extensions, where extension images are mounted read-only and
+// dm-verity measured, so nothing outside the agent selects what the console
+// execs. It only exists when the extension is cold-plugged, which is itself the
+// operator opting in to debugging this sandbox.
+const DEVKIT_DEBUG_CONSOLE_SHELL: &str = "/run/kata-extensions/devkit/bin/devkit-sh";
+
 lazy_static! {
     static ref SHELLS: Arc<SyncMutex<Vec<String>>> = {
         let mut v = Vec::new();
 
         if !cfg!(test) {
+            // Ahead of the built-ins: some bases are shell-less, and where a
+            // shell does exist the devkit one is the richer choice.
+            v.push(DEVKIT_DEBUG_CONSOLE_SHELL.to_string());
             v.push("/bin/bash".to_string());
             v.push("/bin/sh".to_string());
         }
@@ -68,10 +79,10 @@ pub async fn debug_console_handler(
             None,
         )?;
         let addr = VsockAddr::new(libc::VMADDR_CID_ANY, port);
-        socket::bind(listenfd, &addr)?;
-        socket::listen(listenfd, 1)?;
+        socket::bind(listenfd.as_raw_fd(), &addr)?;
+        socket::listen(&listenfd, nix::sys::socket::Backlog::new(1).unwrap())?;
 
-        let mut incoming = util::get_vsock_incoming(listenfd);
+        let mut incoming = util::get_vsock_incoming(listenfd.into_raw_fd());
 
         loop {
             select! {
@@ -114,7 +125,7 @@ pub async fn debug_console_handler(
                 info!(logger, "debug console got shutdown request");
             }
 
-            result = run_debug_console_serial(shell.clone(), fd) => {
+            result = run_debug_console_serial(shell.clone(), fd.into_raw_fd()) => {
                match result {
                    Ok(_) => {
                        info!(logger, "run_debug_console_shell session finished");
@@ -135,9 +146,17 @@ fn run_in_child(slave_fd: libc::c_int, shell: String) -> Result<()> {
     setsid()?;
 
     // dup stdin, stdout, stderr to let child act as a terminal
-    dup2(slave_fd, STDIN_FILENO)?;
-    dup2(slave_fd, STDOUT_FILENO)?;
-    dup2(slave_fd, STDERR_FILENO)?;
+    let borrowed_fd = unsafe { BorrowedFd::borrow_raw(slave_fd) };
+    let mut stdin_fd = unsafe { OwnedFd::from_raw_fd(STDIN_FILENO) };
+    let mut stdout_fd = unsafe { OwnedFd::from_raw_fd(STDOUT_FILENO) };
+    let mut stderr_fd = unsafe { OwnedFd::from_raw_fd(STDERR_FILENO) };
+    dup2(borrowed_fd, &mut stdin_fd)?;
+    dup2(borrowed_fd, &mut stdout_fd)?;
+    dup2(borrowed_fd, &mut stderr_fd)?;
+    // Prevent closing of stdio fds
+    let _ = stdin_fd.into_raw_fd();
+    let _ = stdout_fd.into_raw_fd();
+    let _ = stderr_fd.into_raw_fd();
 
     // set tty
     unsafe {
@@ -165,10 +184,11 @@ async fn run_in_parent<T: AsyncRead + AsyncWrite>(
     info!(logger, "get debug shell pid {:?}", child_pid);
 
     let master_fd = pseudo.master;
-    let _ = close(pseudo.slave);
+    let _ = close(pseudo.slave.into_raw_fd());
 
     let (mut socket_reader, mut socket_writer) = tokio::io::split(stream);
-    let (mut master_reader, mut master_writer) = tokio::io::split(PipeStream::from_fd(master_fd));
+    let (mut master_reader, mut master_writer) =
+        tokio::io::split(PipeStream::from_fd(master_fd.into_raw_fd()));
 
     select! {
         res = tokio::io::copy(&mut master_reader, &mut socket_writer) => {
@@ -185,8 +205,35 @@ async fn run_in_parent<T: AsyncRead + AsyncWrite>(
         }
     }
 
-    let wait_status = wait::waitpid(child_pid, None);
-    info!(logger, "debug console process exit code: {:?}", wait_status);
+    // Either way the session is over, but the shell may well still be running:
+    // the master side also "closes" when relaying its output fails because the
+    // client went away, and the input the client sent last (say, "exit") can
+    // be left unread on the socket when that branch wins.
+    //
+    // The SIGCHLD reaper may already have reaped the shell and freed its pid
+    // for reuse. Holding its lock keeps it from doing so between the liveness
+    // check and the kill. WNOWAIT keeps the check itself from reaping a shell
+    // that already exited, so its status is still collected below.
+    {
+        let _locker = rustjail::container::WAIT_PID_LOCKER.lock().await;
+        let flags = WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT;
+        if wait::waitid(Id::Pid(child_pid), flags) == Ok(WaitStatus::StillAlive) {
+            if let Err(e) = signal::kill(child_pid, Some(signal::Signal::SIGKILL)) {
+                if e != nix::errno::Errno::ESRCH {
+                    warn!(logger, "kill child shell process {:?}", e);
+                }
+            }
+        }
+    }
+
+    // waitpid blocks, and a runtime worker stuck in it stalls every task that
+    // worker serves - on a single vCPU guest, the whole agent.
+    let wait_status = tokio::task::spawn_blocking(move || wait::waitpid(child_pid, None)).await;
+    match wait_status {
+        Ok(Ok(status)) => info!(logger, "debug console process exit status: {:?}", status),
+        Ok(Err(e)) => info!(logger, "debug console child already reaped: {:?}", e),
+        Err(e) => warn!(logger, "debug console waitpid task failed: {:?}", e),
+    }
 
     Ok(())
 }
@@ -199,10 +246,10 @@ async fn run_debug_console_vsock<T: AsyncRead + AsyncWrite>(
     let logger = logger.new(o!("subsystem" => "debug-console-shell"));
 
     let pseudo = openpty(None, None)?;
-    let _ = fcntl::fcntl(pseudo.master, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC));
-    let _ = fcntl::fcntl(pseudo.slave, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC));
+    let slave_fd = pseudo.slave.as_fd().as_raw_fd();
 
-    let slave_fd = pseudo.slave;
+    let _ = fcntl::fcntl(pseudo.master.as_fd(), FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC));
+    let _ = fcntl::fcntl(pseudo.slave.as_fd(), FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC));
 
     match unsafe { fork() } {
         Ok(ForkResult::Child) => run_in_child(slave_fd, shell),
@@ -236,6 +283,64 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
     use tokio::sync::watch;
+
+    /// A client that stops reading ends the session through the master side,
+    /// with the shell still alive. That must neither leave the shell behind
+    /// nor block the runtime waiting for it, which on a single worker stalls
+    /// the whole agent.
+    #[test]
+    fn test_session_ends_when_the_client_stops_reading() {
+        use std::os::unix::process::CommandExt;
+        use std::process::Command;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let pseudo = openpty(None, None).unwrap();
+        let slave = pseudo.slave.try_clone().unwrap();
+        let mut shell = unsafe {
+            Command::new("sh")
+                .args(["-c", "echo ready; exec sleep 600"])
+                .stdin(Stdio::from(slave.try_clone().unwrap()))
+                .stdout(Stdio::from(slave.try_clone().unwrap()))
+                .stderr(Stdio::from(slave))
+                .pre_exec(|| {
+                    setsid()?;
+                    libc::ioctl(0, libc::TIOCSCTTY, 0);
+                    Ok(())
+                })
+                .spawn()
+                .unwrap()
+        };
+        let child_pid = Pid::from_raw(shell.id() as i32);
+
+        let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        theirs.shutdown(std::net::Shutdown::Read).unwrap();
+        ours.set_nonblocking(true).unwrap();
+
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let res = rt.block_on(async {
+                let stream = tokio::net::UnixStream::from_std(ours).unwrap();
+                run_in_parent(slog_scope::logger(), stream, pseudo, child_pid).await
+            });
+            let _ = done_tx.send(res.is_ok());
+        });
+
+        let finished = done_rx.recv_timeout(Duration::from_secs(30));
+        let reaped = signal::kill(child_pid, None).is_err();
+        if !reaped {
+            let _ = shell.kill();
+            let _ = shell.wait();
+        }
+        drop(theirs);
+
+        assert_eq!(finished, Ok(true), "the debug console session never ended");
+        assert!(reaped, "the debug console shell outlived its session");
+    }
 
     #[tokio::test]
     async fn test_setup_debug_console_no_shells() {

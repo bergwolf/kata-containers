@@ -67,7 +67,7 @@ message Process {
 	// Rlimits specifies rlimit options to apply to the process.
 	repeated POSIXRlimit Rlimits = 8;
 
-	// NoNewPrivileges controls whether additional privileges could be gained by processes in the container.	
+	// NoNewPrivileges controls whether additional privileges could be gained by processes in the container.
 	bool NoNewPrivileges = 9;
 
 	// ApparmorProfile specifies the apparmor profile for the container.
@@ -84,7 +84,7 @@ message Box {
 	// Height is the vertical dimension of a box.
 	uint32 Height = 1;
 
-	// Width is the horizontal dimension of a box.	
+	// Width is the horizontal dimension of a box.
 	uint32 Width = 2;
 }
 
@@ -172,9 +172,16 @@ message Hooks {
 }
 
 message Hook {
+	// Path is the absolute path to the container's root filesystem.
 	string Path = 1;
+
+	// Arguments used for the binary, including the binary name itself.
 	repeated string Args = 2;
+
+	// Additional `key=value` environment variables.
 	repeated string Env = 3;
+
+	// Timeout is the number of seconds before aborting the hook. If set, timeout MUST be greater than zero.
 	int64 Timeout = 4;
 }
 

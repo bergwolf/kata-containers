@@ -4,8 +4,6 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 #
-
-SKIP_GO_VERSION_CHECK=
 include golang.mk
 
 #Get ARCH.
@@ -18,9 +16,14 @@ ifeq ($(ARCH),)
 endif
 ifeq ($(ARCH),x86_64)
     override ARCH = amd64
+    override EDK2_NAME = ovmf
 endif
 ifeq ($(ARCH),aarch64)
     override ARCH = arm64
+    override EDK2_NAME = aavmf
+endif
+ifeq ($(ARCH),riscv64gc)
+    override ARCH = riscv64
 endif
 
 ARCH_DIR = arch
@@ -56,9 +59,14 @@ BINLIBEXECLIST :=
 BIN_PREFIX = $(PROJECT_TYPE)
 PROJECT_DIR = $(PROJECT_TAG)
 IMAGENAME = $(PROJECT_TAG).img
-IMAGETDXNAME = $(PROJECT_TAG)-tdx.img
+IMAGECONFIDENTIALNAME = $(PROJECT_TAG)-confidential.img
 INITRDNAME = $(PROJECT_TAG)-initrd.img
-INITRDSEVNAME = $(PROJECT_TAG)-initrd-sev.img
+INITRDCONFIDENTIALNAME = $(PROJECT_TAG)-initrd-confidential.img
+
+IMAGENAME_NV = $(PROJECT_TAG)-nvidia-gpu.img
+IMAGENAME_CONFIDENTIAL_NV = $(PROJECT_TAG)-nvidia-gpu-confidential.img
+# Driver-agnostic NVIDIA base image (no GPU userspace), booted by qemu-nvidia-cpu.
+IMAGENAME_NV_BASE = $(PROJECT_TAG)-nvidia.img
 
 TARGET = $(BIN_PREFIX)-runtime
 RUNTIME_OUTPUT = $(CURDIR)/$(TARGET)
@@ -79,7 +87,7 @@ BINDIR        := $(EXEC_PREFIX)/bin
 QEMUBINDIR    := $(PREFIXDEPS)/bin
 CLHBINDIR    := $(PREFIXDEPS)/bin
 FCBINDIR      := $(PREFIXDEPS)/bin
-ACRNBINDIR    := $(PREFIXDEPS)/bin
+STRATOVIRTBINDIR := $(PREFIXDEPS)/bin
 SYSCONFDIR    := /etc
 LOCALSTATEDIR := /var
 
@@ -95,14 +103,19 @@ RUNTIME_NAME = $(TARGET)
 GENERATED_FILES += $(COLLECT_SCRIPT)
 GENERATED_VARS = \
 		VERSION \
-		CONFIG_ACRN_IN \
 		CONFIG_QEMU_IN \
+        CONFIG_QEMU_COCO_DEV_IN \
 		CONFIG_QEMU_NVIDIA_GPU_IN \
-		CONFIG_QEMU_SEV_IN \
+		CONFIG_QEMU_NVIDIA_CPU_IN \
+		CONFIG_QEMU_NVIDIA_GPU_SNP_IN \
+		CONFIG_QEMU_NVIDIA_GPU_TDX_IN \
 		CONFIG_QEMU_TDX_IN \
 		CONFIG_QEMU_SNP_IN \
 		CONFIG_CLH_IN \
 		CONFIG_FC_IN \
+		CONFIG_STRATOVIRT_IN \
+		CONFIG_REMOTE_IN \
+		CONFIG_QEMU_SE_IN \
 		$(USER_VARS)
 SCRIPTS += $(COLLECT_SCRIPT)
 SCRIPTS_DIR := $(BINDIR)
@@ -117,47 +130,72 @@ PKGLIBEXECDIR := $(LIBEXECDIR)/$(PROJECT_DIR)
 KERNELDIR := $(PKGDATADIR)
 
 IMAGEPATH := $(PKGDATADIR)/$(IMAGENAME)
-IMAGETDXPATH := $(PKGDATADIR)/$(IMAGETDXNAME)
+IMAGECONFIDENTIALPATH := $(PKGDATADIR)/$(IMAGECONFIDENTIALNAME)
 INITRDPATH := $(PKGDATADIR)/$(INITRDNAME)
-INITRDSEVPATH := $(PKGDATADIR)/$(INITRDSEVNAME)
+INITRDCONFIDENTIALPATH := $(PKGDATADIR)/$(INITRDCONFIDENTIALNAME)
+
+IMAGEPATH_NV := $(PKGDATADIR)/$(IMAGENAME_NV)
+IMAGEPATH_CONFIDENTIAL_NV := $(PKGDATADIR)/$(IMAGENAME_CONFIDENTIAL_NV)
+IMAGEPATH_NV_BASE := $(PKGDATADIR)/$(IMAGENAME_NV_BASE)
 
 ROOTFSTYPE_EXT4 := \"ext4\"
 ROOTFSTYPE_XFS := \"xfs\"
 ROOTFSTYPE_EROFS := \"erofs\"
-DEFROOTFSTYPE := $(ROOTFSTYPE_EXT4)
+# Guest disk images use compressed EROFS.
+DEFROOTFSTYPE := $(ROOTFSTYPE_EROFS)
 
 FIRMWAREPATH :=
 FIRMWAREVOLUMEPATH :=
 
-FIRMWARETDVFPATH := $(PREFIXDEPS)/share/tdvf/OVMF.fd
+FIRMWAREPATH_NV :=
+ifeq ($(ARCH),amd64)
+    FIRMWAREPATH_NV := $(PREFIXDEPS)/share/$(EDK2_NAME)/OVMF.fd
+endif
+ifeq ($(ARCH),arm64)
+    FIRMWAREPATH_NV := $(PREFIXDEPS)/share/$(EDK2_NAME)/AAVMF_CODE.fd
+endif
+
+
+FIRMWAREPATH_NV_CPU :=
+FIRMWAREVOLUMEPATH_NV_CPU :=
+
+FIRMWARETDVFPATH := $(PREFIXDEPS)/share/ovmf/OVMF.inteltdx.fd
+FIRMWARETDVFPATH_NV := $(FIRMWARETDVFPATH)
 FIRMWARETDVFVOLUMEPATH :=
 
-FIRMWARESEVPATH := $(PREFIXDEPS)/share/ovmf/OVMF.fd
-FIRMWARESNPPATH := $(PREFIXDEPS)/share/ovmf/OVMF.fd
+FIRMWARESNPPATH := $(PREFIXDEPS)/share/ovmf/AMDSEV.fd
+FIRMWARESNPPATH_NV := $(FIRMWARESNPPATH)
 
-ROOTMEASURECONFIG ?= ""
-KERNELPARAMS += $(ROOTMEASURECONFIG)
-KERNELTDXPARAMS += $(ROOTMEASURECONFIG)
+KERNELVERITYPARAMS ?= ""
+KERNELVERITYPARAMS_NV ?= ""
+KERNELVERITYPARAMS_CONFIDENTIAL_NV ?= ""
+# dm-verity params for the driver-agnostic nvidia base image (qemu-nvidia-cpu).
+# The Go runtime maps KERNELVERITYPARAMS_NV to the monolithic nvidia-gpu hash,
+# so qemu-nvidia-cpu needs its own var pointing at the "nvidia" base root hash.
+KERNELVERITYPARAMS_NV_BASE ?= ""
 
 # Name of default configuration file the runtime will use.
 CONFIG_FILE = configuration.toml
 
-HYPERVISOR_ACRN = acrn
 HYPERVISOR_FC = firecracker
 HYPERVISOR_QEMU = qemu
 HYPERVISOR_CLH = cloud-hypervisor
+HYPERVISOR_STRATOVIRT = stratovirt
+HYPERVISOR_REMOTE = remote
 
 # Determines which hypervisor is specified in $(CONFIG_FILE).
 DEFAULT_HYPERVISOR ?= $(HYPERVISOR_QEMU)
 
 # List of hypervisors this build system can generate configuration for.
-HYPERVISORS := $(HYPERVISOR_ACRN) $(HYPERVISOR_FC) $(HYPERVISOR_QEMU) $(HYPERVISOR_CLH)
+HYPERVISORS := $(HYPERVISOR_FC) $(HYPERVISOR_QEMU) $(HYPERVISOR_CLH) $(HYPERVISOR_STRATOVIRT) $(HYPERVISOR_REMOTE)
 
 QEMUPATH := $(QEMUBINDIR)/$(QEMUCMD)
 QEMUVALIDHYPERVISORPATHS := [\"$(QEMUPATH)\"]
 
-QEMUTDXPATH := $(QEMUBINDIR)/$(QEMUTDXCMD)
-QEMUTDXVALIDHYPERVISORPATHS := [\"$(QEMUTDXPATH)\"]
+QEMUTDXEXPERIMENTALPATH := $(QEMUBINDIR)/$(QEMUTDXEXPERIMENTALCMD)
+QEMUTDXEXPERIMENTALVALIDHYPERVISORPATHS := [\"$(QEMUTDXEXPERIMENTALPATH)\"]
+
+QEMUTDXQUOTEGENERATIONSERVICESOCKETPORT := 0
 
 QEMUSNPPATH := $(QEMUBINDIR)/$(QEMUSNPCMD)
 QEMUSNPVALIDHYPERVISORPATHS := [\"$(QEMUSNPPATH)\"]
@@ -172,10 +210,8 @@ FCVALIDHYPERVISORPATHS := [\"$(FCPATH)\"]
 FCJAILERPATH = $(FCBINDIR)/$(FCJAILERCMD)
 FCVALIDJAILERPATHS = [\"$(FCJAILERPATH)\"]
 
-ACRNPATH := $(ACRNBINDIR)/$(ACRNCMD)
-ACRNVALIDHYPERVISORPATHS := [\"$(ACRNPATH)\"]
-ACRNCTLPATH := $(ACRNBINDIR)/$(ACRNCTLCMD)
-ACRNVALIDCTLPATHS := [\"$(ACRNCTLPATH)\"]
+STRATOVIRTPATH = $(STRATOVIRTBINDIR)/$(STRATOVIRTCMD)
+STRATOVIRTVALIDHYPERVISORPATHS := [\"$(STRATOVIRTPATH)\"]
 
 # Default number of vCPUs
 DEFVCPUS := 1
@@ -194,9 +230,14 @@ DEFMEMSLOTS := 10
 DEFMAXMEMSZ := 0
 #Default number of bridges
 DEFBRIDGES := 1
-DEFENABLEANNOTATIONS := [\"enable_iommu\", \"virtio_fs_extra_args\", \"kernel_params\"]
+# Security note: do not enable "virtio_fs_extra_args" by default.
+# Allowing pods to pass arbitrary virtiofsd arguments can be abused for malicious host-side behavior.
+DEFENABLEANNOTATIONS := [\"enable_iommu\", \"kernel_params\", \"kernel_verity_params\"]
+DEFENABLEANNOTATIONS_COCO := [\"enable_iommu\", \"kernel_params\", \"kernel_verity_params\", \"default_vcpus\", \"default_memory\", \"cc_init_data\"]
 DEFDISABLEGUESTSECCOMP := true
-DEFDISABLEGUESTEMPTYDIR := false
+DEFDISABLEGUESTEMPTYDIR := true
+DEFEMPTYDIRMODE := shared-fs
+DEFEMPTYDIRMODE_COCO := block-encrypted
 #Default experimental features enabled
 DEFAULTEXPFEATURES := []
 
@@ -204,24 +245,33 @@ DEFDISABLESELINUX := false
 
 # Default guest SELinux configuration
 DEFDISABLEGUESTSELINUX := true
-DEFGUESTSELINUXLABEL := system_u:system_r:container_t
+# Default is empty string "" to match the default golang (when commented out in config).
+# Most users will want to set this to "system_u:system_r:container_t" for SELinux support.
+DEFGUESTSELINUXLABEL :=
 
 #Default SeccomSandbox param
 #The same default policy is used by libvirt
-#More explanation on https://lists.gnu.org/archive/html/qemu-devel/2017-02/msg03348.html
-# Note: "elevateprivileges=deny" doesn't work with daemonize option, so it's removed from the seccomp sandbox
-DEFSECCOMPSANDBOXPARAM := on,obsolete=deny,spawn=deny,resourcecontrol=deny
+# More explanation on https://lists.gnu.org/archive/html/qemu-devel/2017-02/msg03348.html
+#
+# Default is empty string "" to match the default (when commented out in config).
+# Most users will want to set this to
+# "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny"
+# for better security.
+DEFSECCOMPSANDBOXPARAM :=
 
 #Default entropy source
 DEFENTROPYSOURCE := /dev/urandom
 DEFVALIDENTROPYSOURCES := [\"/dev/urandom\",\"/dev/random\",\"\"]
 
-DEFDISABLEBLOCK := false
+DEFDISABLEBLOCK := true
 DEFSHAREDFS_CLH_VIRTIOFS := virtio-fs
 DEFSHAREDFS_QEMU_VIRTIOFS := virtio-fs
-DEFSHAREDFS_QEMU_TDX_VIRTIOFS := virtio-9p
-DEFSHAREDFS_QEMU_SEV_VIRTIOFS := virtio-9p
-DEFSHAREDFS_QEMU_SNP_VIRTIOFS := virtio-9p
+# Please keep DEFSHAREDFS_QEMU_COCO_DEV_VIRTIOFS in sync with TDX/SNP
+DEFSHAREDFS_QEMU_COCO_DEV_VIRTIOFS := none
+DEFSHAREDFS_STRATOVIRT_VIRTIOFS := virtio-fs
+DEFSHAREDFS_QEMU_TDX_VIRTIOFS := none
+DEFSHAREDFS_QEMU_SNP_VIRTIOFS := none
+DEFSHAREDFS_QEMU_SEL_VIRTIOFS := none
 DEFVIRTIOFSDAEMON := $(LIBEXECDIR)/virtiofsd
 DEFVALIDVIRTIOFSDAEMONPATHS := [\"$(DEFVIRTIOFSDAEMON)\"]
 # Default DAX mapping cache size in MiB
@@ -234,13 +284,13 @@ DEFVIRTIOFSQUEUESIZE ?= 1024
 #
 # see `virtiofsd -h` for possible options.
 # Make sure you quote args.
-DEFVIRTIOFSEXTRAARGS ?= [\"--thread-pool-size=1\", \"--announce-submounts\"]
+DEFVIRTIOFSEXTRAARGS ?= [\"--announce-submounts\"]
 DEFENABLEIOTHREADS := false
+DEFINDEPIOTHREADS := 0
 DEFENABLEVHOSTUSERSTORE := false
+DEFENABLEVIRTIOMEM ?= false
 DEFVHOSTUSERSTOREPATH := $(PKGRUNDIR)/vhost-user
 DEFVALIDVHOSTUSERSTOREPATHS := [\"$(DEFVHOSTUSERSTOREPATH)\"]
-DEFFILEMEMBACKEND := ""
-DEFVALIDFILEMEMBACKENDS := [\"$(DEFFILEMEMBACKEND)\"]
 DEFMSIZE9P := 8192
 DEFVFIOMODE := guest-kernel
 
@@ -248,12 +298,32 @@ DEFVFIOMODE := guest-kernel
 DEFSANDBOXCGROUPONLY ?= false
 
 DEFSTATICRESOURCEMGMT ?= false
+DEFSTATICRESOURCEMGMT_QEMU ?= false
+ifeq ($(ARCH),arm64)
+    DEFSTATICRESOURCEMGMT_QEMU = true
+endif
 DEFSTATICRESOURCEMGMT_TEE = true
+DEFSTATICRESOURCEMGMT_NV = true
+
+DEFDISABLEIMAGENVDIMM ?= true
+DEFDISABLEIMAGENVDIMM_NV = true
+DEFDISABLEIMAGENVDIMM_CLH ?= true
 
 DEFBINDMOUNTS := []
 
-# Image Service Offload
-DEFSERVICEOFFLOAD ?= false
+# Create Container Timeout in seconds
+DEFCREATECONTAINERTIMEOUT ?= 60
+
+# Default directory of directly attachable network config.
+DEFDANCONF := /run/kata-containers/dans
+
+DEFFORCEGUESTPULL := false
+
+DEFKUBELETROOTDIR := /var/lib/kubelet
+
+# Device cold plug
+DEFPODRESOURCEAPISOCK := ""
+DEFPODRESOURCEAPISOCK_NV := "$(DEFKUBELETROOTDIR)/pod-resources/kubelet.sock"
 
 SED = sed
 
@@ -293,6 +363,17 @@ ifneq (,$(QEMUCMD))
 
     CONFIGS += $(CONFIG_QEMU)
 
+    # Begin configuration-qemu-coco-dev
+    CONFIG_FILE_QEMU_COCO_DEV = configuration-qemu-coco-dev.toml
+    CONFIG_QEMU_COCO_DEV = config/$(CONFIG_FILE_QEMU_COCO_DEV)
+    CONFIG_QEMU_COCO_DEV_IN = $(CONFIG_QEMU_COCO_DEV).in
+
+    SYSCONFIG_QEMU_COCO_DEV = $(abspath $(SYSCONFDIR)/$(CONFIG_FILE_QEMU_COCO_DEV))
+    SYSCONFIG_PATHS += $(SYSCONFIG_QEMU_COCO_DEV)
+
+    CONFIGS += $(CONFIG_QEMU_COCO_DEV)
+    # End configuration-qemu-coco-dev
+
     CONFIG_FILE_QEMU_TDX = configuration-qemu-tdx.toml
     CONFIG_QEMU_TDX = config/$(CONFIG_FILE_QEMU_TDX)
     CONFIG_QEMU_TDX_IN = $(CONFIG_QEMU_TDX).in
@@ -304,18 +385,6 @@ ifneq (,$(QEMUCMD))
     SYSCONFIG_PATHS_TDX += $(SYSCONFIG_QEMU_TDX)
 
     CONFIGS += $(CONFIG_QEMU_TDX)
-
-    CONFIG_FILE_QEMU_SEV = configuration-qemu-sev.toml
-    CONFIG_QEMU_SEV = config/$(CONFIG_FILE_QEMU_SEV)
-    CONFIG_QEMU_SEV_IN = $(CONFIG_QEMU_SEV).in
-
-    CONFIG_PATH_QEMU_SEV = $(abspath $(CONFDIR)/$(CONFIG_FILE_QEMU_SEV))
-    CONFIG_PATHS += $(CONFIG_PATH_QEMU_SEV)
-
-    SYSCONFIG_QEMU_SEV = $(abspath $(SYSCONFDIR)/$(CONFIG_FILE_QEMU_SEV))
-    SYSCONFIG_PATHS_SEV += $(SYSCONFIG_QEMU_SEV)
-
-    CONFIGS += $(CONFIG_QEMU_SEV)
 
     CONFIG_FILE_QEMU_SNP = configuration-qemu-snp.toml
     CONFIG_QEMU_SNP = config/$(CONFIG_FILE_QEMU_SNP)
@@ -335,27 +404,123 @@ ifneq (,$(QEMUCMD))
 
     CONFIGS += $(CONFIG_QEMU_NVIDIA_GPU)
 
+    CONFIG_FILE_QEMU_NVIDIA_CPU = configuration-qemu-nvidia-cpu.toml
+    CONFIG_QEMU_NVIDIA_CPU = config/$(CONFIG_FILE_QEMU_NVIDIA_CPU)
+    CONFIG_QEMU_NVIDIA_CPU_IN = $(CONFIG_QEMU_NVIDIA_CPU).in
+
+    CONFIGS += $(CONFIG_QEMU_NVIDIA_CPU)
+
+    CONFIG_FILE_QEMU_NVIDIA_GPU_SNP = configuration-qemu-nvidia-gpu-snp.toml
+    CONFIG_QEMU_NVIDIA_GPU_SNP = config/$(CONFIG_FILE_QEMU_NVIDIA_GPU_SNP)
+    CONFIG_QEMU_NVIDIA_GPU_SNP_IN = $(CONFIG_QEMU_NVIDIA_GPU_SNP).in
+
+    CONFIG_PATH_QEMU_NVIDIA_GPU_SNP = $(abspath $(CONFDIR)/$(CONFIG_FILE_QEMU_NVIDIA_GPU_SNP))
+    CONFIG_PATHS += $(CONFIG_PATH_QEMU_NVIDIA_GPU_SNP)
+
+    SYSCONFIG_QEMU_NVIDIA_GPU_SNP = $(abspath $(SYSCONFDIR)/$(CONFIG_FILE_QEMU_NVIDIA_GPU_SNP))
+    SYSCONFIG_PATHS_SNP += $(SYSCONFIG_QEMU_NVIDIA_GPU_SNP)
+
+    CONFIGS += $(CONFIG_QEMU_NVIDIA_GPU_SNP)
+
+    CONFIG_FILE_QEMU_NVIDIA_GPU_TDX = configuration-qemu-nvidia-gpu-tdx.toml
+    CONFIG_QEMU_NVIDIA_GPU_TDX = config/$(CONFIG_FILE_QEMU_NVIDIA_GPU_TDX)
+    CONFIG_QEMU_NVIDIA_GPU_TDX_IN = $(CONFIG_QEMU_NVIDIA_GPU_TDX).in
+
+    CONFIG_PATH_QEMU_NVIDIA_GPU_TDX = $(abspath $(CONFDIR)/$(CONFIG_FILE_QEMU_NVIDIA_GPU_TDX))
+    CONFIG_PATHS += $(CONFIG_PATH_QEMU_NVIDIA_GPU_TDX)
+
+    SYSCONFIG_QEMU_NVIDIA_GPU_TDX = $(abspath $(SYSCONFDIR)/$(CONFIG_FILE_QEMU_NVIDIA_GPU_TDX))
+    SYSCONFIG_PATHS += $(SYSCONFIG_QEMU_NVIDIA_GPU_TDX)
+
+    CONFIGS += $(CONFIG_QEMU_NVIDIA_GPU_TDX)
+
+    CONFIG_FILE_REMOTE = configuration-remote.toml
+    CONFIG_REMOTE = config/$(CONFIG_FILE_REMOTE)
+    CONFIG_REMOTE_IN = $(CONFIG_REMOTE).in
+
+    CONFIG_PATH_REMOTE = $(abspath $(CONFDIR)/$(CONFIG_FILE_REMOTE))
+    CONFIG_PATHS += $(CONFIG_PATH_REMOTE)
+
+    SYSCONFIG_REMOTE = $(abspath $(SYSCONFDIR)/$(CONFIG_FILE_REMOTE))
+    SYSCONFIG_PATHS += $(SYSCONFIG_REMOTE)
+
+    CONFIGS += $(CONFIG_REMOTE)
+
+    CONFIG_FILE_QEMU_SE = configuration-qemu-se.toml
+    CONFIG_QEMU_SE = config/$(CONFIG_FILE_QEMU_SE)
+    CONFIG_QEMU_SE_IN = $(CONFIG_QEMU_SE).in
+
+    CONFIG_PATH_QEMU_SE = $(abspath $(CONFDIR)/$(CONFIG_FILE_QEMU_SE))
+    CONFIG_PATHS += $(CONFIG_PATH_QEMU_SE)
+
+    SYSCONFIG_QEMU_SE = $(abspath $(SYSCONFDIR)/$(CONFIG_FILE_QEMU_SE))
+    SYSCONFIG_PATHS += $(SYSCONFIG_QEMU_SE)
+
+    DEFVFIOMODE_SE = vfio
+
+    CONFIGS += $(CONFIG_QEMU_SE)
+
     # qemu-specific options (all should be suffixed by "_QEMU")
     DEFBLOCKSTORAGEDRIVER_QEMU := virtio-scsi
     DEFBLOCKDEVICEAIO_QEMU := io_uring
     DEFNETWORKMODEL_QEMU := tcfilter
 
+    # Normal: uncompressed (KERNELTYPE). Confidential: compressed (KERNELCONFIDENTIALTYPE).
     KERNELTYPE = uncompressed
     KERNELNAME = $(call MAKE_KERNEL_NAME,$(KERNELTYPE))
     KERNELPATH = $(KERNELDIR)/$(KERNELNAME)
 
-    KERNELSEVTYPE = compressed
-    KERNELSEVNAME = $(call MAKE_KERNEL_SEV_NAME,$(KERNELSEVTYPE))
-    KERNELSEVPATH = $(KERNELDIR)/$(KERNELSEVNAME)
+    KERNELCONFIDENTIALTYPE = compressed
+    KERNELCONFIDENTIALNAME = $(call MAKE_KERNEL_NAME,$(KERNELCONFIDENTIALTYPE))
+    KERNELCONFIDENTIALPATH = $(KERNELDIR)/$(KERNELCONFIDENTIALNAME)
 
-    KERNELTDXTYPE = compressed
-    KERNELTDXNAME = $(call MAKE_KERNEL_TDX_NAME,$(KERNELTDXTYPE))
-    KERNELTDXPATH = $(KERNELDIR)/$(KERNELTDXNAME)
+    KERNELSENAME = kata-containers-se.img
+    KERNELSEPATH = $(KERNELDIR)/$(KERNELSENAME)
 
-    KERNELSNPTYPE = compressed
-    KERNELSNPNAME = $(call MAKE_KERNEL_SNP_NAME,$(KERNELSNPTYPE))
-    KERNELSNPPATH = $(KERNELDIR)/$(KERNELSNPNAME)
+    # NVIDIA CPU specific options (all should be suffixed by _NV_CPU)
+    KERNELTYPE_NV_CPU = uncompressed
+    KERNELNAME_NV_CPU = $(call MAKE_KERNEL_NAME_NV,$(KERNELTYPE_NV_CPU))
+    KERNELPATH_NV_CPU = $(KERNELDIR)/$(KERNELNAME_NV_CPU)
 
+    # NVIDIA GPU specific options (all should be suffixed by _NV)
+    KERNELTYPE_NV = compressed
+    KERNELNAME_NV = $(call MAKE_KERNEL_NAME_NV,$(KERNELTYPE_NV))
+    KERNELPATH_NV = $(KERNELDIR)/$(KERNELNAME_NV)
+    KERNELNAME_CONFIDENTIAL_NV = $(call MAKE_KERNEL_NAME_NV,$(KERNELCONFIDENTIALTYPE))
+    KERNELPATH_CONFIDENTIAL_NV = $(KERNELDIR)/$(KERNELNAME_CONFIDENTIAL_NV)
+
+    DEFAULTVCPUS_NV = 1
+    DEFAULTMEMORY_NV = 8192
+    DEFAULTTIMEOUT_NV = 1200
+    DEFAULTLAUNCHPROCESSTIMEOUT_NV = 15
+    DEFAULTVFIOPORT_NV = root-port
+    DEFAULTPCIEROOTPORT_NV = 8
+
+    KERNELPARAMS_NV = "cgroup_no_v1=all"
+    KERNELPARAMS_NV += "pci=realloc"
+    KERNELPARAMS_NV += "pci=nocrs"
+    KERNELPARAMS_NV += "pci=assign-busses"
+
+    KERNELPARAMS_CONFIDENTIAL_NV = $(KERNELPARAMS_NV)
+    KERNELPARAMS_CONFIDENTIAL_NV += "nvrc.smi.srs=1"
+
+    # Setting this to false can lead to cgroup leakages in the host
+    # Best practice for production is to set this to true
+    DEFSANDBOXCGROUPONLY_NV = true
+
+    DEFENABLEVCPUPINNING_NV = false
+
+    DEFENABLENUMA_NV = false
+
+    # NVIDIA profile: rootfs filesystem type (erofs for read-only, compressed images)
+    DEFROOTFSTYPE_NV := $(ROOTFSTYPE_EROFS)
+
+    ifneq (,$(QEMUFW))
+        FIRMWAREPATH := $(PREFIXDEPS)/share/$(EDK2_NAME)/$(QEMUFW)
+    endif
+    ifneq (,$(QEMUFWVOL))
+        FIRMWAREVOLUMEPATH := $(PREFIXDEPS)/share/$(EDK2_NAME)/$(QEMUFWVOL)
+    endif
 endif
 
 ifneq (,$(CLHCMD))
@@ -373,12 +538,59 @@ ifneq (,$(CLHCMD))
 
     CONFIGS += $(CONFIG_CLH)
 
+    CONFIG_FILE_CLH_AZURE = configuration-clh-azure.toml
+    CONFIG_CLH_AZURE = config/$(CONFIG_FILE_CLH_AZURE)
+    CONFIG_CLH_AZURE_IN = $(CONFIG_CLH_AZURE).in
+
+    CONFIG_PATH_CLH_AZURE = $(abspath $(CONFDIR)/$(CONFIG_FILE_CLH_AZURE))
+    CONFIG_PATHS += $(CONFIG_PATH_CLH_AZURE)
+
+    SYSCONFIG_CLH_AZURE = $(abspath $(SYSCONFDIR)/$(CONFIG_FILE_CLH_AZURE))
+    SYSCONFIG_PATHS += $(SYSCONFIG_CLH_AZURE)
+
+    CONFIGS += $(CONFIG_CLH_AZURE)
+
     # CLH-specific options (all should be suffixed by "_CLH")
+    DEFDISABLENESTEDVIRTUALIZATION_CLH := false
+    DEFDISABLENESTEDVIRTUALIZATION_CLH_AZURE := true
     # currently, huge pages are required for virtiofsd support
     DEFNETWORKMODEL_CLH := tcfilter
+    IMAGEPATH_CLH_AZURE := $(PKGDATADIR)/kata-containers-mariner.img
+    KERNELPATH_CLH_AZURE := /usr/share/cloud-hypervisor/vmlinux.bin
+    DEFSTATICRESOURCEMGMT_CLH_AZURE := true
     KERNELTYPE_CLH = uncompressed
     KERNEL_NAME_CLH = $(call MAKE_KERNEL_NAME,$(KERNELTYPE_CLH))
     KERNELPATH_CLH = $(KERNELDIR)/$(KERNEL_NAME_CLH)
+endif
+
+ifneq (,$(STRATOVIRTCMD))
+    KNOWN_HYPERVISORS += $(HYPERVISOR_STRATOVIRT)
+
+    CONFIG_FILE_STRATOVIRT = configuration-stratovirt.toml
+    CONFIG_STRATOVIRT = config/$(CONFIG_FILE_STRATOVIRT)
+    CONFIG_STRATOVIRT_IN = $(CONFIG_STRATOVIRT).in
+
+    CONFIG_PATH_STRATOVIRT = $(abspath $(CONFDIR)/$(CONFIG_FILE_STRATOVIRT))
+    CONFIG_PATHS += $(CONFIG_PATH_STRATOVIRT)
+
+    SYSCONFIG_STRATOVIRT = $(abspath $(SYSCONFDIR)/$(CONFIG_FILE_STRATOVIRT))
+    SYSCONFIG_PATHS += $(SYSCONFIG_STRATOVIRT)
+
+    CONFIGS += $(CONFIG_STRATOVIRT)
+
+    # stratovirt-specific options (all should be suffixed by "_STRATOVIRT")
+    DEFMACHINETYPE_STRATOVIRT := microvm
+    DEFBLOCKSTORAGEDRIVER_STRATOVIRT := virtio-mmio
+    DEFNETWORKMODEL_STRATOVIRT := tcfilter
+    DEFSTATICRESOURCEMGMT_STRATOVIRT = true
+ifeq ($(ARCH),amd64)
+    KERNELTYPE_STRATOVIRT = compressed
+endif
+ifeq ($(ARCH),arm64)
+    KERNELTYPE_STRATOVIRT = uncompressed
+endif
+    KERNEL_NAME_STRATOVIRT = $(call MAKE_KERNEL_NAME,$(KERNELTYPE_STRATOVIRT))
+    KERNELPATH_STRATOVIRT = $(KERNELDIR)/$(KERNEL_NAME_STRATOVIRT)
 endif
 
 ifneq (,$(FCCMD))
@@ -405,30 +617,6 @@ ifneq (,$(FCCMD))
     KERNELPATH_FC = $(KERNELDIR)/$(KERNEL_NAME_FC)
 endif
 
-ifneq (,$(ACRNCMD))
-    KNOWN_HYPERVISORS += $(HYPERVISOR_ACRN)
-
-    CONFIG_FILE_ACRN = configuration-acrn.toml
-    CONFIG_ACRN = config/$(CONFIG_FILE_ACRN)
-    CONFIG_ACRN_IN = $(CONFIG_ACRN).in
-
-    CONFIG_PATH_ACRN = $(abspath $(CONFDIR)/$(CONFIG_FILE_ACRN))
-    CONFIG_PATHS += $(CONFIG_PATH_ACRN)
-
-    SYSCONFIG_ACRN = $(abspath $(SYSCONFDIR)/$(CONFIG_FILE_ACRN))
-    SYSCONFIG_PATHS += $(SYSCONFIG_ACRN)
-
-    CONFIGS += $(CONFIG_ACRN)
-
-    # acrn-specific options (all should be suffixed by "_ACRN")
-    DEFMAXVCPUS_ACRN := 1
-    DEFBLOCKSTORAGEDRIVER_ACRN := virtio-blk
-    DEFNETWORKMODEL_ACRN := macvtap
-    KERNELTYPE_ACRN = compressed
-    KERNEL_NAME_ACRN = $(call MAKE_KERNEL_NAME,$(KERNELTYPE_ACRN))
-    KERNELPATH_ACRN = $(KERNELDIR)/$(KERNEL_NAME_ACRN)
-endif
-
 ifeq (,$(KNOWN_HYPERVISORS))
     $(error "ERROR: No hypervisors known for architecture $(ARCH) (looked for: $(HYPERVISORS))")
 endif
@@ -453,10 +641,6 @@ ifeq ($(DEFAULT_HYPERVISOR),$(HYPERVISOR_FC))
     DEFAULT_HYPERVISOR_CONFIG = $(CONFIG_FILE_FC)
 endif
 
-ifeq ($(DEFAULT_HYPERVISOR),$(HYPERVISOR_ACRN))
-    DEFAULT_HYPERVISOR_CONFIG = $(CONFIG_FILE_ACRN)
-endif
-
 ifeq ($(DEFAULT_HYPERVISOR),$(HYPERVISOR_CLH))
     DEFAULT_HYPERVISOR_CONFIG = $(CONFIG_FILE_CLH)
 endif
@@ -476,19 +660,14 @@ SHAREDIR := $(SHAREDIR)
 # list of variables the user may wish to override
 USER_VARS += ARCH
 USER_VARS += BINDIR
-USER_VARS += CONFIG_ACRN_IN
 USER_VARS += CONFIG_CLH_IN
 USER_VARS += CONFIG_FC_IN
+USER_VARS += CONFIG_STRATOVIRT_IN
 USER_VARS += CONFIG_PATH
 USER_VARS += CONFIG_QEMU_IN
+USER_VARS += CONFIG_REMOTE_IN
 USER_VARS += DESTDIR
 USER_VARS += DEFAULT_HYPERVISOR
-USER_VARS += ACRNCMD
-USER_VARS += ACRNCTLCMD
-USER_VARS += ACRNPATH
-USER_VARS += ACRNVALIDHYPERVISORPATHS
-USER_VARS += ACRNCTLPATH
-USER_VARS += ACRNVALIDCTLPATHS
 USER_VARS += CLHPATH
 USER_VARS += CLHVALIDHYPERVISORPATHS
 USER_VARS += FIRMWAREPATH_CLH
@@ -497,42 +676,77 @@ USER_VARS += FCPATH
 USER_VARS += FCVALIDHYPERVISORPATHS
 USER_VARS += FCJAILERPATH
 USER_VARS += FCVALIDJAILERPATHS
+USER_VARS += STRATOVIRTPATH
+USER_VARS += STRATOVIRTVALIDHYPERVISORPATHS
 USER_VARS += SYSCONFIG
 USER_VARS += IMAGENAME
-USER_VARS += IMAGETDXNAME
+USER_VARS += IMAGECONFIDENTIALNAME
 USER_VARS += IMAGEPATH
-USER_VARS += IMAGETDXPATH
+USER_VARS += IMAGEPATH_CLH_AZURE
+USER_VARS += IMAGECONFIDENTIALPATH
 USER_VARS += INITRDNAME
-USER_VARS += INITRDSEVNAME
+USER_VARS += INITRDCONFIDENTIALNAME
 USER_VARS += INITRDPATH
-USER_VARS += INITRDSEVPATH
+USER_VARS += INITRDCONFIDENTIALPATH
+USER_VARS += IMAGENAME_NV
+USER_VARS += IMAGENAME_CONFIDENTIAL_NV
+USER_VARS += IMAGEPATH_NV
+USER_VARS += IMAGEPATH_CONFIDENTIAL_NV
+USER_VARS += IMAGENAME_NV_BASE
+USER_VARS += IMAGEPATH_NV_BASE
+USER_VARS += KERNELNAME_NV
+USER_VARS += KERNELPATH_NV
+USER_VARS += KERNELPATH_NV_CPU
+USER_VARS += KERNELNAME_CONFIDENTIAL_NV
+USER_VARS += KERNELPATH_CONFIDENTIAL_NV
+USER_VARS += DEFAULTVCPUS_NV
+USER_VARS += DEFAULTMEMORY_NV
+USER_VARS += DEFAULTVFIOPORT_NV
+USER_VARS += DEFAULTPCIEROOTPORT_NV
+USER_VARS += KERNELPARAMS_NV
+USER_VARS += KERNELPARAMS_CONFIDENTIAL_NV
+USER_VARS += KERNELVERITYPARAMS_NV
+USER_VARS += KERNELVERITYPARAMS_CONFIDENTIAL_NV
+USER_VARS += KERNELVERITYPARAMS_NV_BASE
+USER_VARS += DEFAULTTIMEOUT_NV
+USER_VARS += DEFAULTLAUNCHPROCESSTIMEOUT_NV
+USER_VARS += DEFSANDBOXCGROUPONLY_NV
+USER_VARS += DEFENABLEVCPUPINNING_NV
+USER_VARS += DEFENABLENUMA_NV
+USER_VARS += DEFROOTFSTYPE_NV
 USER_VARS += DEFROOTFSTYPE
 USER_VARS += MACHINETYPE
 USER_VARS += KERNELDIR
 USER_VARS += KERNELTYPE
 USER_VARS += KERNELTYPE_FC
-USER_VARS += KERNELTYPE_ACRN
 USER_VARS += KERNELTYPE_CLH
-USER_VARS += KERNELPATH_ACRN
 USER_VARS += KERNELPATH
-USER_VARS += KERNELSEVPATH
-USER_VARS += KERNELTDXPATH
-USER_VARS += KERNELSNPPATH
+USER_VARS += KERNELCONFIDENTIALPATH
+USER_VARS += KERNELSEPATH
 USER_VARS += KERNELPATH_CLH
+USER_VARS += KERNELPATH_CLH_AZURE
 USER_VARS += KERNELPATH_FC
+USER_VARS += KERNELPATH_STRATOVIRT
 USER_VARS += KERNELVIRTIOFSPATH
 USER_VARS += FIRMWAREPATH
-USER_VARS += FIRMWARESEVPATH
+USER_VARS += FIRMWAREPATH_NV
+USER_VARS += FIRMWAREPATH_NV_CPU
 USER_VARS += FIRMWARETDVFPATH
 USER_VARS += FIRMWAREVOLUMEPATH
+USER_VARS += FIRMWAREVOLUMEPATH_NV_CPU
 USER_VARS += FIRMWARETDVFVOLUMEPATH
 USER_VARS += FIRMWARESNPPATH
+USER_VARS += FIRMWARETDVFPATH_NV
+USER_VARS += FIRMWARESNPPATH_NV
 USER_VARS += MACHINEACCELERATORS
 USER_VARS += CPUFEATURES
 USER_VARS += TDXCPUFEATURES
 USER_VARS += DEFMACHINETYPE_CLH
+USER_VARS += DEFMACHINETYPE_STRATOVIRT
 USER_VARS += KERNELPARAMS
+USER_VARS += KERNELVERITYPARAMS
 USER_VARS += KERNELTDXPARAMS
+USER_VARS += KERNELQEMUCOCODEVPARAMS
 USER_VARS += LIBEXECDIR
 USER_VARS += LOCALSTATEDIR
 USER_VARS += PKGDATADIR
@@ -548,13 +762,14 @@ USER_VARS += PROJECT_TYPE
 USER_VARS += PROJECT_URL
 USER_VARS += QEMUBINDIR
 USER_VARS += QEMUCMD
-USER_VARS += QEMUTDXCMD
+USER_VARS += QEMUTDXEXPERIMENTALCMD
 USER_VARS += QEMUSNPCMD
 USER_VARS += QEMUPATH
-USER_VARS += QEMUTDXPATH
+USER_VARS += QEMUTDXEXPERIMENTALPATH
+USER_VARS += QEMUTDXQUOTEGENERATIONSERVICESOCKETPORT
 USER_VARS += QEMUSNPPATH
 USER_VARS += QEMUVALIDHYPERVISORPATHS
-USER_VARS += QEMUTDXVALIDHYPERVISORPATHS
+USER_VARS += QEMUTDXEXPERIMENTALVALIDHYPERVISORPATHS
 USER_VARS += QEMUSNPVALIDHYPERVISORPATHS
 USER_VARS += QEMUVIRTIOFSCMD
 USER_VARS += QEMUVIRTIOFSPATH
@@ -563,31 +778,36 @@ USER_VARS += SHAREDIR
 USER_VARS += SYSCONFDIR
 USER_VARS += DEFVCPUS
 USER_VARS += DEFMAXVCPUS
-USER_VARS += DEFMAXVCPUS_ACRN
+USER_VARS += DEFDISABLENESTEDVIRTUALIZATION_CLH
+USER_VARS += DEFDISABLENESTEDVIRTUALIZATION_CLH_AZURE
 USER_VARS += DEFMEMSZ
 USER_VARS += DEFMEMSLOTS
 USER_VARS += DEFMAXMEMSZ
 USER_VARS += DEFBRIDGES
-USER_VARS += DEFNETWORKMODEL_ACRN
 USER_VARS += DEFNETWORKMODEL_CLH
 USER_VARS += DEFNETWORKMODEL_FC
 USER_VARS += DEFNETWORKMODEL_QEMU
+USER_VARS += DEFNETWORKMODEL_STRATOVIRT
 USER_VARS += DEFDISABLEGUESTEMPTYDIR
+USER_VARS += DEFEMPTYDIRMODE
+USER_VARS += DEFEMPTYDIRMODE_COCO
 USER_VARS += DEFDISABLEGUESTSECCOMP
 USER_VARS += DEFDISABLESELINUX
 USER_VARS += DEFDISABLEGUESTSELINUX
 USER_VARS += DEFGUESTSELINUXLABEL
 USER_VARS += DEFAULTEXPFEATURES
 USER_VARS += DEFDISABLEBLOCK
-USER_VARS += DEFBLOCKSTORAGEDRIVER_ACRN
 USER_VARS += DEFBLOCKSTORAGEDRIVER_FC
 USER_VARS += DEFBLOCKSTORAGEDRIVER_QEMU
+USER_VARS += DEFBLOCKSTORAGEDRIVER_STRATOVIRT
 USER_VARS += DEFBLOCKDEVICEAIO_QEMU
 USER_VARS += DEFSHAREDFS_CLH_VIRTIOFS
 USER_VARS += DEFSHAREDFS_QEMU_VIRTIOFS
+USER_VARS += DEFSHAREDFS_QEMU_COCO_DEV_VIRTIOFS
+USER_VARS += DEFSHAREDFS_STRATOVIRT_VIRTIOFS
 USER_VARS += DEFSHAREDFS_QEMU_TDX_VIRTIOFS
-USER_VARS += DEFSHAREDFS_QEMU_SEV_VIRTIOFS
 USER_VARS += DEFSHAREDFS_QEMU_SNP_VIRTIOFS
+USER_VARS += DEFSHAREDFS_QEMU_SEL_VIRTIOFS
 USER_VARS += DEFVIRTIOFSDAEMON
 USER_VARS += DEFVALIDVIRTIOFSDAEMONPATHS
 USER_VARS += DEFVIRTIOFSCACHESIZE
@@ -595,26 +815,39 @@ USER_VARS += DEFVIRTIOFSCACHE
 USER_VARS += DEFVIRTIOFSQUEUESIZE
 USER_VARS += DEFVIRTIOFSEXTRAARGS
 USER_VARS += DEFENABLEANNOTATIONS
+USER_VARS += DEFENABLEANNOTATIONS_COCO
 USER_VARS += DEFENABLEIOTHREADS
+USER_VARS += DEFINDEPIOTHREADS
+USER_VARS += DEFENABLEVIRTIOMEM
 USER_VARS += DEFSECCOMPSANDBOXPARAM
 USER_VARS += DEFENABLEVHOSTUSERSTORE
 USER_VARS += DEFVHOSTUSERSTOREPATH
 USER_VARS += DEFVALIDVHOSTUSERSTOREPATHS
-USER_VARS += DEFFILEMEMBACKEND
-USER_VARS += DEFVALIDFILEMEMBACKENDS
 USER_VARS += DEFMSIZE9P
 USER_VARS += DEFENTROPYSOURCE
 USER_VARS += DEFVALIDENTROPYSOURCES
 USER_VARS += DEFSANDBOXCGROUPONLY
 USER_VARS += DEFSTATICRESOURCEMGMT
+USER_VARS += DEFSTATICRESOURCEMGMT_QEMU
 USER_VARS += DEFSTATICRESOURCEMGMT_CLH
+USER_VARS += DEFSTATICRESOURCEMGMT_CLH_AZURE
 USER_VARS += DEFSTATICRESOURCEMGMT_FC
+USER_VARS += DEFSTATICRESOURCEMGMT_STRATOVIRT
 USER_VARS += DEFSTATICRESOURCEMGMT_TEE
+USER_VARS += DEFSTATICRESOURCEMGMT_NV
 USER_VARS += DEFBINDMOUNTS
-USER_VARS += DEFSERVICEOFFLOAD
+USER_VARS += DEFCREATECONTAINERTIMEOUT
+USER_VARS += DEFDANCONF
+USER_VARS += DEFKUBELETROOTDIR
+USER_VARS += DEFFORCEGUESTPULL
 USER_VARS += DEFVFIOMODE
+USER_VARS += DEFVFIOMODE_SE
 USER_VARS += BUILDFLAGS
-
+USER_VARS += DEFDISABLEIMAGENVDIMM
+USER_VARS += DEFDISABLEIMAGENVDIMM_NV
+USER_VARS += DEFDISABLEIMAGENVDIMM_CLH
+USER_VARS += DEFPODRESOURCEAPISOCK
+USER_VARS += DEFPODRESOURCEAPISOCK_NV
 
 V              = @
 Q              = $(V:1=)
@@ -627,14 +860,56 @@ QUIET_TEST     = $(Q:@=@echo    '     TEST     '$@;)
 
 BUILDTAGS :=
 
-# go build common flags
-BUILDFLAGS := -buildmode=pie -mod=vendor ${BUILDTAGS}
+# Static build profile (default on amd64, arm64 and riscv64; opt-in on
+# s390x and ppc64le).
+#
+# The Go host binaries (kata-runtime, containerd-shim-kata-v2 and kata-monitor)
+# are built with cgo disabled and without PIE by default, producing fully
+# static, libc-agnostic executables. This lets the kata-deploy payload run on
+# musl-only hosts that have no glibc dynamic loader (e.g. Alpine, Kairos'
+# Hadron), in addition to the traditional glibc hosts. It relies on the runtime
+# being cgo-free.
+#
+# On s390x the profile stays opt-in because the KVM host process must be
+# marked with a PT_S390_PGSTE program header, which is emitted by ld's
+# --s390-pgste. Go only honours -extldflags when linkmode=external, and
+# linkmode=external requires cgo, so a cgo-free s390x build cannot carry the
+# marker with today's tooling. The default on s390x therefore stays cgo + PIE
+# until we have a way to produce a cgo-free static binary that still carries
+# the PGSTE program header.
+#
+# On ppc64le the profile also stays opt-in for now. The rest of the
+# kata-deploy payload on ppc64le is glibc-linked (musl is not well supported
+# on the arch, and upstream nydus-snapshotter publishes only per-arch glibc
+# release assets), so shipping a static Go runtime alone does not unlock
+# musl-only hosts. Keep the cgo + PIE build as the default until the ppc64le
+# payload story catches up and ppc64le maintainers confirm the flip.
+#
+# Set STATIC=no to opt out (on s390x and ppc64le this is the default).
+ifneq (,$(filter $(ARCH),s390x ppc64le))
+    STATIC ?= no
+else
+    STATIC ?= yes
+endif
+
+ifeq ($(STATIC),yes)
+       export CGO_ENABLED := 0
+       # PIE requires a dynamic loader, so it cannot be used for static binaries.
+       BUILDFLAGS := ${BUILDTAGS}
+else
+       BUILDFLAGS := -buildmode=pie ${BUILDTAGS}
+endif
 
 # whether stipping the binary
 ifeq ($(STRIP),yes)
        KATA_LDFLAGS = -w -s
 endif
 
+# On s390x the KVM host process must be marked with a PT_S390_PGSTE program
+# header so the kernel allocates PGSTE tables (required by KVM_CREATE_VM). The
+# marker is emitted by the external linker's --s390-pgste flag, which the
+# default cgo + PIE build (STATIC=no on s390x) drives through Go's external
+# linker path.
 ifeq ($(ARCH),s390x)
     KATA_LDFLAGS += -extldflags=-Wl,--s390-pgste
 endif
@@ -696,17 +971,8 @@ define MAKE_KERNEL_VIRTIOFS_NAME
 $(if $(findstring uncompressed,$1),vmlinux-virtiofs.container,vmlinuz-virtiofs.container)
 endef
 
-define MAKE_KERNEL_SEV_NAME
-$(if $(findstring uncompressed,$1),vmlinux-sev.container,vmlinuz-sev.container)
-endef
-
-define MAKE_KERNEL_TDX_NAME
-$(if $(findstring uncompressed,$1),vmlinux-tdx.container,vmlinuz-tdx.container)
-endef
-
-# SNP configuration uses the SEV kernel
-define MAKE_KERNEL_SNP_NAME
-$(if $(findstring uncompressed,$1),vmlinux-sev.container,vmlinuz-sev.container)
+define MAKE_KERNEL_NAME_NV
+$(if $(findstring uncompressed,$1),vmlinux-nvidia-gpu.container,vmlinuz-nvidia-gpu.container)
 endef
 
 GENERATED_FILES += pkg/katautils/config-settings.go
@@ -730,8 +996,7 @@ $(MONITOR_OUTPUT): $(SOURCES) $(GENERATED_FILES) $(MAKEFILE_LIST) .git-commit
 	pre-commit \
 	show-header \
 	show-summary \
-	show-variables \
-	vendor
+	show-variables
 
 $(TARGET).coverage: $(SOURCES) $(GENERATED_FILES) $(MAKEFILE_LIST)
 	$(QUIET_TEST)go test -o $@ -covermode count
@@ -757,9 +1022,9 @@ go-test: $(GENERATED_FILES)
 
 fast-test: $(GENERATED_FILES)
 	go clean -testcache
-	for s in $$(go list ./...); do if ! go test -failfast -v -mod=vendor -p 1 $$s; then break; fi; done
+	for s in $$(go list ./...); do if ! go test -failfast -v -p 1 $$s; then break; fi; done
 
-GOLANGCI_LINT_FILE := ../../../tests/.ci/.golangci.yml
+GOLANGCI_LINT_FILE := ../../tests/.golangci.yml
 GOLANGCI_LINT_NAME = golangci-lint
 GOLANGCI_LINT_CMD := $(shell command -v $(GOLANGCI_LINT_NAME) 2>/dev/null)
 lint: all
@@ -779,7 +1044,7 @@ lint: all
 pre-commit: lint fast-test
 
 coverage:
-	go test -v -mod=vendor -covermode=atomic -coverprofile=coverage.txt ./...
+	go test -v -covermode=atomic -coverprofile=coverage.txt ./...
 	go tool cover -html=coverage.txt -o coverage.html
 
 install: all install-runtime install-containerd-shim-v2 install-monitor
@@ -808,24 +1073,17 @@ install-scripts: $(SCRIPTS)
 install-completions:
 	$(QUIET_INST)install --mode 0644 -D  $(BASH_COMPLETIONS) $(DESTDIR)/$(BASH_COMPLETIONSDIR)/$(notdir $(BASH_COMPLETIONS));
 
-handle_vendor:
-	go mod tidy
-	go mod vendor
-	go mod verify
-
-vendor: handle_vendor
-	./hack/tree_status.sh
-
 static-checks-build: $(GENERATED_FILES)
 
-clean:
+clean: clean-generated-files
 	$(QUIET_CLEAN)rm -f \
-		$(CONFIGS) \
-		$(GENERATED_FILES) \
 		$(MONITOR) \
 		$(SHIMV2) \
 		$(TARGET) \
 		.git-commit .git-commit.tmp
+
+clean-generated-files:
+	$(QUIET_CLEAN)rm -f $(GENERATED_FILES)
 
 show-usage: show-header
 	@printf "• Overview:\n"
@@ -843,6 +1101,7 @@ show-usage: show-header
 	@printf "\tfast-test                  : run tests with failfast option.\n"
 	@printf "\tcheck                      : run code checks.\n"
 	@printf "\tclean                      : remove built files.\n"
+	@printf "\tclean-generated-files      : remove generated files.\n"
 	@printf "\tcontainerd-shim-v2         : only build containerd shim v2.\n"
 	@printf "\tcoverage                   : run coverage tests.\n"
 	@printf "\tdefault                    : same as 'make build' (or just 'make').\n"
@@ -938,8 +1197,8 @@ endif
 ifneq (,$(findstring $(HYPERVISOR_FC),$(KNOWN_HYPERVISORS)))
 	@printf "\t$(HYPERVISOR_FC) hypervisor path (FCPATH) : %s\n" $(abspath $(FCPATH))
 endif
-ifneq (,$(findstring $(HYPERVISOR_ACRN),$(KNOWN_HYPERVISORS)))
-	@printf "\t$(HYPERVISOR_ACRN) hypervisor path (ACRNPATH) : %s\n" $(abspath $(ACRNPATH))
+ifneq (,$(findstring $(HYPERVISOR_STRATOVIRT),$(KNOWN_HYPERVISORS)))
+	@printf "\t$(HYPERVISOR_STRATOVIRT) hypervisor path (STRATOVIRTPATH) : %s\n" $(abspath $(STRATOVIRTPATH))
 endif
 	@printf "\tassets path (PKGDATADIR) : %s\n" $(abspath $(PKGDATADIR))
 	@printf "\tshim path (PKGLIBEXECDIR) : %s\n" $(abspath $(PKGLIBEXECDIR))

@@ -13,17 +13,28 @@ use super::{default, register_hypervisor_plugin};
 use crate::config::default::MAX_CH_VCPUS;
 use crate::config::default::MIN_CH_MEMORY_SIZE_MB;
 
+use crate::config::hypervisor::VIRTIO_BLK_MMIO;
 use crate::config::{ConfigPlugin, TomlConfig};
-use crate::{eother, resolve_path, validate_path};
+use crate::{resolve_path, validate_path};
 
 /// Hypervisor name for CH, used to index `TomlConfig::hypervisor`.
-pub const HYPERVISOR_NAME_CH: &str = "cloud-hypervisor";
+pub const HYPERVISOR_NAME_CH: &str = "clh";
 
 /// Configuration information for CH.
 #[derive(Default, Debug)]
 pub struct CloudHypervisorConfig {}
 
 impl CloudHypervisorConfig {
+    /// Maximum vCPUs for the host's Cloud Hypervisor backend.
+    pub fn max_vcpus() -> u32 {
+        if Path::new("/dev/mshv").exists() {
+            // Preserve the existing MSHV limit; the larger guest is for KVM.
+            default::MAX_CH_MSHV_VCPUS
+        } else {
+            MAX_CH_VCPUS
+        }
+    }
+
     /// Create a new instance of `CloudHypervisorConfig`.
     pub fn new() -> Self {
         CloudHypervisorConfig {}
@@ -38,7 +49,7 @@ impl CloudHypervisorConfig {
 
 impl ConfigPlugin for CloudHypervisorConfig {
     fn get_max_cpus(&self) -> u32 {
-        MAX_CH_VCPUS
+        Self::max_vcpus()
     }
 
     fn get_min_memory(&self) -> u32 {
@@ -85,6 +96,9 @@ impl ConfigPlugin for CloudHypervisorConfig {
             if ch.memory_info.memory_slots == 0 {
                 ch.memory_info.memory_slots = default::DEFAULT_CH_MEMORY_SLOTS;
             }
+            if ch.factory.template_path.is_empty() {
+                ch.factory.template_path = default::DEFAULT_TEMPLATE_PATH.to_string();
+            }
         }
 
         Ok(())
@@ -96,44 +110,98 @@ impl ConfigPlugin for CloudHypervisorConfig {
             validate_path!(ch.path, "CH binary path `{}` is invalid: {}")?;
             validate_path!(ch.ctlpath, "CH control path `{}` is invalid: {}")?;
             if !ch.jailer_path.is_empty() {
-                return Err(eother!("Path for CH jailer should be empty"));
+                return Err(std::io::Error::other("Path for CH jailer should be empty"));
             }
             if !ch.valid_jailer_paths.is_empty() {
-                return Err(eother!("Valid CH jailer path list should be empty"));
+                return Err(std::io::Error::other(
+                    "Valid CH jailer path list should be empty",
+                ));
+            }
+
+            // CoCo guest hardening: virtio-mmio is not hardened for confidential computing.
+            if ch.security_info.confidential_guest
+                && ch.boot_info.vm_rootfs_driver == VIRTIO_BLK_MMIO
+            {
+                return Err(std::io::Error::other(
+                    "Confidential guests must not use virtio-blk-mmio (use virtio-blk-pci); \
+                     virtio-mmio is not hardened for CoCo",
+                ));
             }
 
             if ch.boot_info.kernel.is_empty() {
-                return Err(eother!("Guest kernel image for CH is empty"));
+                return Err(std::io::Error::other("Guest kernel image for CH is empty"));
             }
             if ch.boot_info.image.is_empty() && ch.boot_info.initrd.is_empty() {
-                return Err(eother!("Both guest boot image and initrd for CH are empty"));
+                return Err(std::io::Error::other(
+                    "Both guest boot image and initrd for CH are empty",
+                ));
             }
 
-            if (ch.cpu_info.default_vcpus > 0
-                && ch.cpu_info.default_vcpus as u32 > default::MAX_CH_VCPUS)
-                || ch.cpu_info.default_maxvcpus > default::MAX_CH_VCPUS
+            let max_vcpus = Self::max_vcpus();
+            if ch.cpu_info.default_vcpus > max_vcpus as f32
+                || ch.cpu_info.default_maxvcpus > max_vcpus
             {
-                return Err(eother!(
+                return Err(std::io::Error::other(format!(
                     "CH hypervisor cannot support {} vCPUs",
-                    ch.cpu_info.default_maxvcpus
-                ));
+                    ch.cpu_info.default_maxvcpus,
+                )));
             }
 
             if ch.device_info.default_bridges > default::MAX_CH_PCI_BRIDGES {
-                return Err(eother!(
+                return Err(std::io::Error::other(format!(
                     "CH hypervisor cannot support {} PCI bridges",
-                    ch.device_info.default_bridges
-                ));
+                    ch.device_info.default_bridges,
+                )));
             }
 
             if ch.memory_info.default_memory < MIN_CH_MEMORY_SIZE_MB {
-                return Err(eother!(
-                    "CH hypervisor has minimal memory limitation {}",
-                    MIN_CH_MEMORY_SIZE_MB
-                ));
+                return Err(std::io::Error::other(format!(
+                    "CH hypervisor has minimal memory limitation {MIN_CH_MEMORY_SIZE_MB}",
+                )));
             }
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::hypervisor::Hypervisor;
+
+    #[test]
+    fn test_validate_cpu_limits() {
+        let plugin = CloudHypervisorConfig::new();
+        let limit = if cfg!(target_arch = "x86_64") && !Path::new("/dev/mshv").exists() {
+            512
+        } else {
+            256
+        };
+        let mut ch = Hypervisor::default();
+        ch.boot_info.kernel = "vmlinuz".to_string();
+        ch.boot_info.image = "kata.img".to_string();
+        ch.memory_info.default_memory = MIN_CH_MEMORY_SIZE_MB;
+
+        for (boot_vcpus, max_vcpus, valid) in [
+            (limit as f32 - 0.5, limit, true),
+            (limit as f32, limit, true),
+            (limit as f32 + 0.5, limit, false),
+            (limit as f32 + 1.0, limit, false),
+            (1.0, limit + 1, false),
+        ] {
+            ch.cpu_info.default_vcpus = boot_vcpus;
+            ch.cpu_info.default_maxvcpus = max_vcpus;
+            let mut config = TomlConfig::default();
+            config
+                .hypervisor
+                .insert(HYPERVISOR_NAME_CH.to_string(), ch.clone());
+
+            assert_eq!(
+                plugin.validate(&config).is_ok(),
+                valid,
+                "boot_vcpus={boot_vcpus}, max_vcpus={max_vcpus}"
+            );
+        }
     }
 }

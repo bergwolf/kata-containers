@@ -1,0 +1,75 @@
+[package]
+authors = ["Alibaba Dragonball Team"]
+description = "Virtio device backend driver framework and device drivers"
+edition = "2018"
+homepage = "https://github.com/openanolis/dragonball-sandbox"
+keywords = ["devices", "dragonball", "secure-sandbox", "virtio"]
+license = "Apache-2.0 AND BSD-3-Clause"
+name = "dbs-virtio-devices"
+readme = "README.md"
+repository = "https://github.com/openanolis/dragonball-sandbox/tree/main/crates/dbs-virtio-devices"
+version = "0.3.1"
+
+[dependencies]
+byteorder = { workspace = true }
+caps = { workspace = true }
+dbs-address-space = { workspace = true }
+dbs-boot = { workspace = true }
+dbs-device = { workspace = true }
+dbs-interrupt = { features = [
+  "kvm-legacy-irq",
+  "kvm-msi-irq",
+  "split-legacy-irq",
+], workspace = true }
+dbs-snapshot = { workspace = true }
+dbs-utils = { workspace = true }
+epoll = { workspace = true }
+fuse-backend-rs = { optional = true, workspace = true }
+io-uring = { workspace = true }
+kata-sys-util = { workspace = true }
+kvm-bindings = { workspace = true }
+kvm-ioctls = { workspace = true }
+libc = { workspace = true }
+log = { workspace = true }
+nix = { workspace = true }
+nydus-api = { workspace = true }
+nydus-rafs = { workspace = true }
+nydus-storage = { workspace = true }
+rlimit = { workspace = true }
+sendfd = { workspace = true }
+serde = { features = ["derive"], workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+threadpool = { workspace = true }
+timerfd = { workspace = true }
+vhost-rs = { optional = true, workspace = true }
+virtio-bindings = { workspace = true }
+virtio-queue = { workspace = true }
+vm-memory = { features = ["backend-mmap"], workspace = true }
+vmm-sys-util = { workspace = true }
+
+[dev-dependencies]
+test-utils = { workspace = true }
+vm-memory = { features = ["backend-atomic", "backend-mmap"], workspace = true }
+
+[features]
+test-resources = []
+vhost = ["vhost-rs/vhost-kern", "vhost-rs/vhost-user-frontend", "virtio-mmio"]
+vhost-net = ["vhost", "vhost-rs/vhost-net"]
+vhost-user = ["vhost"]
+vhost-user-blk = ["vhost-user"]
+vhost-user-fs = ["vhost-user"]
+vhost-user-net = ["vhost-user"]
+virtio-balloon = ["virtio-mmio"]
+virtio-blk = ["virtio-mmio"]
+virtio-fs = ["fuse-backend-rs/virtiofs", "nydus-rafs/virtio-fs", "virtio-mmio"]
+virtio-fs-pro = [
+  "nydus-storage/backend-oss",
+  "nydus-storage/backend-registry",
+  "virtio-fs",
+]
+virtio-mem = ["virtio-mmio"]
+virtio-mmio = []
+virtio-net = ["virtio-mmio"]
+virtio-rng = ["virtio-mmio"]
+virtio-vsock = ["virtio-mmio"]

@@ -7,23 +7,30 @@ Name | Type | Description | Notes
 **Cpus** | Pointer to [**CpusConfig**](CpusConfig.md) |  | [optional] 
 **Memory** | Pointer to [**MemoryConfig**](MemoryConfig.md) |  | [optional] 
 **Payload** | [**PayloadConfig**](PayloadConfig.md) |  | 
+**RateLimitGroups** | Pointer to [**[]RateLimitGroupConfig**](RateLimitGroupConfig.md) |  | [optional] 
 **Disks** | Pointer to [**[]DiskConfig**](DiskConfig.md) |  | [optional] 
 **Net** | Pointer to [**[]NetConfig**](NetConfig.md) |  | [optional] 
 **Rng** | Pointer to [**RngConfig**](RngConfig.md) |  | [optional] 
 **Balloon** | Pointer to [**BalloonConfig**](BalloonConfig.md) |  | [optional] 
 **Fs** | Pointer to [**[]FsConfig**](FsConfig.md) |  | [optional] 
+**GenericVhostUser** | Pointer to [**[]GenericVhostUserConfig**](GenericVhostUserConfig.md) |  | [optional] 
 **Pmem** | Pointer to [**[]PmemConfig**](PmemConfig.md) |  | [optional] 
-**Serial** | Pointer to [**ConsoleConfig**](ConsoleConfig.md) |  | [optional] 
+**Serial** | Pointer to [**SerialConfig**](SerialConfig.md) |  | [optional] 
 **Console** | Pointer to [**ConsoleConfig**](ConsoleConfig.md) |  | [optional] 
+**DebugConsole** | Pointer to [**DebugConsoleConfig**](DebugConsoleConfig.md) |  | [optional] 
 **Devices** | Pointer to [**[]DeviceConfig**](DeviceConfig.md) |  | [optional] 
+**UserDevices** | Pointer to [**[]UserDeviceConfig**](UserDeviceConfig.md) |  | [optional] 
 **Vdpa** | Pointer to [**[]VdpaConfig**](VdpaConfig.md) |  | [optional] 
 **Vsock** | Pointer to [**VsockConfig**](VsockConfig.md) |  | [optional] 
-**SgxEpc** | Pointer to [**[]SgxEpcConfig**](SgxEpcConfig.md) |  | [optional] 
 **Numa** | Pointer to [**[]NumaConfig**](NumaConfig.md) |  | [optional] 
-**Iommu** | Pointer to **bool** |  | [optional] [default to false]
 **Watchdog** | Pointer to **bool** |  | [optional] [default to false]
+**Rtc** | Pointer to [**RtcConfig**](RtcConfig.md) |  | [optional] 
+**Pvpanic** | Pointer to **bool** |  | [optional] [default to false]
+**PciSegments** | Pointer to [**[]PciSegmentConfig**](PciSegmentConfig.md) |  | [optional] 
 **Platform** | Pointer to [**PlatformConfig**](PlatformConfig.md) |  | [optional] 
 **Tpm** | Pointer to [**TpmConfig**](TpmConfig.md) |  | [optional] 
+**LandlockEnable** | Pointer to **bool** |  | [optional] [default to false]
+**LandlockRules** | Pointer to [**[]LandlockConfig**](LandlockConfig.md) |  | [optional] 
 
 ## Methods
 
@@ -113,6 +120,31 @@ and a boolean to check if the value has been set.
 
 SetPayload sets Payload field to given value.
 
+
+### GetRateLimitGroups
+
+`func (o *VmConfig) GetRateLimitGroups() []RateLimitGroupConfig`
+
+GetRateLimitGroups returns the RateLimitGroups field if non-nil, zero value otherwise.
+
+### GetRateLimitGroupsOk
+
+`func (o *VmConfig) GetRateLimitGroupsOk() (*[]RateLimitGroupConfig, bool)`
+
+GetRateLimitGroupsOk returns a tuple with the RateLimitGroups field if it's non-nil, zero value otherwise
+and a boolean to check if the value has been set.
+
+### SetRateLimitGroups
+
+`func (o *VmConfig) SetRateLimitGroups(v []RateLimitGroupConfig)`
+
+SetRateLimitGroups sets RateLimitGroups field to given value.
+
+### HasRateLimitGroups
+
+`func (o *VmConfig) HasRateLimitGroups() bool`
+
+HasRateLimitGroups returns a boolean if a field has been set.
 
 ### GetDisks
 
@@ -239,6 +271,31 @@ SetFs sets Fs field to given value.
 
 HasFs returns a boolean if a field has been set.
 
+### GetGenericVhostUser
+
+`func (o *VmConfig) GetGenericVhostUser() []GenericVhostUserConfig`
+
+GetGenericVhostUser returns the GenericVhostUser field if non-nil, zero value otherwise.
+
+### GetGenericVhostUserOk
+
+`func (o *VmConfig) GetGenericVhostUserOk() (*[]GenericVhostUserConfig, bool)`
+
+GetGenericVhostUserOk returns a tuple with the GenericVhostUser field if it's non-nil, zero value otherwise
+and a boolean to check if the value has been set.
+
+### SetGenericVhostUser
+
+`func (o *VmConfig) SetGenericVhostUser(v []GenericVhostUserConfig)`
+
+SetGenericVhostUser sets GenericVhostUser field to given value.
+
+### HasGenericVhostUser
+
+`func (o *VmConfig) HasGenericVhostUser() bool`
+
+HasGenericVhostUser returns a boolean if a field has been set.
+
 ### GetPmem
 
 `func (o *VmConfig) GetPmem() []PmemConfig`
@@ -266,20 +323,20 @@ HasPmem returns a boolean if a field has been set.
 
 ### GetSerial
 
-`func (o *VmConfig) GetSerial() ConsoleConfig`
+`func (o *VmConfig) GetSerial() SerialConfig`
 
 GetSerial returns the Serial field if non-nil, zero value otherwise.
 
 ### GetSerialOk
 
-`func (o *VmConfig) GetSerialOk() (*ConsoleConfig, bool)`
+`func (o *VmConfig) GetSerialOk() (*SerialConfig, bool)`
 
 GetSerialOk returns a tuple with the Serial field if it's non-nil, zero value otherwise
 and a boolean to check if the value has been set.
 
 ### SetSerial
 
-`func (o *VmConfig) SetSerial(v ConsoleConfig)`
+`func (o *VmConfig) SetSerial(v SerialConfig)`
 
 SetSerial sets Serial field to given value.
 
@@ -314,6 +371,31 @@ SetConsole sets Console field to given value.
 
 HasConsole returns a boolean if a field has been set.
 
+### GetDebugConsole
+
+`func (o *VmConfig) GetDebugConsole() DebugConsoleConfig`
+
+GetDebugConsole returns the DebugConsole field if non-nil, zero value otherwise.
+
+### GetDebugConsoleOk
+
+`func (o *VmConfig) GetDebugConsoleOk() (*DebugConsoleConfig, bool)`
+
+GetDebugConsoleOk returns a tuple with the DebugConsole field if it's non-nil, zero value otherwise
+and a boolean to check if the value has been set.
+
+### SetDebugConsole
+
+`func (o *VmConfig) SetDebugConsole(v DebugConsoleConfig)`
+
+SetDebugConsole sets DebugConsole field to given value.
+
+### HasDebugConsole
+
+`func (o *VmConfig) HasDebugConsole() bool`
+
+HasDebugConsole returns a boolean if a field has been set.
+
 ### GetDevices
 
 `func (o *VmConfig) GetDevices() []DeviceConfig`
@@ -338,6 +420,31 @@ SetDevices sets Devices field to given value.
 `func (o *VmConfig) HasDevices() bool`
 
 HasDevices returns a boolean if a field has been set.
+
+### GetUserDevices
+
+`func (o *VmConfig) GetUserDevices() []UserDeviceConfig`
+
+GetUserDevices returns the UserDevices field if non-nil, zero value otherwise.
+
+### GetUserDevicesOk
+
+`func (o *VmConfig) GetUserDevicesOk() (*[]UserDeviceConfig, bool)`
+
+GetUserDevicesOk returns a tuple with the UserDevices field if it's non-nil, zero value otherwise
+and a boolean to check if the value has been set.
+
+### SetUserDevices
+
+`func (o *VmConfig) SetUserDevices(v []UserDeviceConfig)`
+
+SetUserDevices sets UserDevices field to given value.
+
+### HasUserDevices
+
+`func (o *VmConfig) HasUserDevices() bool`
+
+HasUserDevices returns a boolean if a field has been set.
 
 ### GetVdpa
 
@@ -389,31 +496,6 @@ SetVsock sets Vsock field to given value.
 
 HasVsock returns a boolean if a field has been set.
 
-### GetSgxEpc
-
-`func (o *VmConfig) GetSgxEpc() []SgxEpcConfig`
-
-GetSgxEpc returns the SgxEpc field if non-nil, zero value otherwise.
-
-### GetSgxEpcOk
-
-`func (o *VmConfig) GetSgxEpcOk() (*[]SgxEpcConfig, bool)`
-
-GetSgxEpcOk returns a tuple with the SgxEpc field if it's non-nil, zero value otherwise
-and a boolean to check if the value has been set.
-
-### SetSgxEpc
-
-`func (o *VmConfig) SetSgxEpc(v []SgxEpcConfig)`
-
-SetSgxEpc sets SgxEpc field to given value.
-
-### HasSgxEpc
-
-`func (o *VmConfig) HasSgxEpc() bool`
-
-HasSgxEpc returns a boolean if a field has been set.
-
 ### GetNuma
 
 `func (o *VmConfig) GetNuma() []NumaConfig`
@@ -439,31 +521,6 @@ SetNuma sets Numa field to given value.
 
 HasNuma returns a boolean if a field has been set.
 
-### GetIommu
-
-`func (o *VmConfig) GetIommu() bool`
-
-GetIommu returns the Iommu field if non-nil, zero value otherwise.
-
-### GetIommuOk
-
-`func (o *VmConfig) GetIommuOk() (*bool, bool)`
-
-GetIommuOk returns a tuple with the Iommu field if it's non-nil, zero value otherwise
-and a boolean to check if the value has been set.
-
-### SetIommu
-
-`func (o *VmConfig) SetIommu(v bool)`
-
-SetIommu sets Iommu field to given value.
-
-### HasIommu
-
-`func (o *VmConfig) HasIommu() bool`
-
-HasIommu returns a boolean if a field has been set.
-
 ### GetWatchdog
 
 `func (o *VmConfig) GetWatchdog() bool`
@@ -488,6 +545,81 @@ SetWatchdog sets Watchdog field to given value.
 `func (o *VmConfig) HasWatchdog() bool`
 
 HasWatchdog returns a boolean if a field has been set.
+
+### GetRtc
+
+`func (o *VmConfig) GetRtc() RtcConfig`
+
+GetRtc returns the Rtc field if non-nil, zero value otherwise.
+
+### GetRtcOk
+
+`func (o *VmConfig) GetRtcOk() (*RtcConfig, bool)`
+
+GetRtcOk returns a tuple with the Rtc field if it's non-nil, zero value otherwise
+and a boolean to check if the value has been set.
+
+### SetRtc
+
+`func (o *VmConfig) SetRtc(v RtcConfig)`
+
+SetRtc sets Rtc field to given value.
+
+### HasRtc
+
+`func (o *VmConfig) HasRtc() bool`
+
+HasRtc returns a boolean if a field has been set.
+
+### GetPvpanic
+
+`func (o *VmConfig) GetPvpanic() bool`
+
+GetPvpanic returns the Pvpanic field if non-nil, zero value otherwise.
+
+### GetPvpanicOk
+
+`func (o *VmConfig) GetPvpanicOk() (*bool, bool)`
+
+GetPvpanicOk returns a tuple with the Pvpanic field if it's non-nil, zero value otherwise
+and a boolean to check if the value has been set.
+
+### SetPvpanic
+
+`func (o *VmConfig) SetPvpanic(v bool)`
+
+SetPvpanic sets Pvpanic field to given value.
+
+### HasPvpanic
+
+`func (o *VmConfig) HasPvpanic() bool`
+
+HasPvpanic returns a boolean if a field has been set.
+
+### GetPciSegments
+
+`func (o *VmConfig) GetPciSegments() []PciSegmentConfig`
+
+GetPciSegments returns the PciSegments field if non-nil, zero value otherwise.
+
+### GetPciSegmentsOk
+
+`func (o *VmConfig) GetPciSegmentsOk() (*[]PciSegmentConfig, bool)`
+
+GetPciSegmentsOk returns a tuple with the PciSegments field if it's non-nil, zero value otherwise
+and a boolean to check if the value has been set.
+
+### SetPciSegments
+
+`func (o *VmConfig) SetPciSegments(v []PciSegmentConfig)`
+
+SetPciSegments sets PciSegments field to given value.
+
+### HasPciSegments
+
+`func (o *VmConfig) HasPciSegments() bool`
+
+HasPciSegments returns a boolean if a field has been set.
 
 ### GetPlatform
 
@@ -538,6 +670,56 @@ SetTpm sets Tpm field to given value.
 `func (o *VmConfig) HasTpm() bool`
 
 HasTpm returns a boolean if a field has been set.
+
+### GetLandlockEnable
+
+`func (o *VmConfig) GetLandlockEnable() bool`
+
+GetLandlockEnable returns the LandlockEnable field if non-nil, zero value otherwise.
+
+### GetLandlockEnableOk
+
+`func (o *VmConfig) GetLandlockEnableOk() (*bool, bool)`
+
+GetLandlockEnableOk returns a tuple with the LandlockEnable field if it's non-nil, zero value otherwise
+and a boolean to check if the value has been set.
+
+### SetLandlockEnable
+
+`func (o *VmConfig) SetLandlockEnable(v bool)`
+
+SetLandlockEnable sets LandlockEnable field to given value.
+
+### HasLandlockEnable
+
+`func (o *VmConfig) HasLandlockEnable() bool`
+
+HasLandlockEnable returns a boolean if a field has been set.
+
+### GetLandlockRules
+
+`func (o *VmConfig) GetLandlockRules() []LandlockConfig`
+
+GetLandlockRules returns the LandlockRules field if non-nil, zero value otherwise.
+
+### GetLandlockRulesOk
+
+`func (o *VmConfig) GetLandlockRulesOk() (*[]LandlockConfig, bool)`
+
+GetLandlockRulesOk returns a tuple with the LandlockRules field if it's non-nil, zero value otherwise
+and a boolean to check if the value has been set.
+
+### SetLandlockRules
+
+`func (o *VmConfig) SetLandlockRules(v []LandlockConfig)`
+
+SetLandlockRules sets LandlockRules field to given value.
+
+### HasLandlockRules
+
+`func (o *VmConfig) HasLandlockRules() bool`
+
+HasLandlockRules returns a boolean if a field has been set.
 
 
 [[Back to Model list]](../README.md#documentation-for-models) [[Back to API list]](../README.md#documentation-for-api-endpoints) [[Back to README]](../README.md)

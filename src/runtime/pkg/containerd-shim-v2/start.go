@@ -9,9 +9,9 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/containerd/containerd/api/types/task"
 	"github.com/sirupsen/logrus"
 
-	"github.com/containerd/containerd/api/types/task"
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/katautils"
 )
 
@@ -46,6 +46,19 @@ func startContainer(ctx context.Context, s *service, c *container) (retErr error
 		}
 		go watchSandbox(ctx, s)
 
+		// If no network endpoints were discovered during sandbox creation,
+		// schedule an async rescan. This handles runtimes that configure
+		// networking after task creation (e.g. Docker 26+ configures
+		// networking after the Start response, and prestart hooks may
+		// not have run yet on slower architectures).
+		// RescanNetwork is idempotent — it returns immediately if
+		// endpoints already exist.
+		go func() {
+			if err := s.sandbox.RescanNetwork(s.ctx); err != nil {
+				shimLog.WithError(err).Error("async network rescan failed — container may lack networking")
+			}
+		}()
+
 		// We use s.ctx(`ctx` derived from `s.ctx`) to check for cancellation of the
 		// shim context and the context passed to startContainer for tracing.
 		go watchOOMEvents(ctx, s)
@@ -66,7 +79,7 @@ func startContainer(ctx context.Context, s *service, c *container) (retErr error
 		shimLog.WithError(err).Warn("Failed to run post-start hooks")
 	}
 
-	c.status = task.StatusRunning
+	c.status = task.Status_RUNNING
 
 	stdin, stdout, stderr, err := s.sandbox.IOStream(c.id, c.id)
 	if err != nil {
@@ -127,7 +140,7 @@ func startExec(ctx context.Context, s *service, containerID, execID string) (e *
 	}
 	execs.id = proc.Token
 
-	execs.status = task.StatusRunning
+	execs.status = task.Status_RUNNING
 	if execs.tty.height != 0 && execs.tty.width != 0 {
 		err = s.sandbox.WinsizeProcess(ctx, c.id, execs.id, execs.tty.height, execs.tty.width)
 		if err != nil {

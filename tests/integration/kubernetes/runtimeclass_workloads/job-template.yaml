@@ -16,8 +16,9 @@ spec:
       labels:
         jobgroup: jobtest
     spec:
-      terminationGracePeriodSeconds: 0
       runtimeClassName: kata
+      securityContext:
+        supplementalGroups: [10]
       containers:
       - name: test
         image: quay.io/prometheus/busybox:latest

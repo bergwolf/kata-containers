@@ -3,7 +3,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use oci::Spec;
+use oci_spec::runtime::Spec;
+use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct CreateOpts {
@@ -14,4 +15,5 @@ pub struct CreateOpts {
     pub spec: Option<Spec>,
     pub rootless_euid: bool,
     pub rootless_cgroup: bool,
+    pub container_name: String,
 }

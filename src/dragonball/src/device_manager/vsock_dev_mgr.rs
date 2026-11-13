@@ -13,11 +13,14 @@ use dbs_virtio_devices::mmio::DRAGONBALL_FEATURE_INTR_USED;
 use dbs_virtio_devices::vsock::backend::{
     VsockInnerBackend, VsockInnerConnector, VsockTcpBackend, VsockUnixStreamBackend,
 };
-use dbs_virtio_devices::vsock::Vsock;
+use dbs_virtio_devices::vsock::{Vsock, VsockState};
 use dbs_virtio_devices::Error as VirtioError;
 use serde_derive::{Deserialize, Serialize};
 
-use super::{DeviceMgrError, StartMicroVmError};
+use super::{persist, DbsMmioV2Device, DeviceMgrError, StartMicroVmError};
+use crate::address_space_manager::GuestAddressSpaceImpl;
+#[cfg(target_arch = "x86_64")]
+use crate::api::v1::ConfidentialVmType;
 use crate::config_manager::{ConfigItem, DeviceConfigInfo, DeviceConfigInfos};
 use crate::device_manager::{DeviceManager, DeviceOpContext};
 
@@ -35,6 +38,10 @@ pub enum VsockDeviceError {
     /// The virtual machine instance ID is invalid.
     #[error("the virtual machine instance ID is invalid")]
     InvalidVMID,
+
+    /// Virtio device operation error.
+    #[error("virtio device operation error: {0}")]
+    Virtio(#[source] VirtioError),
 
     /// The Context Identifier is already in use.
     #[error("the device ID {0} already exists")]
@@ -67,6 +74,10 @@ pub enum VsockDeviceError {
     /// Inner backend create error
     #[error("vsock inner backend create error: {0}")]
     CreateInnerBackend(#[source] std::io::Error),
+
+    /// The restored guest did not acknowledge the transport reset in time.
+    #[error("timed out waiting for restored guest to acknowledge virtio-vsock transport reset")]
+    TransportResetTimeout,
 }
 
 /// Configuration information for a vsock device.
@@ -207,6 +218,11 @@ impl VsockDeviceMgr {
                 virtio::Error::InvalidInput,
             ))?;
 
+        #[cfg(not(target_arch = "x86_64"))]
+        let f_access_platform = false;
+        #[cfg(target_arch = "x86_64")]
+        let f_access_platform = ctx.get_confidential_vm_type() == Some(ConfidentialVmType::TDX);
+
         for info in self.info_list.iter_mut() {
             slog::info!(
                 ctx.logger(),
@@ -221,6 +237,7 @@ impl VsockDeviceMgr {
                     info.config.guest_cid as u64,
                     Arc::new(info.config.queue_sizes()),
                     epoll_mgr.clone(),
+                    f_access_platform,
                 )
                 .map_err(VirtioError::VirtioVsockError)
                 .map_err(StartMicroVmError::CreateVsockDevice)?,
@@ -285,6 +302,72 @@ impl VsockDeviceMgr {
         Ok(self.default_inner_connector.clone().unwrap())
     }
 
+    /// Wait until restored vsock is dispatchable, then reset stale guest-side
+    /// connections before the runtime opens a new agent channel.
+    pub fn finalize_restore(&self) -> std::result::Result<bool, VsockDeviceError> {
+        for info in self.info_list.iter() {
+            let device = info
+                .device
+                .as_ref()
+                .ok_or(VsockDeviceError::Virtio(VirtioError::InvalidInput))?;
+            let mmio_dev = device
+                .as_any()
+                .downcast_ref::<DbsMmioV2Device>()
+                .ok_or(VsockDeviceError::Virtio(VirtioError::InvalidInput))?;
+            let mut guard = mmio_dev.state();
+            let vsock = guard
+                .get_inner_device_mut()
+                .as_any_mut()
+                .downcast_mut::<Vsock<GuestAddressSpaceImpl>>()
+                .ok_or(VsockDeviceError::Virtio(VirtioError::InvalidInput))?;
+
+            if !vsock.handler_ready() {
+                return Ok(false);
+            }
+
+            let reset_requested = vsock
+                .request_transport_reset()
+                .map_err(VsockDeviceError::Virtio)?;
+            if reset_requested {
+                // Return control to the VMM event loop so it can dispatch the
+                // guest event-queue kick that acknowledges this reset.
+                return Ok(false);
+            }
+            if vsock.transport_reset_pending()
+                && !vsock
+                    .poll_transport_reset_ack()
+                    .map_err(VsockDeviceError::Virtio)?
+            {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
+    }
+
+    /// Schedule one transport reset for every active vsock device. The existing
+    /// readiness path publishes the reset and waits for the guest ACK.
+    pub fn schedule_transport_reset(&self) -> std::result::Result<(), VsockDeviceError> {
+        for info in self.info_list.iter() {
+            let device = info
+                .device
+                .as_ref()
+                .ok_or(VsockDeviceError::Virtio(VirtioError::InvalidInput))?;
+            let mmio_dev = device
+                .as_any()
+                .downcast_ref::<DbsMmioV2Device>()
+                .ok_or(VsockDeviceError::Virtio(VirtioError::InvalidInput))?;
+            let mut guard = mmio_dev.state();
+            let vsock = guard
+                .get_inner_device_mut()
+                .as_any_mut()
+                .downcast_mut::<Vsock<GuestAddressSpaceImpl>>()
+                .ok_or(VsockDeviceError::Virtio(VirtioError::InvalidInput))?;
+            vsock.schedule_transport_reset();
+        }
+        Ok(())
+    }
+
     /// Remove all virtio-vsock devices
     pub fn remove_devices(&mut self, ctx: &mut DeviceOpContext) -> Result<(), DeviceMgrError> {
         while let Some(mut info) = self.info_list.pop() {
@@ -294,11 +377,87 @@ impl VsockDeviceMgr {
                 info.config.id
             );
             if let Some(device) = info.device.take() {
-                DeviceManager::destroy_mmio_virtio_device(device, ctx)?;
+                DeviceManager::destroy_mmio_device(device, ctx)?;
             }
         }
         Ok(())
     }
+}
+
+impl<'a> dbs_snapshot::Persist<'a> for VsockDeviceMgr {
+    type State = VsockDeviceMgrState;
+    type SaveArgs = bool;
+    type RestoreArgs = bool;
+    type Error = VsockDeviceError;
+
+    /// Capture the state of all vsock devices.
+    ///
+    /// The virtual machine must be paused when this is called. Live vsock
+    /// connection state is not captured: snapshots must be taken at a clean
+    /// quiesce point with no active connections.
+    fn save_state(
+        &mut self,
+        reset_transport: bool,
+    ) -> std::result::Result<Self::State, Self::Error> {
+        let mut devices = Vec::new();
+        for info in self.info_list.iter() {
+            let device = info
+                .device
+                .as_ref()
+                .ok_or(VsockDeviceError::Virtio(VirtioError::InvalidInput))?;
+            let (device_info, transport) =
+                persist::save_device_state::<Vsock<GuestAddressSpaceImpl>>(device, reset_transport)
+                    .map_err(VsockDeviceError::Virtio)?;
+            devices.push(persist::VirtioDevState {
+                config: info.config.clone(),
+                device_info,
+                transport,
+            });
+        }
+        Ok(VsockDeviceMgrState { devices })
+    }
+
+    /// Restore the runtime state of all vsock devices.
+    ///
+    /// The devices must have been re-created from the same configuration
+    /// (matched by id) and must not have been activated yet. Must be called
+    /// before the guest vCPUs resume.
+    fn restore_state(
+        &mut self,
+        state: &Self::State,
+        reset_pending: bool,
+    ) -> std::result::Result<(), Self::Error> {
+        for dev_state in &state.devices {
+            let info = self
+                .info_list
+                .iter()
+                .find(|info| info.config.id() == dev_state.config.id())
+                .ok_or(VsockDeviceError::Virtio(VirtioError::InvalidInput))?;
+            let device = info
+                .device
+                .as_ref()
+                .ok_or(VsockDeviceError::Virtio(VirtioError::InvalidInput))?;
+            persist::restore_device_state::<Vsock<GuestAddressSpaceImpl>>(
+                device,
+                &dev_state.device_info,
+                &dev_state.transport,
+                reset_pending,
+            )
+            .map_err(VsockDeviceError::Virtio)?;
+        }
+        Ok(())
+    }
+}
+
+/// Snapshot state of one vsock device (config + guest-negotiated device state
+/// + transport state); see [`persist::VirtioDevState`].
+pub type VsockDevState = persist::VirtioDevState<VsockDeviceConfigInfo, VsockState>;
+
+/// Snapshot state of the vsock device manager.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct VsockDeviceMgrState {
+    /// Per-device state, in insertion order.
+    pub devices: Vec<VsockDevState>,
 }
 
 impl Default for VsockDeviceMgr {

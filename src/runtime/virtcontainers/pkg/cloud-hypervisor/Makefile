@@ -16,6 +16,7 @@ generate-client-code: clean-generated-code
 		-v $${PWD}:/local openapitools/openapi-generator-cli:v5.3.0 generate \
 		-i /local/cloud-hypervisor.yaml \
 		-g go \
+		--additional-properties enumClassPrefix=true \
 		-o /local/client
 go-fmt:
 	rm client/go.mod; \
@@ -25,7 +26,7 @@ update-yaml:
 ifndef YQ
 	$(MK_DIR)/../../../../../ci//install_yq.sh
 endif
-	clh_version=$(shell yq r $(VERSIONS_FILE) assets.hypervisor.cloud_hypervisor.version); \
+	clh_version=$(shell yq .assets.hypervisor.cloud_hypervisor.version $(VERSIONS_FILE)); \
 	curl -OL https://raw.githubusercontent.com/cloud-hypervisor/cloud-hypervisor/$$clh_version/vmm/src/api/openapi/cloud-hypervisor.yaml
 
 clean-generated-code:

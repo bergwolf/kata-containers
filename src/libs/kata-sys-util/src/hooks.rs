@@ -7,16 +7,30 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::hash::{Hash, Hasher};
-use std::io::{self, Read, Result};
-use std::path::Path;
+use std::io::{self, Result};
 use std::time::Duration;
 
-use subprocess::{ExitStatus, Popen, PopenConfig, PopenError, Redirection};
+use oci_spec::runtime as oci;
+use subprocess::{Exec, ExitStatus, Job, Redirection};
 
+use crate::sl;
 use crate::validate::valid_env;
-use crate::{eother, sl};
 
 const DEFAULT_HOOK_TIMEOUT_SEC: i32 = 10;
+
+/// Mirror a hook *failure* to `/dev/kmsg`.
+///
+/// createContainer hooks run in the forked container child, where kata-agent's
+/// async slog drain (its background thread) doesn't exist, so `error!` here is
+/// silently dropped. `/dev/kmsg` is the one sink that survives the fork and
+/// reaches the guest console, so without this a failed hook (e.g. a CDI hook
+/// that can't be found or exits non-zero) leaves no trace at all. Failures only.
+fn log_hook_failure_to_kmsg(msg: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open("/dev/kmsg") {
+        let _ = writeln!(f, "kata-agent: hook failed: {msg}");
+    }
+}
 
 /// A simple wrapper over `oci::Hook` to provide `Hash, Eq`.
 ///
@@ -40,10 +54,10 @@ impl Eq for HookKey {}
 
 impl Hash for HookKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0.path.hash(state);
-        self.0.args.hash(state);
-        self.0.env.hash(state);
-        self.0.timeout.hash(state);
+        self.0.path().hash(state);
+        self.0.args().hash(state);
+        self.0.env().hash(state);
+        self.0.timeout().hash(state);
     }
 }
 
@@ -114,43 +128,54 @@ impl HookStates {
     ///
     /// The OCI spec also defines the context to invoke hooks, caller needs to take the responsibility
     /// to setup execution context, such as namespace etc.
-    pub fn execute_hook(&mut self, hook: &oci::Hook, state: Option<oci::State>) -> Result<()> {
+    pub fn execute_hook(
+        &mut self,
+        hook: &oci::Hook,
+        state: Option<runtime_spec::State>,
+    ) -> Result<()> {
         if self.get(hook) != HookState::Pending {
             return Ok(());
         }
 
         fail::fail_point!("execute_hook", |_| {
-            Err(eother!("execute hook fail point injection"))
+            Err(std::io::Error::other("execute hook fail point injection"))
         });
         info!(sl!(), "execute hook {:?}", hook);
 
         self.states.insert(hook.into(), HookState::Pending);
 
-        let mut executor = HookExecutor::new(hook)?;
-        let stdin = if state.is_some() {
-            Redirection::Pipe
-        } else {
-            Redirection::None
-        };
-        let mut popen = Popen::create(
-            &executor.args,
-            PopenConfig {
-                stdin,
-                stdout: Redirection::Pipe,
-                stderr: Redirection::Pipe,
-                executable: executor.executable.to_owned(),
-                detached: true,
-                env: Some(executor.envs.clone()),
-                ..Default::default()
-            },
-        )
-        .map_err(|e| eother!("failed to create subprocess for hook {:?}: {}", hook, e))?;
+        let executor = HookExecutor::new(hook)?;
+        let mut job = executor.spawn(state.as_ref())?;
 
-        if let Some(state) = state {
-            executor.execute_with_input(&mut popen, state)?;
+        let communicate_result = job
+            .communicate()?
+            .limit_time(Duration::from_secs(executor.timeout))
+            .read_string();
+
+        match communicate_result {
+            Err(ref e) if e.kind() == io::ErrorKind::TimedOut => {
+                error!(sl!(), "hook poll failed, kill it");
+                let _ = job.kill();
+                let _ = job.wait();
+                return Err(io::Error::from(io::ErrorKind::TimedOut));
+            }
+            Err(e) => {
+                return Err(std::io::Error::other(format!(
+                    "communicate hook {hook:?}: {e}"
+                )));
+            }
+            Ok((ref stdout, ref stderr)) => {
+                if !stderr.is_empty() {
+                    error!(sl!(), "hook {} stderr: {}", hook.path().display(), stderr);
+                }
+                if !stdout.is_empty() {
+                    info!(sl!(), "hook {} stdout: {}", hook.path().display(), stdout);
+                }
+            }
         }
-        executor.execute_and_wait(&mut popen)?;
-        info!(sl!(), "hook {} finished", hook.path);
+
+        executor.wait_and_check(&mut job)?;
+        info!(sl!(), "hook {} finished", hook.path().display());
         self.states.insert(hook.into(), HookState::Done);
 
         Ok(())
@@ -165,11 +190,16 @@ impl HookStates {
     ///
     /// The execution result will be recorded for each hook. Once a hook returns success, it will not
     /// be invoked anymore.
-    pub fn execute_hooks(&mut self, hooks: &[oci::Hook], state: Option<oci::State>) -> Result<()> {
+    pub fn execute_hooks(
+        &mut self,
+        hooks: &[oci::Hook],
+        state: Option<runtime_spec::State>,
+    ) -> Result<()> {
         for hook in hooks.iter() {
             if let Err(e) = self.execute_hook(hook, state.clone()) {
                 // Ignore error and try next hook, the caller should retry.
-                error!(sl!(), "hook {} failed: {}", hook.path, e);
+                error!(sl!(), "hook {} failed: {}", hook.path().display(), e);
+                log_hook_failure_to_kmsg(&format!("{}: {e}", hook.path().display()));
             }
         }
 
@@ -179,8 +209,8 @@ impl HookStates {
 
 struct HookExecutor<'a> {
     hook: &'a oci::Hook,
-    executable: Option<OsString>,
-    args: Vec<String>,
+    executable: OsString,
+    args: Vec<OsString>,
     envs: Vec<(OsString, OsString)>,
     timeout: u64,
 }
@@ -188,33 +218,37 @@ struct HookExecutor<'a> {
 impl<'a> HookExecutor<'a> {
     fn new(hook: &'a oci::Hook) -> Result<Self> {
         // Ensure Hook.path is present and is an absolute path.
-        let executable = if hook.path.is_empty() {
-            return Err(eother!("path of hook {:?} is empty", hook));
-        } else {
-            let path = Path::new(&hook.path);
-            if !path.is_absolute() {
-                return Err(eother!("path of hook {:?} is not absolute", hook));
-            }
-            Some(path.as_os_str().to_os_string())
-        };
+        let path = hook.path();
+        if !path.exists() {
+            return Err(std::io::Error::other(format!(
+                "path of hook {hook:?} is empty"
+            )));
+        }
+        if !path.is_absolute() {
+            return Err(std::io::Error::other(format!(
+                "path of hook {hook:?} is not absolute"
+            )));
+        }
+        let executable = path.as_os_str().to_os_string();
 
         // Hook.args is optional, use Hook.path as arg0 if Hook.args is empty.
-        let args = if hook.args.is_empty() {
-            vec![hook.path.clone()]
-        } else {
-            hook.args.clone()
+        let args: Vec<OsString> = match hook.args() {
+            Some(args) => args.iter().map(OsString::from).collect(),
+            None => vec![OsString::from(hook.path())],
         };
 
         let mut envs: Vec<(OsString, OsString)> = Vec::new();
-        for e in hook.env.iter() {
-            if let Some((key, value)) = valid_env(e) {
-                envs.push((OsString::from(key), OsString::from(value)));
+        if let Some(env) = hook.env() {
+            for e in env.iter() {
+                if let Some((key, value)) = valid_env(e) {
+                    envs.push((OsString::from(key), OsString::from(value)));
+                }
             }
         }
 
         // Use Hook.timeout if it's valid, otherwise default to 10s.
         let mut timeout = DEFAULT_HOOK_TIMEOUT_SEC as u64;
-        if let Some(t) = hook.timeout {
+        if let Some(t) = hook.timeout() {
             if t > 0 {
                 timeout = t as u64;
             }
@@ -229,99 +263,91 @@ impl<'a> HookExecutor<'a> {
         })
     }
 
-    fn execute_with_input(&mut self, popen: &mut Popen, state: oci::State) -> Result<()> {
-        let st = serde_json::to_string(&state)?;
-        let (stdout, stderr) = popen
-            .communicate_start(Some(st.as_bytes().to_vec()))
-            .limit_time(Duration::from_secs(self.timeout))
-            .read_string()
-            .map_err(|e| e.error)?;
-        if let Some(err) = stderr {
-            if !err.is_empty() {
-                error!(sl!(), "hook {} exec failed: {}", self.hook.path, err);
-            }
-        }
-        if let Some(out) = stdout {
-            if !out.is_empty() {
-                info!(sl!(), "hook {} exec stdout: {}", self.hook.path, out);
-            }
-        }
-        // Give a grace period for `execute_and_wait()`.
-        self.timeout = 1;
-        Ok(())
-    }
+    /// Spawn the subprocess, optionally feeding `state` to its stdin.
+    fn spawn(&self, state: Option<&runtime_spec::State>) -> Result<Job> {
+        // Execute the hook's `path` (an absolute path, validated in `new`) directly.
+        // Using `args[0]` as the command would PATH-search a bare program name, which
+        // only resolves when the binary lives in the compiled-in default PATH
+        // (/bin:/usr/bin) after `env_clear()` - so hooks outside it (e.g. a composable
+        // image extension under /run/kata-extensions/<name>/bin) fail with ENOENT.
+        // OCI semantics: run `path`, with `args` as argv (argv[0] = args[0]).
+        let mut exec = Exec::cmd(&self.executable)
+            .args(&self.args[1..])
+            .arg0(&self.args[0])
+            .env_clear()
+            .env_extend(
+                self.envs
+                    .iter()
+                    .map(|(k, v)| (k.as_os_str(), v.as_os_str())),
+            )
+            .detached()
+            .stdout(Redirection::Pipe)
+            .stderr(Redirection::Pipe);
 
-    fn execute_and_wait(&mut self, popen: &mut Popen) -> Result<()> {
-        match popen.wait_timeout(Duration::from_secs(self.timeout)) {
-            Ok(v) => self.handle_exit_status(v, popen),
-            Err(e) => self.handle_popen_wait_error(e, popen),
-        }
-    }
-
-    fn handle_exit_status(&mut self, result: Option<ExitStatus>, popen: &mut Popen) -> Result<()> {
-        if let Some(exit_status) = result {
-            // the process has finished
-            info!(
-                sl!(),
-                "exit status of hook {:?} : {:?}", self.hook, exit_status
-            );
-            self.print_result(popen);
-            match exit_status {
-                subprocess::ExitStatus::Exited(code) => {
-                    if code == 0 {
-                        info!(sl!(), "hook {:?} succeeds", self.hook);
-                        Ok(())
-                    } else {
-                        warn!(sl!(), "hook {:?} exit status with {}", self.hook, code,);
-                        Err(eother!("hook {:?} exit status with {}", self.hook, code))
-                    }
-                }
-                _ => {
-                    error!(
-                        sl!(),
-                        "no exit code for hook {:?}: {:?}", self.hook, exit_status
-                    );
-                    Err(eother!(
-                        "no exit code for hook {:?}: {:?}",
-                        self.hook,
-                        exit_status
-                    ))
-                }
-            }
+        if let Some(st) = state {
+            let json = serde_json::to_string(st)?;
+            exec = exec.stdin(json.into_bytes());
         } else {
-            // may be timeout
-            error!(sl!(), "hook poll failed, kill it");
-            // it is still running, kill it
-            popen.kill()?;
-            let _ = popen.wait();
-            self.print_result(popen);
-            Err(io::Error::from(io::ErrorKind::TimedOut))
+            exec = exec.stdin(Redirection::None);
         }
+
+        exec.start().map_err(|e| {
+            std::io::Error::other(format!(
+                "failed to create subprocess for hook {:?}: {e}",
+                self.hook
+            ))
+        })
     }
 
-    fn handle_popen_wait_error(&mut self, e: PopenError, popen: &mut Popen) -> Result<()> {
-        self.print_result(popen);
-        error!(sl!(), "wait_timeout for hook {:?} failed: {}", self.hook, e);
-        Err(eother!(
-            "wait_timeout for hook {:?} failed: {}",
-            self.hook,
-            e
-        ))
-    }
-
-    fn print_result(&mut self, popen: &mut Popen) {
-        if let Some(file) = popen.stdout.as_mut() {
-            let mut buffer = String::new();
-            file.read_to_string(&mut buffer).ok();
-            if !buffer.is_empty() {
-                info!(sl!(), "hook stdout: {}", buffer);
+    /// Wait for the process to finish and check its exit status.
+    fn wait_and_check(&self, job: &mut Job) -> Result<()> {
+        match job.wait_timeout(Duration::from_secs(1)) {
+            Ok(Some(exit_status)) => {
+                info!(
+                    sl!(),
+                    "exit status of hook {:?} : {:?}", self.hook, exit_status
+                );
+                self.check_exit_status(exit_status)
+            }
+            Ok(None) => {
+                // Timeout — kill the process.
+                error!(sl!(), "hook poll failed, kill it");
+                let _ = job.kill();
+                let _ = job.wait();
+                Err(io::Error::from(io::ErrorKind::TimedOut))
+            }
+            Err(e) => {
+                error!(sl!(), "wait_timeout for hook {:?} failed: {}", self.hook, e);
+                Err(std::io::Error::other(format!(
+                    "wait_timeout for hook {:?} failed: {}",
+                    self.hook, e,
+                )))
             }
         }
-        if let Some(file) = popen.stderr.as_mut() {
-            let mut buffer = String::new();
-            file.read_to_string(&mut buffer).ok();
-            if !buffer.is_empty() {
-                info!(sl!(), "hook stderr: {}", buffer);
+    }
+
+    fn check_exit_status(&self, exit_status: ExitStatus) -> Result<()> {
+        match exit_status.code() {
+            Some(0) => {
+                info!(sl!(), "hook {:?} succeeds", self.hook);
+                Ok(())
+            }
+            Some(code) => {
+                warn!(sl!(), "hook {:?} exit status with {}", self.hook, code);
+                Err(std::io::Error::other(format!(
+                    "hook {:?} exit status with {}",
+                    self.hook, code,
+                )))
+            }
+            None => {
+                error!(
+                    sl!(),
+                    "no exit code for hook {:?}: {:?}", self.hook, exit_status
+                );
+                Err(std::io::Error::other(format!(
+                    "no exit code for hook {:?}: {:?}",
+                    self.hook, exit_status,
+                )))
             }
         }
     }
@@ -333,6 +359,7 @@ mod tests {
     use std::fs::{self, set_permissions, File, Permissions};
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
     use std::time::Instant;
 
     fn test_hook_eq(hook1: &oci::Hook, hook2: &oci::Hook, expected: bool) {
@@ -341,17 +368,45 @@ mod tests {
 
         assert_eq!(key1 == key2, expected);
     }
+
+    // struct Hook is just for test cases
+    #[derive(Clone)]
+    pub struct Hook {
+        pub path: String,
+        pub args: Vec<String>,
+        pub env: Vec<String>,
+        pub timeout: Option<i64>,
+    }
+
+    impl Hook {
+        fn build_oci_hook(self) -> oci::Hook {
+            let mut hook = oci::Hook::default();
+            hook.set_path(PathBuf::from(self.path));
+            if self.args.is_empty() {
+                hook.set_args(None);
+            } else {
+                hook.set_args(Some(self.args));
+            }
+            hook.set_env(Some(self.env));
+            hook.set_timeout(self.timeout);
+
+            hook
+        }
+    }
+
     #[test]
     fn test_hook_key() {
-        let hook = oci::Hook {
+        let hook = Hook {
             path: "1".to_string(),
             args: vec!["2".to_string(), "3".to_string()],
             env: vec![],
             timeout: Some(0),
         };
+        let oci_hook = hook.build_oci_hook();
+
         let cases = [
             (
-                oci::Hook {
+                Hook {
                     path: "1000".to_string(),
                     args: vec!["2".to_string(), "3".to_string()],
                     env: vec![],
@@ -360,7 +415,7 @@ mod tests {
                 false,
             ),
             (
-                oci::Hook {
+                Hook {
                     path: "1".to_string(),
                     args: vec!["2".to_string(), "4".to_string()],
                     env: vec![],
@@ -369,7 +424,7 @@ mod tests {
                 false,
             ),
             (
-                oci::Hook {
+                Hook {
                     path: "1".to_string(),
                     args: vec!["2".to_string()],
                     env: vec![],
@@ -378,7 +433,7 @@ mod tests {
                 false,
             ),
             (
-                oci::Hook {
+                Hook {
                     path: "1".to_string(),
                     args: vec!["2".to_string(), "3".to_string()],
                     env: vec!["5".to_string()],
@@ -387,7 +442,7 @@ mod tests {
                 false,
             ),
             (
-                oci::Hook {
+                Hook {
                     path: "1".to_string(),
                     args: vec!["2".to_string(), "3".to_string()],
                     env: vec![],
@@ -396,7 +451,7 @@ mod tests {
                 false,
             ),
             (
-                oci::Hook {
+                Hook {
                     path: "1".to_string(),
                     args: vec!["2".to_string(), "3".to_string()],
                     env: vec![],
@@ -405,7 +460,7 @@ mod tests {
                 false,
             ),
             (
-                oci::Hook {
+                Hook {
                     path: "1".to_string(),
                     args: vec!["2".to_string(), "3".to_string()],
                     env: vec![],
@@ -416,7 +471,8 @@ mod tests {
         ];
 
         for case in cases.iter() {
-            test_hook_eq(&hook, &case.0, case.1);
+            let case_hook = case.0.clone().build_oci_hook();
+            test_hook_eq(&oci_hook, &case_hook, case.1);
         }
     }
 
@@ -435,58 +491,60 @@ mod tests {
 
         // test case 1: normal
         // execute hook
-        let hook = oci::Hook {
+        let hook = Hook {
             path: "/bin/touch".to_string(),
             args: vec!["touch".to_string(), file_str.to_string()],
             env: vec![],
             timeout: Some(0),
         };
-        let ret = states.execute_hook(&hook, None);
+        let oci_hook = hook.build_oci_hook();
+        let ret = states.execute_hook(&oci_hook, None);
         assert!(ret.is_ok());
         assert!(fs::metadata(&file).is_ok());
         assert!(!states.should_retry());
 
         // test case 2: timeout in 10s
-        let hook = oci::Hook {
+        let hook = Hook {
             path: "/bin/sleep".to_string(),
             args: vec!["sleep".to_string(), "3600".to_string()],
             env: vec![],
             timeout: Some(0), // default timeout is 10 seconds
         };
+        let oci_hook = hook.build_oci_hook();
         let start = Instant::now();
-        let ret = states.execute_hook(&hook, None).unwrap_err();
+        let ret = states.execute_hook(&oci_hook, None).unwrap_err();
         let duration = start.elapsed();
         let used = duration.as_secs();
         assert!((10..12u64).contains(&used));
         assert_eq!(ret.kind(), io::ErrorKind::TimedOut);
-        assert_eq!(states.get(&hook), HookState::Pending);
+        assert_eq!(states.get(&oci_hook), HookState::Pending);
         assert!(states.should_retry());
-        states.remove(&hook);
+        states.remove(&oci_hook);
 
         // test case 3: timeout in 5s
-        let hook = oci::Hook {
+        let hook = Hook {
             path: "/bin/sleep".to_string(),
             args: vec!["sleep".to_string(), "3600".to_string()],
             env: vec![],
             timeout: Some(5), // timeout is set to 5 seconds
         };
+        let oci_hook = hook.build_oci_hook();
         let start = Instant::now();
-        let ret = states.execute_hook(&hook, None).unwrap_err();
+        let ret = states.execute_hook(&oci_hook, None).unwrap_err();
         let duration = start.elapsed();
         let used = duration.as_secs();
         assert!((5..7u64).contains(&used));
         assert_eq!(ret.kind(), io::ErrorKind::TimedOut);
-        assert_eq!(states.get(&hook), HookState::Pending);
+        assert_eq!(states.get(&oci_hook), HookState::Pending);
         assert!(states.should_retry());
-        states.remove(&hook);
+        states.remove(&oci_hook);
 
         // test case 4: with envs
         let create_shell = |shell_path: &str, data_path: &str| -> Result<()> {
             let shell = format!(
                 r#"#!/bin/sh
-echo -n "K1=${{K1}}" > {}
-"#,
-                data_path
+echo -n "K1=${{K1}}" > {data_path}
+"#
             );
             let mut output = File::create(shell_path)?;
             output.write_all(shell.as_bytes())?;
@@ -500,13 +558,14 @@ echo -n "K1=${{K1}}" > {}
         let shell_path = format!("{}/test.sh", tmpdir.path().to_string_lossy());
         let ret = create_shell(&shell_path, file_str.as_ref());
         assert!(ret.is_ok());
-        let hook = oci::Hook {
+        let hook = Hook {
             path: shell_path,
             args: vec![],
             env: vec!["K1=V1".to_string()],
             timeout: Some(5),
         };
-        let ret = states.execute_hook(&hook, None);
+        let oci_hook = hook.build_oci_hook();
+        let ret = states.execute_hook(&oci_hook, None);
         assert!(ret.is_ok());
         assert!(!states.should_retry());
         let contents = fs::read_to_string(file);
@@ -516,22 +575,23 @@ echo -n "K1=${{K1}}" > {}
         }
 
         // test case 5: timeout in 5s with state
-        let hook = oci::Hook {
+        let hook = Hook {
             path: "/bin/sleep".to_string(),
             args: vec!["sleep".to_string(), "3600".to_string()],
             env: vec![],
             timeout: Some(6), // timeout is set to 5 seconds
         };
-        let state = oci::State {
+        let oci_hook = hook.build_oci_hook();
+        let state = runtime_spec::State {
             version: "".to_string(),
             id: "".to_string(),
-            status: oci::ContainerState::Creating,
+            status: runtime_spec::ContainerState::Creating,
             pid: 10,
             bundle: "nouse".to_string(),
             annotations: Default::default(),
         };
         let start = Instant::now();
-        let ret = states.execute_hook(&hook, Some(state)).unwrap_err();
+        let ret = states.execute_hook(&oci_hook, Some(state)).unwrap_err();
         let duration = start.elapsed();
         let used = duration.as_secs();
         assert!((6..8u64).contains(&used));

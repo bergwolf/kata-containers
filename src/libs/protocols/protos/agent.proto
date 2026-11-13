@@ -27,8 +27,7 @@ service AgentService {
 	// all processes running inside that container and releasing all internal
 	// resources associated with it.
 	// RemoveContainer will wait for all processes termination before returning.
-	// If any process can not be killed or if it can not be killed after
-	// the RemoveContainerRequest timeout, RemoveContainer will return an error.
+	// If any process cannot be killed, RemoveContainer will return an error.
 	rpc RemoveContainer(RemoveContainerRequest) returns (google.protobuf.Empty);
 	rpc ExecProcess(ExecProcessRequest) returns (google.protobuf.Empty);
 	rpc SignalProcess(SignalProcessRequest) returns (google.protobuf.Empty);
@@ -39,6 +38,7 @@ service AgentService {
 	rpc PauseContainer(PauseContainerRequest) returns (google.protobuf.Empty);
 	rpc ResumeContainer(ResumeContainerRequest) returns (google.protobuf.Empty);
 	rpc RemoveStaleVirtiofsShareMounts(RemoveStaleVirtiofsShareMountsRequest) returns (google.protobuf.Empty);
+	rpc GetDiagnosticData(GetDiagnosticDataRequest) returns (GetDiagnosticDataResponse);
 
 	// stdio
 	rpc WriteStdin(WriteStreamRequest) returns (WriteStreamResponse);
@@ -59,6 +59,10 @@ service AgentService {
 	// observability
 	rpc GetMetrics(GetMetricsRequest) returns (Metrics);
 
+	// mem-agent
+	rpc MemAgentMemcgSet(MemAgentMemcgConfig) returns (google.protobuf.Empty);
+	rpc MemAgentCompactSet(MemAgentCompactConfig) returns (google.protobuf.Empty);
+
 	// misc (TODO: some rpcs can be replaced by hyperstart-exec)
 	rpc CreateSandbox(CreateSandboxRequest) returns (google.protobuf.Empty);
 	rpc DestroySandbox(DestroySandboxRequest) returns (google.protobuf.Empty);
@@ -70,6 +74,7 @@ service AgentService {
 	rpc CopyFile(CopyFileRequest) returns (google.protobuf.Empty);
 	rpc GetOOMEvent(GetOOMEventRequest) returns (OOMEvent);
 	rpc AddSwap(AddSwapRequest) returns (google.protobuf.Empty);
+	rpc AddSwapPath(AddSwapPathRequest) returns (google.protobuf.Empty);
 	rpc GetVolumeStats(VolumeStatsRequest) returns (VolumeStatsResponse);
 	rpc ResizeVolume(ResizeVolumeRequest) returns (google.protobuf.Empty);
 	rpc SetPolicy(SetPolicyRequest) returns (google.protobuf.Empty);
@@ -89,6 +94,18 @@ message CreateContainerRequest {
 	// The agent would receive an OCI spec with PID namespace cleared
 	// out altogether and not just the pid ns path.
 	bool sandbox_pidns = 7;
+
+	// This field is used to declare a set of shared mount points
+	// that support cross-container sharing of mount objects.
+	repeated SharedMount shared_mounts = 8;
+
+	// These fields are the host-side vport numbers of passfd streams
+	// pre-created by runtime-rs, and used as identifiers for the agent
+	// to select the right streams for init process's stdin/stdout/stderr.
+	// Disable the feature by setting the associated port to 0.
+	uint32 stdin_port = 9;
+	uint32 stdout_port = 10;
+	uint32 stderr_port = 11;
 }
 
 message StartContainerRequest {
@@ -96,14 +113,11 @@ message StartContainerRequest {
 }
 
 message RemoveContainerRequest {
-	string container_id = 1;
+	// Avoid accidental reuse of the former field: uint32 timeout = 2;
+	reserved 2;
+	reserved "timeout";
 
-	// RemoveContainer will return an error if
-	// it could not kill some container processes
-	// after timeout seconds.
-	// Setting timeout to 0 means RemoveContainer will
-	// wait for ever.
-	uint32 timeout = 2;
+	string container_id = 1;
 }
 
 message ExecProcessRequest {
@@ -111,6 +125,14 @@ message ExecProcessRequest {
 	string exec_id = 2;
 	StringUser string_user = 3;
 	Process process = 4;
+
+	// These fields are the host-side vport numbers of passfd streams
+	// pre-created by runtime-rs, and used as identifiers for the agent
+	// to select the right streams for process's stdin/stdout/stderr.
+	// Disable the feature by setting the associated port to 0.
+	uint32 stdin_port = 5;
+	uint32 stdout_port = 6;
+	uint32 stderr_port = 7;
 }
 
 message SignalProcessRequest {
@@ -397,6 +419,9 @@ message AgentDetails {
 	// Set only if the agent is built with seccomp support and the guest
 	// environment supports seccomp.
 	bool supports_seccomp = 5;
+
+	// List of additional features enabled at agent build time.
+	repeated string extra_features = 6;
 }
 
 message GuestDetailsRequest {
@@ -444,11 +469,28 @@ message FSGroup {
 	types.FSGroupChangePolicy group_change_policy = 3;
 }
 
+// SharedMount declares a set of shared mount points that support
+// cross-container sharing of mount objects.
+message SharedMount {
+	// Name is used to identify a pair of shared mount points.
+	string name = 1;
+	// Src_ctr is used to specify the name of the source container.
+	string src_ctr = 2;
+	// Src_path is used to specify the path of the mount point. If the path doesn't
+	// exist in the rootfs, it will be created.
+	string src_path = 3;
+	// Dst_ctr is used to specify the name of the destination container.
+	string dst_ctr = 4;
+	// Dst_path is used to specify the path of the mount point. If the path doesn't
+	// exist in the rootfs, it will be created.
+	string dst_path = 5;
+}
+
 // Storage represents both the rootfs of the container, and any volume that
 // could have been defined through the Mount list of the OCI specification.
 message Storage {
 	// Driver is used to define the way the storage is passed through the
-	// virtual machine. It can be "9p", "blk", or something else, but for
+	// virtual machine. It can be "blk", or something else, but for
 	// all cases, this will define if some extra steps are required before
 	// this storage gets mounted into the container.
 	string driver = 1;
@@ -464,7 +506,7 @@ message Storage {
 	string source = 3;
 	// Fstype represents the filesystem that needs to be used to mount the
 	// storage inside the VM. For instance, it could be "xfs" for block
-	// device, "9p" for shared filesystem, or "tmpfs" for shared /dev/shm.
+	// device, or "tmpfs" for shared /dev/shm.
 	string fstype = 4;
 	// Options describes the additional options that might be needed to
 	// mount properly the storage filesystem.
@@ -475,6 +517,11 @@ message Storage {
 	// FSGroup consists of the group ID and group ownership change policy
 	// that the mounted volume must have its group ID changed to when specified.
 	FSGroup fs_group = 7;
+	// Shared indicates this storage is shared across multiple containers
+	// (e.g., block-based emptyDirs). When true, the agent should not clean up
+	// the storage when a container using it exits, as other containers
+	// may still need it. Cleanup will happen when the sandbox is destroyed.
+	bool shared = 8;
 }
 
 // Device represents only the devices that could have been defined through the
@@ -551,6 +598,10 @@ message AddSwapRequest {
 	repeated uint32 PCIPath = 1;
 }
 
+message AddSwapPathRequest {
+	string path = 1;
+}
+
 message GetMetricsRequest {}
 
 message Metrics {
@@ -570,4 +621,34 @@ message ResizeVolumeRequest {
 
 message SetPolicyRequest {
 	string policy = 1;
+}
+
+message GetDiagnosticDataRequest {
+	string log_type = 1;
+	string container_id = 2;
+}
+
+message GetDiagnosticDataResponse {
+	string data = 1;
+}
+
+message MemAgentMemcgConfig {
+	optional bool disabled = 1;
+	optional bool swap = 2;
+	optional uint32 swappiness_max = 3;
+	optional uint64 period_secs = 4;
+	optional uint32 period_psi_percent_limit = 5;
+	optional uint32 eviction_psi_percent_limit = 6;
+	optional uint64 eviction_run_aging_count_min = 7;
+}
+
+message MemAgentCompactConfig {
+	optional bool disabled = 1;
+	optional uint64 period_secs = 2;
+	optional uint32 period_psi_percent_limit = 3;
+	optional uint32 compact_psi_percent_limit = 4;
+	optional int64 compact_sec_max = 5;
+	optional uint32 compact_order = 6;
+	optional uint64 compact_threshold = 7;
+	optional uint64 compact_force_times = 8;
 }

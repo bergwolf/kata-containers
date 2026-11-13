@@ -1,6 +1,6 @@
 # Virtual machine vCPU sizing in Kata Containers 3.0
 
-> Preview: 
+> Preview:
 > [Kubernetes(since 1.23)][1] and [Containerd(since 1.6.0-beta4)][2] will help calculate `Sandbox Size` info and pass it to Kata Containers through annotations.
 > In order to adapt to this beneficial change and be compatible with the past, we have implemented the new vCPUs handling way in `runtime-rs`, which is slightly different from the original `runtime-go`'s design.
 
@@ -12,7 +12,7 @@ vCPUs sizing should be determined by the container workloads. So throughout the 
 * `DeleteContainer`: When a container is removed from the VM, we may need to hot-unplug the vCPUs to reclaim the vCPU resources introduced by the container.
 
 ## On what basis do we calculate the number of vCPUs?
-When Kata calculate the number of vCPUs, We have three data sources, the `default_vcpus` and `default_maxvcpus` specified in the configuration file (named `TomlConfig` later in the doc), the `io.kubernetes.cri.sandbox-cpu-quota` and `io.kubernetes.cri.sandbox-cpu-period` annotations passed by the upper layer runtime, and the corresponding CPU resource part in the container's spec for the container when `CreateContainer`/`UpdateContainer`/`DeleteContainer` is requested.
+When Kata calculate the number of vCPUs, We have three data sources, the `default_vcpus` and `default_maxvcpus` specified in the configuration file (named `TomlConfig` later in the doc), the `io.kubernetes.cri.sandbox-cpu-quota`, `io.kubernetes.cri.sandbox-cpu-period` and `io.kubernetes.cri.sandbox-cpu-shares` annotations passed by the upper layer runtime, and the corresponding CPU resource part in the container's spec for the container when `CreateContainer`/`UpdateContainer`/`DeleteContainer` is requested.
 
 Our understanding and priority of these resources are as follows, which will affect how we calculate the number of vCPUs later.
 
@@ -20,7 +20,8 @@ Our understanding and priority of these resources are as follows, which will aff
   * `default_vcpus`: default number of vCPUs when starting a VM.
   * `default_maxvcpus`: maximum number of vCPUs.
 * From `Annotation`:
-  * `InitialSize`: we call the size of the resource passed from the annotations as `InitialSize`. Kubernetes will calculate the sandbox size according to the Pod's statement, which is the `InitialSize` here. This size should be the size we want to prioritize. 
+  * `InitialSize`: we call the size of the resource passed from the annotations as `InitialSize`. Kubernetes will calculate the sandbox size according to the Pod's statement, which is the `InitialSize` here. This size should be the size we want to prioritize.
+  * For Pods with exclusive CPUs the sandbox `cpu quota` is `-1`, so `vCPUs = ceiling( shares / 1024 )` is used instead.
 * From `Container Spec`:
   * The amount of CPU resources that the Container wants to use will be declared through the spec. Including the aforementioned annotations, we mainly consider `cpu quota` and `cpuset` when calculating the number of vCPUs.
   * `cpu quota`: `cpu quota` is the most common way to declare the amount of CPU resources. The number of vCPUs introduced by `cpu quota` declared in a container's spec is: `vCPUs = ceiling( quota / period )`.

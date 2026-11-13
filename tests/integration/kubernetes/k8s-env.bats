@@ -5,31 +5,43 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
+load "${BATS_TEST_DIRNAME}/lib.sh"
 load "${BATS_TEST_DIRNAME}/../../common.bash"
 load "${BATS_TEST_DIRNAME}/tests_common.sh"
 
 setup() {
 	pod_name="test-env"
-	get_pod_config_dir
+	setup_common || die "setup_common failed"
+	yaml_file="${pod_config_dir}/pod-env.yaml"
+	cmd="printenv"
+
+	policy_settings_dir="$(create_tmp_policy_settings_dir "${pod_config_dir}")"
+
+	exec_command=(sh -c "${cmd}")
+	add_exec_to_policy_settings "${policy_settings_dir}" "${exec_command[@]}"
+
+	add_requests_to_policy_settings "${policy_settings_dir}" "ReadStreamRequest"
+	auto_generate_policy "${policy_settings_dir}" "${yaml_file}"
 }
 
 @test "Environment variables" {
 	# Create pod
-	kubectl create -f "${pod_config_dir}/pod-env.yaml"
+	kubectl create -f "${yaml_file}"
 
 	# Check pod creation
 	kubectl wait --for=condition=Ready --timeout=$timeout pod "$pod_name"
 
 	# Print environment variables
-	cmd="printenv"
-	kubectl exec $pod_name -- sh -c $cmd | grep "MY_POD_NAME=$pod_name"
-	kubectl exec $pod_name -- sh -c $cmd | \
-		grep "HOST_IP=\([0-9]\+\(\.\|$\)\)\{4\}"
+	grep_pod_exec_output "${pod_name}" "MY_POD_NAME=${pod_name}" "${exec_command[@]}"
+	host_ip="$(kubectl get pod "${pod_name}" -o jsonpath='{.status.hostIP}')"
+	[[ -n "${host_ip}" ]]
+	grep_pod_exec_output "${pod_name}" "^HOST_IP=${host_ip//./\\.}$" "${exec_command[@]}"
+
 	# Requested 32Mi of memory
-	kubectl exec $pod_name -- sh -c $cmd | \
-		grep "MEMORY_REQUESTS=$((1024 * 1024 * 32))"
+	grep_pod_exec_output "${pod_name}" "MEMORY_REQUESTS=$((1024 * 1024 * 32))" "${exec_command[@]}"
+
 	# Memory limits allocated by the node
-	kubectl exec $pod_name -- sh -c $cmd | grep "MEMORY_LIMITS=[1-9]\+"
+	grep_pod_exec_output "${pod_name}" "MEMORY_LIMITS=[1-9]\+" "${exec_command[@]}"
 }
 
 teardown() {
@@ -37,4 +49,7 @@ teardown() {
 	kubectl describe "pod/$pod_name"
 
 	kubectl delete pod "$pod_name"
+
+	delete_tmp_policy_settings_dir "${policy_settings_dir}"
+	teardown_common "${node}" "${node_start_time:-}"
 }

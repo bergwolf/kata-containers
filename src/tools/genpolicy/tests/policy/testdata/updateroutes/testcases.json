@@ -1,0 +1,96 @@
+{
+  "bases": {
+    "update-routes": {
+      "kind": "UpdateRoutesRequest",
+      "request": {
+        "routes": {
+          "Routes": [
+            {
+              "dest": "",
+              "device": "eth0",
+              "family": 0,
+              "gateway": "10.244.0.1",
+              "scope": 0,
+              "source": ""
+            }
+          ]
+        }
+      }
+    }
+  },
+  "cases": [
+    {
+      "description": "compliant routes",
+      "base": "update-routes",
+      "allowed": true,
+      "patch": []
+    },
+    {
+      "description": "forbidden device",
+      "base": "update-routes",
+      "allowed": false,
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/routes/Routes/0/device",
+          "value": "lo"
+        }
+      ]
+    },
+    {
+      "description": "one compliant route, one noncompliant",
+      "base": "update-routes",
+      "allowed": false,
+      "patch": [
+        {
+          "op": "add",
+          "path": "/routes/Routes/-",
+          "value": {
+            "dest": "",
+            "device": "eth0",
+            "family": 0,
+            "gateway": "10.244.0.1",
+            "scope": 0,
+            "source": "::1"
+          }
+        }
+      ]
+    },
+    {
+      "description": "noncompliant routes",
+      "base": "update-routes",
+      "allowed": false,
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/routes/Routes/0/source",
+          "value": "127.0.0.1"
+        }
+      ]
+    },
+    {
+      "description": "noncompliant routes ipv6 1",
+      "base": "update-routes",
+      "allowed": false,
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/routes/Routes/0/source",
+          "value": "::1"
+        }
+      ]
+    },
+    {
+      "description": "noncompliant routes ipv6 2",
+      "base": "update-routes",
+      "allowed": false,
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/routes/Routes/0/source",
+          "value": "00::001"
+        }
+      ]
+    }
+  ]
+}
